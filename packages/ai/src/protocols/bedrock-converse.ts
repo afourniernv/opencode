@@ -1,15 +1,18 @@
-import { Effect, Encoding, Schema } from "effect"
+import { Effect, Encoding, Option, Schema } from "effect"
 import { Route } from "../route/client.js"
 import { Endpoint } from "../route/endpoint.js"
 import { Protocol } from "../route/protocol.js"
+import { HttpTransport } from "../route/transport/index.js"
 import {
   AIError,
+  HttpOptions,
   LLMEvent,
+  LLMRequest,
+  mergeJsonRecords,
   Usage,
   type CacheHint,
   type FinishReason,
   type FinishReasonDetails,
-  type LLMRequest,
   type LanguageModel,
   type ProviderMetadata,
   type ReasoningPart,
@@ -23,6 +26,7 @@ import { JsonObject, optionalArray, ProviderShared } from "./shared.js"
 import { BedrockAuth } from "./utils/bedrock-auth.js"
 import { BedrockCache } from "./utils/bedrock-cache.js"
 import { BedrockMedia } from "./utils/bedrock-media.js"
+import { supportsThinkingBlockBinding, THINKING_BINDING_BETA } from "./utils/claude-model.js"
 import { Lifecycle } from "./utils/lifecycle.js"
 import { MistralToolID } from "./utils/mistral-tool-id.js"
 import { ToolStream } from "./utils/tool-stream.js"
@@ -443,6 +447,13 @@ const decodeOptions = ProviderShared.validateWith(Schema.decodeUnknownEffect(Opt
 // Claude on Bedrock requires the thinking budget below `maxTokens`, with a minimum of 1,024.
 const MIN_THINKING_BUDGET = 1_024
 
+// `block_binding` is only accepted beside `adaptive` and `enabled` thinking, and `http.body` can pick another type.
+const decodeOverlayThinking = Schema.decodeUnknownOption(
+  Schema.Struct({
+    additionalModelRequestFields: Schema.Struct({ thinking: Schema.Struct({ type: Schema.String }) }),
+  }),
+)
+
 const fromRequest = Effect.fn("BedrockConverse.fromRequest")(function* (request: LLMRequest) {
   const toolChoice = request.toolChoice ? yield* lowerToolChoice(request.toolChoice) : undefined
   const flattened = ProviderShared.flattenToolRequest(request)
@@ -461,6 +472,20 @@ const fromRequest = Effect.fn("BedrockConverse.fromRequest")(function* (request:
             MIN_THINKING_BUDGET,
           ),
         }
+  const overlayThinking = decodeOverlayThinking(request.http?.body)
+  const bindThinking =
+    supportsThinkingBlockBinding(request.model) &&
+    (Option.isNone(overlayThinking) ||
+      ["adaptive", "enabled"].includes(overlayThinking.value.additionalModelRequestFields.thinking.type))
+  // Claude 5.1+ binds thinking signatures to the prefix above them. Ask Bedrock to drop the affected blocks instead
+  // of failing when the prefix changes, defaulting to adaptive thinking where none is configured. `http.body`
+  // overlays this field by field, so callers can still change the type or the mismatch behavior.
+  const boundThinking = bindThinking
+    ? {
+        ...(thinking ?? { type: "adaptive" as const }),
+        block_binding: { prefix_mismatch_behavior: "drop_block" },
+      }
+    : thinking
   // Bedrock-Claude shares Anthropic's 4-breakpoint cap. Spend the budget in
   // tools → system → messages order to favour the highest-impact prefixes.
   const breakpoints = BedrockCache.breakpoints(request.model.id)
@@ -504,11 +529,11 @@ const fromRequest = Effect.fn("BedrockConverse.fromRequest")(function* (request:
     // Converse's base inferenceConfig has no topK or thinking; Anthropic/Nova accept them
     // as model-specific fields, so they go through additionalModelRequestFields.
     additionalModelRequestFields:
-      generation?.topK === undefined && thinking === undefined
+      generation?.topK === undefined && boundThinking === undefined
         ? undefined
         : {
             ...(generation?.topK === undefined ? {} : { top_k: generation.topK }),
-            ...(thinking === undefined ? {} : { thinking }),
+            ...(boundThinking === undefined ? {} : { thinking: boundThinking }),
           },
   }
 })
@@ -805,6 +830,42 @@ export const protocol = Protocol.make({
   },
 })
 
+const decodeBoundThinking = Schema.decodeUnknownOption(
+  Schema.Struct({
+    additionalModelRequestFields: Schema.Struct({
+      thinking: Schema.Struct({ block_binding: Schema.Unknown }),
+      anthropic_beta: Schema.optional(Schema.Array(Schema.String)),
+    }),
+  }),
+)
+
+// Converse takes Anthropic betas in the body instead of a header, and Bedrock rejects `block_binding` without its
+// beta. `http.body` replaces arrays instead of merging them, so resolve the request that will actually be sent and
+// add the beta to the overlay beside any betas the caller already set.
+const transport = () => {
+  const http = HttpTransport.httpJson<BedrockConverseBody, object>({ framing })
+  return {
+    ...http,
+    prepare: (input: Parameters<typeof http.prepare>[0]) => {
+      const bound = decodeBoundThinking(mergeJsonRecords(input.body, input.request.http?.body))
+      if (Option.isNone(bound)) return http.prepare(input)
+      const betas = bound.value.additionalModelRequestFields.anthropic_beta ?? []
+      if (betas.includes(THINKING_BINDING_BETA)) return http.prepare(input)
+      return http.prepare({
+        ...input,
+        request: LLMRequest.update(input.request, {
+          http: new HttpOptions({
+            ...input.request.http,
+            body: mergeJsonRecords(input.request.http?.body, {
+              additionalModelRequestFields: { anthropic_beta: [...betas, THINKING_BINDING_BETA] },
+            }),
+          }),
+        }),
+      })
+    },
+  }
+}
+
 export const route = Route.make({
   id: ADAPTER,
   provider: "bedrock",
@@ -817,7 +878,7 @@ export const route = Route.make({
     ({ body }) => `/model/${encodeURIComponent(body.modelId)}/converse-stream`,
   ),
   auth: BedrockAuth.auth,
-  framing,
+  transport: transport(),
 })
 
 export const sigV4Auth = BedrockAuth.sigV4
