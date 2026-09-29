@@ -4,7 +4,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
 import { tool } from "ai"
-import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
@@ -104,7 +104,7 @@ function defer<T>() {
   return { promise, resolve }
 }
 
-const waitFor = <A>(check: Effect.Effect<A | undefined>, message: string) =>
+const waitFor = <A, E, R>(check: Effect.Effect<A | undefined, E, R>, message: string) =>
   Effect.gen(function* () {
     const stop = Date.now() + 500
     while (Date.now() < stop) {
@@ -210,11 +210,17 @@ const providerErrorLLM = Layer.succeed(
 const providerToolObservations: NemoRelay.ToolCompleted[] = []
 const relay = Layer.succeed(
   NemoRelay.Service,
-  NemoRelay.Service.of({
-    status: { state: "active" },
-    llmCompleted: () => Effect.void,
-    toolCompleted: (input) => Effect.sync(() => providerToolObservations.push(input)),
-  }),
+  NemoRelay.Service.of(
+    NemoRelay.makeForTesting(
+      {
+        MetricKind: { Counter: "counter", Histogram: "histogram" },
+        MetricValueType: { U64: "u64", F64: "f64" },
+        metric() {},
+        flushSubscribers: async () => {},
+      },
+      { toolCompleted: (input) => Effect.sync(() => providerToolObservations.push(input)) },
+    ),
+  ),
 )
 const providerErrorEnv = LayerNode.compile(root, [
   ...replacements,
@@ -245,11 +251,17 @@ const localSuccessLLM = Layer.succeed(
 const localToolObservations: NemoRelay.ToolCompleted[] = []
 const localRelay = Layer.succeed(
   NemoRelay.Service,
-  NemoRelay.Service.of({
-    status: { state: "active" },
-    llmCompleted: () => Effect.void,
-    toolCompleted: (input) => Effect.sync(() => localToolObservations.push(input)),
-  }),
+  NemoRelay.Service.of(
+    NemoRelay.makeForTesting(
+      {
+        MetricKind: { Counter: "counter", Histogram: "histogram" },
+        MetricValueType: { U64: "u64", F64: "f64" },
+        metric() {},
+        flushSubscribers: async () => {},
+      },
+      { toolCompleted: (input) => Effect.sync(() => localToolObservations.push(input)) },
+    ),
+  ),
 )
 const localSuccessEnv = LayerNode.compile(root, [
   ...replacements,
@@ -257,6 +269,114 @@ const localSuccessEnv = LayerNode.compile(root, [
   [NemoRelay.node, localRelay],
 ])
 const itLocalSuccess = testEffect(localSuccessEnv)
+
+const interruptedToolObservations: NemoRelay.ToolCompleted[] = []
+const interruptedRelay = Layer.succeed(
+  NemoRelay.Service,
+  NemoRelay.Service.of(
+    NemoRelay.makeForTesting(
+      {
+        MetricKind: { Counter: "counter", Histogram: "histogram" },
+        MetricValueType: { U64: "u64", F64: "f64" },
+        metric() {},
+        flushSubscribers: async () => {},
+      },
+      { toolCompleted: (input) => Effect.sync(() => interruptedToolObservations.push(input)) },
+    ),
+  ),
+)
+const interruptedEnv = LayerNode.compile(
+  LayerNode.group([root, LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })]),
+  [...replacements, [NemoRelay.node, interruptedRelay]],
+)
+const itInterrupted = testEffect(interruptedEnv)
+
+let missingPartGate = defer<void>()
+const missingPartLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "call-missing", name: "lookup" }),
+        LLMEvent.toolInputEnd({ id: "call-missing", name: "lookup" }),
+        LLMEvent.toolCall({ id: "call-missing", name: "lookup", input: {} }),
+      ).pipe(
+        Stream.concat(
+          Stream.unwrap(
+            Effect.promise(() => missingPartGate.promise).pipe(
+              Effect.as(
+                Stream.make(
+                  LLMEvent.toolResult({
+                    id: "call-missing",
+                    name: "lookup",
+                    result: { type: "json", value: { title: "Lookup", output: "ok", metadata: {} } },
+                  }),
+                  LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+                  LLMEvent.finish({ reason: "stop" }),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+  }),
+)
+const missingPartObservations: NemoRelay.ToolCompleted[] = []
+const missingPartRelay = Layer.succeed(
+  NemoRelay.Service,
+  NemoRelay.Service.of(
+    NemoRelay.makeForTesting(
+      {
+        MetricKind: { Counter: "counter", Histogram: "histogram" },
+        MetricValueType: { U64: "u64", F64: "f64" },
+        metric() {},
+        flushSubscribers: async () => {},
+      },
+      { toolCompleted: (input) => Effect.sync(() => missingPartObservations.push(input)) },
+    ),
+  ),
+)
+const missingPartEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, missingPartLLM],
+  [NemoRelay.node, missingPartRelay],
+])
+const itMissingPart = testEffect(missingPartEnv)
+
+const reusedCallIDLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "call-reused", name: "lookup" }),
+        LLMEvent.toolInputEnd({ id: "call-reused", name: "lookup" }),
+        LLMEvent.toolCall({ id: "call-reused", name: "lookup", input: { generation: 1 } }),
+        LLMEvent.toolResult({
+          id: "call-reused",
+          name: "lookup",
+          result: { type: "json", value: { title: "First", output: "one", metadata: {} } },
+        }),
+        LLMEvent.toolInputStart({ id: "call-reused", name: "lookup" }),
+        LLMEvent.toolInputEnd({ id: "call-reused", name: "lookup" }),
+        LLMEvent.toolCall({ id: "call-reused", name: "lookup", input: { generation: 2 } }),
+        LLMEvent.toolResult({
+          id: "call-reused",
+          name: "lookup",
+          result: { type: "json", value: { title: "Second", output: "two", metadata: {} } },
+        }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      ),
+  }),
+)
+const reusedCallIDEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, reusedCallIDLLM],
+  [NemoRelay.node, localRelay],
+])
+const itReusedCallID = testEffect(reusedCallIDEnv)
 
 const fragmentFailureLLM = Layer.succeed(
   LLM.Service,
@@ -988,6 +1108,76 @@ it.live("session.processor effect tests mark pending tools as aborted on cleanup
   ),
 )
 
+itInterrupted.live("session.processor effect tests report interrupted running tools as cancelled", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        interruptedToolObservations.length = 0
+        const started = defer<void>()
+        const database = yield* Database.Service
+        const { processors, session, provider } = yield* boot()
+
+        yield* llm.tool("lookup", { query: "weather" })
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "interrupt running tool")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const run = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "interrupt running tool" }],
+            tools: {
+              lookup: tool({
+                description: "Wait until interrupted",
+                inputSchema: z.object({ query: z.string() }),
+                execute: async (_input, options) => {
+                  started.resolve()
+                  return await new Promise<{ title: string; output: string; metadata: Record<string, never> }>(
+                    (_resolve, reject) => {
+                      const abort = () => reject(new DOMException("Aborted", "AbortError"))
+                      if (options.abortSignal?.aborted) abort()
+                      else options.abortSignal?.addEventListener("abort", abort, { once: true })
+                    },
+                  )
+                },
+              }),
+            },
+          })
+          .pipe(Effect.forkChild)
+
+        yield* Effect.promise(() => started.promise)
+        yield* waitFor(
+          MessageV2.parts(msg.id).pipe(
+            Effect.map((parts) =>
+              parts.find((part): part is SessionV1.ToolPart => part.type === "tool" && part.state.status === "running"),
+            ),
+            Effect.provideService(Database.Service, database),
+          ),
+          "timed out waiting for running tool part",
+        )
+        yield* Fiber.interrupt(run)
+
+        expect(interruptedToolObservations).toEqual([
+          expect.objectContaining({ name: "lookup", execution: "local", outcome: "cancelled" }),
+        ])
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
 it.live("session.processor effect tests record aborted errors and idle state", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>
@@ -1215,6 +1405,158 @@ itLocalSuccess.live("session.processor effect tests observe completed local tool
             execution: "local",
             durationMs: expect.any(Number),
           },
+        ])
+      }),
+    { config: cfg },
+  ),
+)
+
+itLocalSuccess.live("session.processor effect tests do not overwrite a tool committed during interruption", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        localToolObservations.length = 0
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        const committed = yield* Deferred.make<void>()
+        const releaseNotification = yield* Deferred.make<void>()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "interrupt after tool commit")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const off = yield* events.listen((event) => {
+          if (event.type !== MessageV2.Event.PartUpdated.type) return Effect.void
+          const data = event.data as typeof MessageV2.Event.PartUpdated.data.Type
+          const part = data.part
+          if (part.type !== "tool" || part.callID !== "call-1" || part.state.status !== "completed") return Effect.void
+          return Deferred.succeed(committed, undefined).pipe(Effect.andThen(Deferred.await(releaseNotification)))
+        })
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const run = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "interrupt after tool commit" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+
+        yield* Deferred.await(committed)
+        const interrupt = yield* Fiber.interrupt(run).pipe(Effect.forkChild)
+        yield* Effect.sleep("10 millis")
+        yield* Deferred.succeed(releaseNotification, undefined)
+        yield* Fiber.join(interrupt)
+        const exit = yield* Fiber.await(run)
+        yield* off
+
+        const parts = yield* MessageV2.parts(msg.id)
+        const call = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(call?.state.status).toBe("completed")
+        expect(localToolObservations).toEqual([
+          expect.objectContaining({ name: "lookup", execution: "local", outcome: "success" }),
+        ])
+      }),
+    { config: cfg },
+  ),
+)
+
+itMissingPart.live("session.processor effect tests settle Relay when an active tool part is deleted", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        missingPartGate = defer<void>()
+        missingPartObservations.length = 0
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "deleted tool part")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const run = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "deleted tool part" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+        const call = yield* waitFor(
+          MessageV2.parts(msg.id).pipe(
+            Effect.map((parts) =>
+              parts.find(
+                (part): part is SessionV1.ToolPart =>
+                  part.type === "tool" && part.callID === "call-missing" && part.state.status === "running",
+              ),
+            ),
+          ),
+          "timed out waiting for running tool part",
+        )
+
+        yield* session.removePart({ sessionID: chat.id, messageID: msg.id, partID: call.id })
+        missingPartGate.resolve()
+        yield* Fiber.join(run)
+
+        expect(missingPartObservations).toEqual([
+          expect.objectContaining({ name: "lookup", execution: "local", outcome: "failed" }),
+        ])
+      }).pipe(Effect.ensuring(Effect.sync(() => missingPartGate.resolve()))),
+    { config: cfg },
+  ),
+)
+
+itReusedCallID.live("session.processor effect tests observe each reused provider call-id generation", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        localToolObservations.length = 0
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "reused tool id")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+        yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "reused tool id" }],
+          tools: {},
+        })
+
+        expect(localToolObservations).toEqual([
+          expect.objectContaining({ name: "lookup", execution: "local", outcome: "success" }),
+          expect.objectContaining({ name: "lookup", execution: "local", outcome: "success" }),
         ])
       }),
     { config: cfg },

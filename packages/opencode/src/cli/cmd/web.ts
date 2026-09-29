@@ -5,6 +5,7 @@ import { withNetworkOptions, resolveNetworkOptions } from "../network"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { openUrl } from "@opencode-ai/core/open"
 import { networkInterfaces } from "os"
+import { shutdownServer, waitForTerminationSignal } from "../signal"
 
 function getNetworkIPs() {
   const nets = networkInterfaces()
@@ -79,6 +80,6 @@ export const WebCommand = effectCmd({
       openUrl(displayUrl).catch(() => {})
     }
 
-    yield* Effect.never
+    yield* waitForTerminationSignal.pipe(Effect.ensuring(shutdownServer(server)))
   }),
 })

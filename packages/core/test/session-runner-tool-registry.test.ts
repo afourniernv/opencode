@@ -5,6 +5,7 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ApplicationTools } from "@opencode-ai/core/tool/application-tools"
 import * as NemoRelay from "@opencode-ai/core/observability/nemo-relay"
+import { PermissionV2 } from "@opencode-ai/core/permission"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
@@ -31,17 +32,21 @@ const outputStore = Layer.mock(ToolOutputStore.Service, {
   },
 })
 const relayObservations: NemoRelay.ToolCompleted[] = []
-const relay = Layer.succeed(
-  NemoRelay.Service,
-  NemoRelay.Service.of({
-    status: { state: "active" },
-    llmCompleted: () => Effect.void,
+const relayAdapter = NemoRelay.makeForTesting(
+  {
+    MetricKind: { Counter: "counter", Histogram: "histogram" },
+    MetricValueType: { U64: "u64", F64: "f64" },
+    metric: () => {},
+    flushSubscribers: async () => {},
+  },
+  {
     toolCompleted: (input) =>
       Effect.sync(() => {
         relayObservations.push(input)
       }),
-  }),
+  },
 )
+const relay = Layer.succeed(NemoRelay.Service, NemoRelay.Service.of(relayAdapter))
 const registryLayer = AppNodeBuilder.build(ToolRegistry.node, [[ToolOutputStore.node, outputStore]])
 const it = testEffect(registryLayer)
 const observed = testEffect(
@@ -252,12 +257,15 @@ describe("ToolRegistry", () => {
         }),
       ).toEqual({ type: "text", value: "echo" })
 
-      expect(relayObservations).toHaveLength(3)
+      expect(relayObservations).toHaveLength(4)
       expect(relayObservations[0]).toMatchObject({ name: "echo", execution: "local", outcome: "success" })
       expect(relayObservations[0]?.durationMs).toBeNumber()
       expect(relayObservations[1]).toMatchObject({ name: "failed", execution: "local", outcome: "failed" })
       expect(relayObservations[1]?.durationMs).toBeNumber()
-      expect(relayObservations[2]).toEqual({ name: "echo", execution: "provider", outcome: "success" })
+      expect(relayObservations[2]).toMatchObject({ name: "missing", execution: "local", outcome: "failed" })
+      expect(relayObservations[2]?.durationMs).toBeNumber()
+      expect(relayObservations[3]).toMatchObject({ name: "echo", execution: "local", outcome: "success" })
+      expect(relayObservations[3]?.durationMs).toBeNumber()
     }),
   )
 
@@ -289,6 +297,40 @@ describe("ToolRegistry", () => {
         outcome: "cancelled",
       })
       expect(relayObservations[0]?.durationMs).toBeNumber()
+    }),
+  )
+
+  observed.effect("preserves typed policy failures as blocked tool outcomes", () =>
+    Effect.gen(function* () {
+      relayObservations.length = 0
+      const service = yield* ToolRegistry.Service
+      yield* service.register({
+        blocked: Tool.make({
+          description: "Policy blocked",
+          input: Schema.Struct({}),
+          output: Schema.Struct({}),
+          execute: () => {
+            const error = new PermissionV2.BlockedError({ rules: [] })
+            return Effect.fail(new Tool.Failure({ message: "Permission blocked", error }))
+          },
+        }),
+        corrected: Tool.make({
+          description: "Policy corrected",
+          input: Schema.Struct({}),
+          output: Schema.Struct({}),
+          execute: () => {
+            const error = new PermissionV2.CorrectedError({ feedback: "Use another tool" })
+            return Effect.fail(new Tool.Failure({ message: error.feedback, error }))
+          },
+        }),
+      })
+
+      expect(yield* executeTool(service, call("blocked"))).toEqual({ type: "error", value: "Permission blocked" })
+      expect(yield* executeTool(service, call("corrected"))).toEqual({ type: "error", value: "Use another tool" })
+      expect(relayObservations.map(({ name, outcome }) => ({ name, outcome }))).toEqual([
+        { name: "blocked", outcome: "blocked" },
+        { name: "corrected", outcome: "blocked" },
+      ])
     }),
   )
 

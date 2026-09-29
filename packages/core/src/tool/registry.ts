@@ -1,9 +1,10 @@
 export * as ToolRegistry from "./registry"
 
-import { ToolOutput, type ToolCall, type ToolDefinition, type ToolResultValue } from "@opencode-ai/llm"
+import { ToolFailure, ToolOutput, type ToolCall, type ToolDefinition, type ToolResultValue } from "@opencode-ai/llm"
 import { Cause, Context, Effect, Exit, Layer, Scope } from "effect"
 import { AgentV2 } from "../agent"
 import { PermissionV2 } from "../permission"
+import { QuestionV2 } from "../question"
 import * as NemoRelay from "../observability/nemo-relay"
 import { SessionMessage } from "../session/message"
 import { SessionSchema } from "../session/schema"
@@ -49,60 +50,76 @@ const registryLayer = Layer.effect(
     type Registration = { readonly identity: object; readonly tool: AnyTool }
     const local = new Map<string, Array<{ readonly token: object; readonly registration: Registration }>>()
 
-    const settleWith = Effect.fn("ToolRegistry.settle")(function* (input: ExecuteInput, advertised?: object) {
-      const registration =
-        local.get(input.call.name)?.at(-1)?.registration ?? applications.entries().get(input.call.name)
-      if (!registration)
-        return {
-          result: {
-            type: "error" as const,
-            value: advertised ? `Stale tool call: ${input.call.name}` : `Unknown tool: ${input.call.name}`,
-          },
-        }
-      if (advertised && registration.identity !== advertised)
-        return { result: { type: "error" as const, value: `Stale tool call: ${input.call.name}` } }
-      const settlement = Effect.gen(function* () {
-        const pending = yield* settle(registration.tool, input.call, {
-          sessionID: input.sessionID,
-          agent: input.agent,
-          assistantMessageID: input.assistantMessageID,
-          toolCallID: input.call.id,
-        }).pipe(
-          Effect.map((output) => ({ output })),
-          Effect.catchTag("LLM.ToolFailure", (failure) =>
-            Effect.succeed({ result: { type: "error" as const, value: failure.message } }),
-          ),
-        )
-        if ("result" in pending) return pending
-        const output = pending.output
-        const bounded = yield* resources.bound({ sessionID: input.sessionID, toolCallID: input.call.id, output })
-        const result = ToolOutput.toResultValue(bounded.output)
-        if (result.type === "error")
-          return bounded.outputPaths.length > 0 ? { result, outputPaths: bounded.outputPaths } : { result }
-        return bounded.outputPaths.length > 0
-          ? { result, output: bounded.output, outputPaths: bounded.outputPaths }
-          : { result, output: bounded.output }
-      })
-      if (relay.status.state !== "active") return yield* settlement
-      const startedAt = Date.now()
-      const execution = input.call.providerExecuted === true ? "provider" : "local"
-      return yield* settlement.pipe(
-        Effect.onExit((exit) => {
-          const outcome = Exit.isSuccess(exit)
-            ? exit.value.result.type === "error"
-              ? "failed"
-              : "success"
-            : Cause.hasInterruptsOnly(exit.cause)
-              ? "cancelled"
-              : "failed"
-          return relay
-            .toolCompleted({
-              name: input.call.name,
-              execution,
-              outcome,
-              ...(execution === "local" ? { durationMs: Math.max(0, Date.now() - startedAt) } : {}),
-            })
-            .pipe(Effect.catchCause(() => Effect.void))
+    const settleWith = Effect.fn("ToolRegistry.settle")(function* (
+      input: ExecuteInput,
+      advertised?: object,
+      missing = false,
+    ) {
+      return yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const observation = yield* relay.beginTool({ name: input.call.name, execution: "local" })
+          let terminalFailure: ToolFailure | undefined
+          const settlement = Effect.gen(function* () {
+            if (missing) return { result: { type: "error" as const, value: `Unknown tool: ${input.call.name}` } }
+            const registration =
+              local.get(input.call.name)?.at(-1)?.registration ?? applications.entries().get(input.call.name)
+            if (!registration)
+              return {
+                result: {
+                  type: "error" as const,
+                  value: advertised ? `Stale tool call: ${input.call.name}` : `Unknown tool: ${input.call.name}`,
+                },
+              }
+            if (advertised && registration.identity !== advertised)
+              return { result: { type: "error" as const, value: `Stale tool call: ${input.call.name}` } }
+            const pending = yield* settle(registration.tool, input.call, {
+              sessionID: input.sessionID,
+              agent: input.agent,
+              assistantMessageID: input.assistantMessageID,
+              toolCallID: input.call.id,
+            }).pipe(
+              Effect.map((output) => ({ output })),
+              Effect.catchTag("LLM.ToolFailure", (failure) => {
+                terminalFailure = failure
+                return Effect.succeed({ result: { type: "error" as const, value: failure.message } })
+              }),
+            )
+            if ("result" in pending) return pending
+            const output = pending.output
+            const bounded = yield* resources.bound({ sessionID: input.sessionID, toolCallID: input.call.id, output })
+            const result = ToolOutput.toResultValue(bounded.output)
+            if (result.type === "error")
+              return bounded.outputPaths.length > 0 ? { result, outputPaths: bounded.outputPaths } : { result }
+            return bounded.outputPaths.length > 0
+              ? { result, output: bounded.output, outputPaths: bounded.outputPaths }
+              : { result, output: bounded.output }
+          })
+          return yield* restore(settlement).pipe(
+            Effect.onExit((exit) => {
+              const blocked =
+                Exit.isFailure(exit) &&
+                exit.cause.reasons.some((reason) => {
+                  const error = Cause.isDieReason(reason)
+                    ? reason.defect
+                    : Cause.isFailReason(reason)
+                      ? reason.error
+                      : undefined
+                  return isBlocked(error)
+                })
+              const outcome: NemoRelay.ToolOutcome = Exit.isSuccess(exit)
+                ? exit.value.result.type === "error"
+                  ? isBlocked(terminalFailure?.error)
+                    ? "blocked"
+                    : "failed"
+                  : "success"
+                : blocked
+                  ? "blocked"
+                  : Cause.hasInterruptsOnly(exit.cause)
+                    ? "cancelled"
+                    : "failed"
+              return observation.complete(outcome).pipe(Effect.catchCause(() => Effect.void))
+            }),
+          )
         }),
       )
     })
@@ -141,8 +158,7 @@ const registryLayer = Layer.effect(
           definitions: Array.from(registrations, ([name, registration]) => definition(name, registration.tool)),
           settle: (input) => {
             const registration = registrations.get(input.call.name)
-            if (registration) return settleWith(input, registration.identity)
-            return Effect.succeed({ result: { type: "error", value: `Unknown tool: ${input.call.name}` } })
+            return settleWith(input, registration?.identity, registration === undefined)
           },
         }
       }),
@@ -158,6 +174,15 @@ const layer = Layer.effect(
 function whollyDisabled(action: string, rules: PermissionV2.Ruleset) {
   const rule = rules.findLast((rule) => Wildcard.match(action, rule.action))
   return rule?.resource === "*" && rule.effect === "deny"
+}
+
+function isBlocked(error: unknown) {
+  return (
+    error instanceof PermissionV2.BlockedError ||
+    error instanceof PermissionV2.DeclinedError ||
+    error instanceof PermissionV2.CorrectedError ||
+    error instanceof QuestionV2.RejectedError
+  )
 }
 
 export const node = makeLocationNode({

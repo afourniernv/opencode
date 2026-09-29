@@ -25,6 +25,7 @@ import { Filesystem } from "@/util/filesystem"
 import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2"
 import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
+import { requestExit } from "../exit"
 
 type ModelInput = Parameters<OpencodeClient["session"]["prompt"]>[0]["model"]
 
@@ -275,7 +276,7 @@ export const RunCommand = effectCmd({
       const thinking = interactive ? (args.thinking ?? true) : (args.thinking ?? false)
       const die = (message: string): never => {
         UI.error(message)
-        process.exit(1)
+        requestExit(1)
       }
       const dieInteractive = (error: unknown): never => {
         if (error instanceof Error && error.message === INTERACTIVE_INPUT_ERROR) {
@@ -340,7 +341,7 @@ export const RunCommand = effectCmd({
           return process.cwd()
         } catch {
           UI.error("Failed to change directory to " + args.dir)
-          process.exit(1)
+          requestExit(1)
         }
       })()
       const attachHeaders = args.attach
@@ -362,14 +363,14 @@ export const RunCommand = effectCmd({
           const resolvedPath = path.resolve(args.attach ? root : (directory ?? root), filePath)
           if (!(await Filesystem.exists(resolvedPath))) {
             UI.error(`File not found: ${filePath}`)
-            process.exit(1)
+            requestExit(1)
           }
 
           const stat = Filesystem.stat(resolvedPath)
           const isDirectory = stat?.isDirectory() ?? false
           if (args.attach && isDirectory) {
             UI.error(`Cannot attach local directory without a shared filesystem: ${filePath}`)
-            process.exit(1)
+            requestExit(1)
           }
 
           const content = await (async () => {
@@ -379,7 +380,7 @@ export const RunCommand = effectCmd({
               const opened = await handle.stat()
               if (!opened.isFile() || Number(opened.size) > ATTACH_FILE_MAX_BYTES) {
                 UI.error(`Cannot attach local file larger than 10 MiB or a special file: ${filePath}`)
-                process.exit(1)
+                requestExit(1)
               }
               if (opened.size === 0) return Buffer.alloc(0)
               const buffer = Buffer.alloc(Number(opened.size))
@@ -419,12 +420,12 @@ export const RunCommand = effectCmd({
 
       if (message.trim().length === 0 && !args.command && !interactive) {
         UI.error("You must provide a message or a command")
-        process.exit(1)
+        requestExit(1)
       }
 
       if (args.fork && !args.continue && !args.session) {
         UI.error("--fork requires --continue or --session")
-        process.exit(1)
+        requestExit(1)
       }
 
       const rules: PermissionV1.Ruleset = interactive
@@ -463,7 +464,7 @@ export const RunCommand = effectCmd({
 
           if (!current?.data) {
             UI.error("Session not found")
-            process.exit(1)
+            requestExit(1)
           }
 
           if (args.fork) {
@@ -589,7 +590,7 @@ export const RunCommand = effectCmd({
         }
 
         UI.error("Failed to resolve remote directory")
-        process.exit(1)
+        requestExit(1)
       }
 
       async function localAgent() {
@@ -671,7 +672,7 @@ export const RunCommand = effectCmd({
         const sess = await session(sdk)
         if (!sess?.id) {
           UI.error("Session not found")
-          process.exit(1)
+          requestExit(1)
         }
         const sessionID = sess.id
 

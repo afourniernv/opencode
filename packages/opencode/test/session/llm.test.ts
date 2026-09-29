@@ -1484,14 +1484,20 @@ describe("session.llm.stream", () => {
     "streams OpenAI through native runtime when opted in",
     () =>
       Effect.gen(function* () {
-        const observed: NemoRelay.LlmCompleted[] = []
+        const observed: NemoRelay.LlmStreamCompleted[] = []
         const relay = Layer.succeed(
           NemoRelay.Service,
-          NemoRelay.Service.of({
-            status: { state: "active" },
-            llmCompleted: (input) => Effect.sync(() => observed.push(input)),
-            toolCompleted: () => Effect.void,
-          }),
+          NemoRelay.Service.of(
+            NemoRelay.makeForTesting(
+              {
+                MetricKind: { Counter: "counter", Histogram: "histogram" },
+                MetricValueType: { U64: "u64", F64: "f64" },
+                metric() {},
+                flushSubscribers: async () => {},
+              },
+              { llmStreamCompleted: (input) => Effect.sync(() => observed.push(input)) },
+            ),
+          ),
         )
         const model = loadFixture("openai", "gpt-5.2").model
         const chunks = [
