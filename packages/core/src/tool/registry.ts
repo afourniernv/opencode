@@ -1,9 +1,10 @@
 export * as ToolRegistry from "./registry"
 
 import { ToolOutput, type ToolCall, type ToolDefinition, type ToolResultValue } from "@opencode-ai/llm"
-import { Context, Effect, Layer, Scope } from "effect"
+import { Cause, Context, Effect, Exit, Layer, Scope } from "effect"
 import { AgentV2 } from "../agent"
 import { PermissionV2 } from "../permission"
+import * as NemoRelay from "../observability/nemo-relay"
 import { SessionMessage } from "../session/message"
 import { SessionSchema } from "../session/schema"
 import { ToolOutputStore } from "../tool-output-store"
@@ -44,6 +45,7 @@ const registryLayer = Layer.effect(
   Effect.gen(function* () {
     const applications = yield* ApplicationTools.Service
     const resources = yield* ToolOutputStore.Service
+    const relay = yield* NemoRelay.Service
     type Registration = { readonly identity: object; readonly tool: AnyTool }
     const local = new Map<string, Array<{ readonly token: object; readonly registration: Registration }>>()
 
@@ -59,26 +61,50 @@ const registryLayer = Layer.effect(
         }
       if (advertised && registration.identity !== advertised)
         return { result: { type: "error" as const, value: `Stale tool call: ${input.call.name}` } }
-      const pending = yield* settle(registration.tool, input.call, {
-        sessionID: input.sessionID,
-        agent: input.agent,
-        assistantMessageID: input.assistantMessageID,
-        toolCallID: input.call.id,
-      }).pipe(
-        Effect.map((output) => ({ output })),
-        Effect.catchTag("LLM.ToolFailure", (failure) =>
-          Effect.succeed({ result: { type: "error" as const, value: failure.message } }),
-        ),
+      const settlement = Effect.gen(function* () {
+        const pending = yield* settle(registration.tool, input.call, {
+          sessionID: input.sessionID,
+          agent: input.agent,
+          assistantMessageID: input.assistantMessageID,
+          toolCallID: input.call.id,
+        }).pipe(
+          Effect.map((output) => ({ output })),
+          Effect.catchTag("LLM.ToolFailure", (failure) =>
+            Effect.succeed({ result: { type: "error" as const, value: failure.message } }),
+          ),
+        )
+        if ("result" in pending) return pending
+        const output = pending.output
+        const bounded = yield* resources.bound({ sessionID: input.sessionID, toolCallID: input.call.id, output })
+        const result = ToolOutput.toResultValue(bounded.output)
+        if (result.type === "error")
+          return bounded.outputPaths.length > 0 ? { result, outputPaths: bounded.outputPaths } : { result }
+        return bounded.outputPaths.length > 0
+          ? { result, output: bounded.output, outputPaths: bounded.outputPaths }
+          : { result, output: bounded.output }
+      })
+      if (relay.status.state !== "active") return yield* settlement
+      const startedAt = Date.now()
+      const execution = input.call.providerExecuted === true ? "provider" : "local"
+      return yield* settlement.pipe(
+        Effect.onExit((exit) => {
+          const outcome = Exit.isSuccess(exit)
+            ? exit.value.result.type === "error"
+              ? "failed"
+              : "success"
+            : Cause.hasInterruptsOnly(exit.cause)
+              ? "cancelled"
+              : "failed"
+          return relay
+            .toolCompleted({
+              name: input.call.name,
+              execution,
+              outcome,
+              ...(execution === "local" ? { durationMs: Math.max(0, Date.now() - startedAt) } : {}),
+            })
+            .pipe(Effect.catchCause(() => Effect.void))
+        }),
       )
-      if ("result" in pending) return pending
-      const output = pending.output
-      const bounded = yield* resources.bound({ sessionID: input.sessionID, toolCallID: input.call.id, output })
-      const result = ToolOutput.toResultValue(bounded.output)
-      if (result.type === "error")
-        return bounded.outputPaths.length > 0 ? { result, outputPaths: bounded.outputPaths } : { result }
-      return bounded.outputPaths.length > 0
-        ? { result, output: bounded.output, outputPaths: bounded.outputPaths }
-        : { result, output: bounded.output }
     })
 
     return Service.of({
@@ -137,11 +163,11 @@ function whollyDisabled(action: string, rules: PermissionV2.Ruleset) {
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [ApplicationTools.node, ToolOutputStore.node],
+  deps: [ApplicationTools.node, ToolOutputStore.node, NemoRelay.node],
 })
 
 export const toolsNode = makeLocationNode({
   service: Tools.Service,
   layer,
-  deps: [ApplicationTools.node, ToolOutputStore.node],
+  deps: [ApplicationTools.node, ToolOutputStore.node, NemoRelay.node],
 })

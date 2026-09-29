@@ -8,7 +8,7 @@ import {
   isContextOverflowFailure,
   type ProviderErrorEvent,
 } from "@opencode-ai/llm"
-import { Cause, DateTime, Effect, FiberSet, Layer, Option, Semaphore, Stream } from "effect"
+import { Cause, DateTime, Effect, Exit, FiberSet, Layer, Option, Semaphore, Stream } from "effect"
 import { AgentV2 } from "../../agent"
 import { Config } from "../../config"
 import { Database } from "../../database/database"
@@ -39,6 +39,7 @@ import { MAX_STEPS_PROMPT } from "./max-steps"
 import { Snapshot } from "../../snapshot"
 import { makeLocationNode } from "../../effect/app-node"
 import { llmClient } from "../../effect/app-node-platform"
+import * as NemoRelay from "../../observability/nemo-relay"
 
 /**
  * Runs one durable coding-agent Session until it settles.
@@ -105,6 +106,7 @@ const layer = Layer.effect(
     const referenceGuidance = yield* ReferenceGuidance.Service
     const config = yield* Config.Service
     const snapshots = yield* Snapshot.Service
+    const relay = yield* NemoRelay.Service
     const db = (yield* Database.Service).db
     const compaction = SessionCompaction.make({ events, llm, config: yield* config.entries() })
     const getSession = Effect.fn("SessionRunner.getSession")(function* (sessionID: SessionSchema.ID) {
@@ -221,6 +223,26 @@ const layer = Layer.effect(
       })
       if (yield* compaction.compactIfNeeded({ sessionID: session.id, entries, model, request }))
         return yield* Effect.die(continueAfterCompaction(currentStep))
+      const relayActive = relay.status.state === "active"
+      const relayStarted = relayActive ? Date.now() : 0
+      let relayOutcome: NemoRelay.LlmOutcome = "unknown"
+      let relayFinish: string | undefined
+      let relayUsage: NemoRelay.TokenUsage | undefined
+      let relayReported = false
+      const reportRelay = Effect.fnUntraced(function* () {
+        if (relayReported) return
+        relayReported = true
+        yield* relay.llmCompleted({
+          role: "primary",
+          runtime: "native",
+          provider: model.provider,
+          model: model.id,
+          outcome: relayOutcome,
+          finish: relayFinish,
+          durationMs: Date.now() - relayStarted,
+          tokens: relayUsage,
+        })
+      })
       const startSnapshot = yield* snapshots.capture()
       const publisher = createLLMEventPublisher(events, {
         sessionID: session.id,
@@ -240,6 +262,21 @@ const layer = Layer.effect(
         Stream.runForEach((event) =>
           Effect.gen(function* () {
             if (overflowFailure || publisher.hasProviderError()) return
+            if (relayActive) {
+              if (event.type === "provider-error") relayOutcome = "provider_error"
+              if (event.type === "step-finish") {
+                relayOutcome = "success"
+                relayFinish = event.reason
+                relayUsage = {
+                  inputTotal: event.usage?.inputTokens,
+                  inputNonCached: event.usage?.nonCachedInputTokens,
+                  inputCacheRead: event.usage?.cacheReadInputTokens,
+                  inputCacheWrite: event.usage?.cacheWriteInputTokens,
+                  outputTotal: event.usage?.outputTokens,
+                  outputReasoning: event.usage?.reasoningTokens,
+                }
+              }
+            }
             if (LLMEvent.is.providerError(event)) {
               if (isContextOverflowFailure(event) && !publisher.hasAssistantStarted()) {
                 overflowFailure = event
@@ -281,7 +318,7 @@ const layer = Layer.effect(
         Effect.ensuring(withPublication(publisher.flush())),
       )
 
-      return yield* Effect.uninterruptibleMask((restore) =>
+      const turn = Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const stream = yield* restore(providerStream).pipe(Effect.exit)
           const failure =
@@ -350,6 +387,16 @@ const layer = Layer.effect(
           if (settled._tag === "Failure" && Cause.hasInterrupts(settled.cause))
             return yield* Effect.failCause(settled.cause)
           return { needsContinuation: !publisher.hasProviderError() && needsContinuation, step: currentStep }
+        }),
+      )
+      if (!relayActive) return yield* turn
+      return yield* turn.pipe(
+        Effect.onExit((exit) => {
+          if (Exit.isFailure(exit)) {
+            if (Cause.hasInterrupts(exit.cause)) relayOutcome = "cancelled"
+            else if (relayOutcome !== "provider_error") relayOutcome = "failed"
+          }
+          return reportRelay()
         }),
       )
     }, Effect.scoped)
@@ -435,5 +482,6 @@ export const node = makeLocationNode({
     Config.node,
     Snapshot.node,
     Database.node,
+    NemoRelay.node,
   ],
 })

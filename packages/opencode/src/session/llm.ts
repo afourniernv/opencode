@@ -1,10 +1,11 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { llmClient } from "@opencode-ai/core/effect/app-node-platform"
+import * as NemoRelay from "@opencode-ai/core/observability/nemo-relay"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Provider } from "@/provider/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
-import { Context, Effect, Layer } from "effect"
+import { Cause, Context, Effect, Exit, Layer } from "effect"
 import * as Stream from "effect/Stream"
 import { streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
 import type { LLMEvent } from "@opencode-ai/llm"
@@ -69,6 +70,7 @@ const live: Layer.Layer<
   | Permission.Service
   | EventV2Bridge.Service
   | LLMClientService
+  | NemoRelay.Service
   | RuntimeFlags.Service
 > = Layer.effect(
   Service,
@@ -80,7 +82,66 @@ const live: Layer.Layer<
     const perm = yield* Permission.Service
     const events = yield* EventV2Bridge.Service
     const llmClient = yield* LLMClient.Service
+    const relay = yield* NemoRelay.Service
     const flags = yield* RuntimeFlags.Service
+
+    const callRole = (input: StreamInput): NemoRelay.CallRole => {
+      if (input.agent.name === "compaction") return "compaction"
+      if (input.agent.name === "title") return "title"
+      if (input.agent.name === "summary") return "summary"
+      return "primary"
+    }
+
+    const observe = (
+      input: StreamInput,
+      runtime: NemoRelay.Runtime,
+      source: Stream.Stream<LLMEvent, unknown>,
+    ): Stream.Stream<LLMEvent, unknown> => {
+      if (relay.status.state !== "active") return source
+      return Stream.unwrap(
+        Effect.sync(() => {
+          const started = Date.now()
+          let outcome: NemoRelay.LlmOutcome = "unknown"
+          let finish: string | undefined
+          let usage: NemoRelay.TokenUsage | undefined
+          return source.pipe(
+            Stream.tap((event) =>
+              Effect.sync(() => {
+                if (event.type === "provider-error") outcome = "provider_error"
+                if (event.type !== "step-finish") return
+                outcome = "success"
+                finish = event.reason
+                usage = {
+                  inputTotal: event.usage?.inputTokens,
+                  inputNonCached: event.usage?.nonCachedInputTokens,
+                  inputCacheRead: event.usage?.cacheReadInputTokens,
+                  inputCacheWrite: event.usage?.cacheWriteInputTokens,
+                  outputTotal: event.usage?.outputTokens,
+                  outputReasoning: event.usage?.reasoningTokens,
+                }
+              }),
+            ),
+            Stream.onExit((exit) => {
+              if (Exit.isFailure(exit)) {
+                const cause = exit.cause
+                if (Cause.hasInterrupts(cause)) outcome = "cancelled"
+                else if (outcome !== "provider_error") outcome = "failed"
+              }
+              return relay.llmCompleted({
+                role: callRole(input),
+                runtime,
+                provider: input.model.providerID,
+                model: input.model.id,
+                outcome,
+                finish,
+                durationMs: Date.now() - started,
+                tokens: usage,
+              })
+            }),
+          )
+        }),
+      )
+    }
 
     const run = Effect.fn("LLM.run")(function* (input: StreamRequest) {
       yield* Effect.logInfo("stream", {
@@ -277,6 +338,7 @@ const live: Layer.Layer<
       // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
       return {
         type: "ai-sdk" as const,
+        runtime: isWorkflow ? ("workflow" as const) : ("ai_sdk" as const),
         result: streamText({
           onError(error) {
             bridge.fork(
@@ -365,17 +427,18 @@ const live: Layer.Layer<
 
             const result = yield* run({ ...input, abort: ctrl.signal })
 
-            if (result.type === "native") return result.stream
+            if (result.type === "native") return observe(input, "native", result.stream)
 
             // Adapter seam: both runtimes expose the same LLMEvent stream. Native
             // already returns one; AI SDK streams are converted here.
             const state = LLMAISDK.adapterState()
-            return Stream.fromAsyncIterable(result.result.fullStream, (e) =>
+            const source = Stream.fromAsyncIterable(result.result.fullStream, (e) =>
               e instanceof Error ? e : new Error(String(e)),
             ).pipe(
               Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
               Stream.flatMap((events) => Stream.fromIterable(events)),
             )
+            return observe(input, result.runtime, source)
           }),
         ),
       )
@@ -397,6 +460,7 @@ export const node = LayerNode.make({
     Permission.node,
     EventV2Bridge.node,
     llmClient,
+    NemoRelay.node,
     RuntimeFlags.node,
   ],
 })
