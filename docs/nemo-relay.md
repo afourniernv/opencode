@@ -1,156 +1,374 @@
-# NeMo Relay observability spike
+# NeMo Relay observability integration
 
-Status: experimental fork work, not an OpenCode compatibility promise.
+Status: experimental fork work. This is not yet an OpenCode or NeMo Relay
+compatibility promise.
 
-## Revision contract
+The integration is a first-party, in-process observation adapter. It emits a
+privacy-bounded metric contract through Relay at OpenCode-owned execution
+boundaries. It does **not** route provider traffic through the Relay gateway,
+create Relay scopes, or hand model and tool callbacks to Relay managed
+execution. Relay subscribers and exporters can observe these metrics, but Relay
+guardrails and request or execution intercepts cannot block, rewrite, or wrap
+the underlying OpenCode operation through this adapter.
 
-This spike was reviewed against:
+## Revision and runtime contract
 
-- OpenCode `7945de208964a49300d7f770d1a71d078db9a4c4` (version 1.18.33).
-- NeMo Relay 0.9.3, commit `52ea6c06d940342c8b20281389335bf60b70b6e0`.
+The implementation was developed and reviewed against:
+
+- OpenCode host baseline `7945de208964a49300d7f770d1a71d078db9a4c4`
+  (version 1.18.33).
+- NeMo Relay 0.9.3, commit
+  `52ea6c06d940342c8b20281389335bf60b70b6e0`.
 - Bun 1.3.14 on macOS arm64.
 
-Re-audit the attachment seams and packaging matrix when either repository pin
-changes.
+Relay 0.9.3 is the qualification target, not a runtime-enforced version range.
+The adapter validates the imported module's `initialize`, `metric`,
+`flushSubscribers`, `MetricKind`, and `MetricValueType` surfaces, but the module
+does not expose a version that OpenCode checks. Requalify both the API and the
+host attachment seams before changing either revision.
 
-## Activation
+The default runtime specifier is `nemo-relay-node`. OpenCode loads it with a
+dynamic import only after Relay is explicitly enabled. This branch does not add
+that package as a workspace dependency or bundle it into the standalone
+OpenCode executable. The operator must make the exact runtime package resolvable
+or provide an explicit module specifier:
 
-Relay is opt-in and runs in-process. Enable the adapter with:
+```text
+OPENCODE_NEMO_RELAY_RUNTIME_MODULE=/absolute/path/to/node_modules/nemo-relay-node/index.js
+```
+
+The published 0.9.3 Node package declares Node.js 24 or newer and selects one of
+seven native packages: Linux x64/arm64 with glibc or musl, macOS arm64, and
+Windows x64/arm64. There is no published macOS x64 native package. The default
+loader rejects macOS x64 before importing `nemo-relay-node`; a custom runtime
+specifier may be used to qualify a separately built addon. Running the Node
+binding under Bun worked in the pinned macOS arm64 development environment, but
+that is not an upstream Relay support guarantee.
+
+First-class release packaging remains separate work. It needs target-pruned
+native artifacts, an explicit macOS x64 decision, and packaged-binary tests for
+each supported OS, architecture, and libc combination. A naive Bun import can
+embed every installed native variant and is not the intended distribution
+shape.
+
+## Activation and health
+
+Relay is strictly opt-in:
 
 ```text
 OPENCODE_NEMO_RELAY=1
 ```
 
-An optional application configuration can be selected explicitly:
+Accepted enable values are `1`, `true`, `yes`, and `on`; accepted disable values
+are `0`, `false`, `no`, and `off`, case-insensitively. An unknown value is
+reported as unavailable. `OPENCODE_PURE=1` or `true` takes precedence and keeps
+Relay disabled.
+
+Select an additional Relay plugin configuration with:
 
 ```text
 OPENCODE_NEMO_RELAY_PLUGINS_TOML=/absolute/path/to/plugins.toml
 ```
 
-The path is passed to Relay as `additionalPluginsToml`; OpenCode does not add a
-repository-local discovery rule. `OPENCODE_NEMO_RELAY_RUNTIME_MODULE` exists for
-development and packaged-runtime experiments. The default module is
-`nemo-relay-node`.
+OpenCode passes this path to Relay as `additionalPluginsToml`; it does not add a
+repository-local discovery rule. Supplying a path without enabling Relay is a
+configuration error. An explicitly missing file, a Relay configuration error,
+an activation conflict, an incompatible module, and an invalid activation
+handle are reported as unavailable. Host execution continues without Relay
+instrumentation in every unavailable case.
 
-When the enable flag is absent or false, the native module is not imported.
-Loading, configuration, and metric-export failures fail open. The adapter
-exposes only bounded `disabled`, `active`, or coarse `unavailable` state and
-does not place paths, loader errors, or secrets in metrics.
+Runtime loading and plugin-host initialization share a five-second startup
+deadline. OpenCode fails open if that deadline expires. Native initialization
+cannot be cancelled, so an activation that resolves after the deadline is
+retained long enough to flush and close instead of leaking process-global Relay
+state.
 
-## Implemented ownership seams
+Inspect the adapter from the same environment that will run OpenCode:
 
-Phase one observes completed host operations. It does not give Relay ownership
-of model or tool callbacks.
+```bash
+OPENCODE_NEMO_RELAY=1 \
+OPENCODE_NEMO_RELAY_RUNTIME_MODULE=/absolute/path/to/node_modules/nemo-relay-node/index.js \
+OPENCODE_NEMO_RELAY_PLUGINS_TOML=/absolute/path/to/plugins.toml \
+bun run --cwd packages/opencode src/index.ts debug nemo-relay
+```
 
-| Host path      | Owner seam                                      | Current coverage                                                                                                                                          |
-| -------------- | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| V1 model calls | `packages/opencode/src/session/llm.ts`          | One logical-call observation when a native, AI SDK, or workflow stream terminates. Title, summary, and compaction are classified from the selected agent. |
-| V1 tools       | `packages/opencode/src/session/processor.ts`    | Exactly one observation when the normalized tool state completes, fails, is blocked, or is aborted. Provider-executed tools do not claim local duration.  |
-| V2 model calls | `packages/core/src/session/runner/llm.ts`       | One logical-call observation around each explicit runner provider turn.                                                                                   |
-| V2 local tools | `packages/core/src/tool/registry.ts`            | One observation around canonical registry settlement. Unknown and stale calls are not reported as executed tools.                                         |
-| Process owner  | `packages/core/src/observability/nemo-relay.ts` | Shared activation, serialized teardown/reopen, bounded subscriber flush, and close. The normal CLI exit path requests a two-second bounded shutdown.      |
+The command prints two related views:
 
-V2 compaction calls that bypass the runner, agent-generation helpers, session
-lifetimes, permission latency, subagent parentage, and direct hard exits from
-individual commands are not yet covered. The spike also does not create Relay
-scope stacks, so it must not claim causal scope or trace coverage.
+- `service` is the status captured by that Effect service acquisition:
+  `disabled`, `active`, or `unavailable`. An active status distinguishes
+  `healthy` from `degraded`, `empty` from `present` configuration, and reports
+  only bounded counts for configuration paths, components, selected dynamic
+  plugins, diagnostics, and dynamic-plugin failures.
+- `process` reports the process-global phase (`idle`, `starting`, `active`,
+  `draining`, `teardown_failed`, or `stopped`) plus configured owner and admitted
+  operation counts.
 
-## Metric contract
+`exporterDelivery` is deliberately `not_probed`. An active plugin host proves
+that Relay accepted the configuration and activation handle; it does not prove
+that a remote collector accepted a metric. Verify the configured subscriber or
+exporter destination separately.
 
-All phase-one instruments are counters. Duration is exported as one bounded
-bucket count rather than an unbounded value.
+## Metric schema
 
-| Measurement                                | Dimensions                                                 |
-| ------------------------------------------ | ---------------------------------------------------------- |
-| `opencode.runtime.activation.count`        | schema version metadata only                               |
-| `opencode.llm.logical_call.count`          | `call_role`, `runtime`, `outcome`                          |
-| `opencode.llm.duration_bucket.count`       | `call_role`, bounded `bucket`                              |
-| `opencode.llm.finish_reason.count`         | `call_role`, normalized `finish_reason`                    |
-| `opencode.model_route.count`               | normalized `provider_family`, normalized `model_family`    |
-| `opencode.llm.tokens`                      | `call_role`, fixed token `kind`                            |
-| `opencode.tool_call.count`                 | bounded `category`, `execution`, `outcome`                 |
-| `opencode.tool_call.duration_bucket.count` | bounded `category`, bounded `bucket`; local execution only |
+Every measurement and metric-event metadata object includes
+`opencode.metric.schema_version = "2"`. Duration instruments are Relay
+histograms with millisecond values, not synthetic duration-bucket counters.
+
+| Measurement                               | Kind      | Attributes                                                                                | Semantics                                                                           |
+| ----------------------------------------- | --------- | ----------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `opencode.runtime.activation.count`       | Counter   | schema version only                                                                       | One best-effort emission after a valid plugin-host activation.                      |
+| `opencode.agent.turn.count`               | Counter   | `runtime`, `call_role`, `outcome`                                                         | One admitted V1 or V2 logical agent turn.                                           |
+| `opencode.agent.turn.duration`            | Histogram | `runtime`, `call_role`, `outcome`                                                         | Wall time of the same logical turn.                                                 |
+| `opencode.llm.host_stream.count`          | Counter   | `call_role`, `agent_runtime`, `llm_runtime`, `provider_family`, `model_family`, `outcome` | One subscription to an OpenCode-visible LLM event stream.                           |
+| `opencode.llm.host_stream.duration`       | Histogram | host-stream attributes                                                                    | Stream lifetime through exhaustion, failure, cancellation, or explicit close.       |
+| `opencode.model_route.count`              | Counter   | `call_role`, `agent_runtime`, `llm_runtime`, `provider_family`, `model_family`            | Normalized route selected for that host stream.                                     |
+| `opencode.llm.finish_reason.count`        | Counter   | route attributes plus `finish_reason`                                                     | Normalized terminal finish reason when one was observed.                            |
+| `opencode.llm.tokens`                     | Counter   | route attributes plus `kind`                                                              | Nonnegative integral usage reported by the provider stream.                         |
+| `opencode.tool_call.count`                | Counter   | `category`, `execution`, `outcome`                                                        | One admitted local or provider-executed tool boundary.                              |
+| `opencode.tool_call.duration`             | Histogram | `category`, `outcome`                                                                     | Local tool lifetime only; provider-executed duration is not attributed to OpenCode. |
+| `opencode.llm.host_retry_scheduled.count` | Counter   | `runtime`, `attempt`                                                                      | One V1 retry scheduled by OpenCode's host retry policy.                             |
+
+LLM and turn histograms use boundaries of 100, 250, 500, 1,000, 2,000,
+5,000, 10,000, 30,000, 120,000, and 600,000 ms. Tool histograms use 10,
+25, 50, 100, 250, 500, 1,000, 2,000, 5,000, 10,000, and 30,000 ms.
 
 Token kinds are `input_total`, `input_non_cached`, `input_cache_read`,
-`input_cache_write`, `output_total`, and `output_reasoning`. They intentionally
-overlap and must not be summed into a second total. Missing provider usage is
-omitted rather than invented.
+`input_cache_write`, `output_total`, and `output_reasoning`. These fields can
+overlap and must not be summed into another total. Aggregate usage on a terminal
+`finish` event wins; otherwise the adapter sums available `step-finish` usage.
+Missing, negative, or non-finite values are omitted rather than invented.
 
-`logical_call` means one host-visible model stream. It is not a physical HTTP
-attempt metric: V1 AI SDK retries and V2 `RequestExecutor` retries happen below
-these seams. Cost is also omitted because V2 currently persists zero rather
-than a reliable normalized cost.
+### Host-stream cardinality is not network-attempt cardinality
 
-## Privacy and cardinality
+`opencode.llm.host_stream.count` deliberately says `host_stream`. The lease and
+timer start when a consumer subscribes, not when an Effect or lazy stream value
+is constructed. Re-subscribing is another host stream; never subscribing emits
+nothing.
 
-The adapter maps provider IDs, model IDs, finish reasons, and tool names into
-closed families or categories before emission. Unknown values collapse to
-`custom`, `extension`, `other`, or `unknown`.
+This is not a physical HTTP-attempt metric. AI SDK internal retries and V2
+`RequestExecutor` retries occur below the observed stream boundary. A V1 retry
+scheduled by OpenCode is reported separately and normally creates a new
+host-stream subscription, but the adapter still cannot count transport attempts
+inside either provider runtime. The retry `attempt` attribute is closed to
+`first`, `second`, or `third_or_later`.
 
-Prompts, system messages, model output, tool arguments and results, raw errors,
+The stream outcome is `success`, `provider_error`, `failed`, `cancelled`,
+`incomplete`, or `unknown`. A normally closed stream without a terminal event is
+`incomplete`; this includes intentional upstream truncation such as the V1
+compaction cutover. Pure interruption is `cancelled`; a mixed failure and
+interruption is `failed`.
+
+## Coverage and ownership
+
+The table describes code paths proven at the pinned host revision. “Observed”
+means OpenCode emits Relay metrics around a host-owned boundary. It does not
+mean Relay manages or can alter that execution.
+
+| Surface                         | V1                                                                                                                                                        | V2                                                                                                                                   | Cardinality and terminal ownership                                                                                                              |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Primary logical turn            | Observed around `SessionProcessor.process`.                                                                                                               | Observed around each runner turn; overflow recovery remains inside the owning logical turn.                                          | One turn measurement on success, failure, block, or cancellation.                                                                               |
+| Primary model stream            | Native, AI SDK, and GitLab workflow streams are observed after normalization.                                                                             | The runner's native provider stream is observed before event publication and tool settlement.                                        | One measurement per host subscription, retained through stream finalization.                                                                    |
+| Background model work           | Compaction, title, and summary agents are classified when they use the V1 stream/processor path.                                                          | Automatic compaction has both a `compaction` turn and its own observed native stream.                                                | Background work is separate from the primary stream; there is no causal scope hierarchy.                                                        |
+| Local tools                     | Normalized running tool calls are observed through processor settlement. Reused call IDs can start a later generation after the prior generation settles. | Built-in and application tools are observed at canonical `ToolRegistry.settle`, including unknown and stale calls as failures.       | A terminal claim prevents duplicate completion. Durable settlement failure is reported as failure even if tool execution returned successfully. |
+| Provider-executed tools         | Observed from normalized provider tool events without local duration.                                                                                     | Observed by the event publisher from provider call/result/error events, including unresolved calls on stream failure.                | Provider tools emit a count only; terminal publication owns completion.                                                                         |
+| Policy and human-input outcomes | Denied, rejected, and corrected permissions plus rejected questions are terminal `blocked` outcomes.                                                      | Preserved `ToolFailure.error` identities classify permission and question rejection as `blocked`. A declined turn is also `blocked`. | Policy decisions are outcomes on turns/tools, not a separate decision or latency metric.                                                        |
+| Host retry                      | V1 retry scheduling is observed.                                                                                                                          | No separate host-retry hook is present at this seam.                                                                                 | Internal transport retries are not observable here.                                                                                             |
+| Direct subtask dispatch         | The explicit task path is observed across pre-hook, child execution, post-hook, durable message/tool persistence, and synthetic summary insertion.        | No canonical V2 task-tool registration exists yet.                                                                                   | The outer task call is measured, but parent/child causal context is not propagated in Relay.                                                    |
+| Activation and shutdown         | Shared process owner for all V1 application graphs.                                                                                                       | The same process owner is provided to V2 core layers.                                                                                | Configuration owners and live observations are counted separately.                                                                              |
+
+Tool outcomes are `success`, `failed`, `blocked`, `cancelled`, or `unknown`.
+Turn outcomes are `success`, `failed`, `blocked`, or `cancelled`. Telemetry
+classification and emission are fail-open: classifier or Relay metric failures
+never replace the host result, error, cancellation, retry, or permission
+behavior.
+
+## Lifecycle and shutdown
+
+Relay plugin activation and subscribers are process-global. Effect application
+graphs acquire a shared owner, while each running turn, subscribed stream, and
+admitted tool observation owns a separate operation lease. Releasing the last
+application owner stops admission for that activation, waits for accepted
+operations, flushes subscribers once, and closes the activation. A later owner
+waits for teardown before reopening.
+
+Explicit process shutdown follows the same order:
+
+1. Stop admitting new observations.
+2. Wait for admitted turns, streams, and tools to finish within the shared
+   deadline.
+3. Flush queued subscriber publication once for the activation.
+4. Close the plugin-host activation.
+
+The default adapter deadline is five seconds. Flush and close are both attempted
+when time permits; a flush failure is retained and cannot later be reported as a
+successful shutdown. An incomplete native close retains its activation so a
+subsequent shutdown attempt can continue it instead of opening a competing
+plugin host. Shutdown calls are single-flight while one attempt is running.
+
+Normal command termination now reaches one root finalizer before the remaining
+forced process exit. The `serve` and `web` commands translate SIGINT/SIGTERM into
+structured shutdown, stop their server, and dispose reachable instances first.
+The TUI worker similarly stops admission, disposes instances and its application
+runtime, then gives Relay a bounded final drain. SIGKILL, host termination, or a
+deadline overrun can still abandon telemetry; OpenCode prints a warning when the
+Relay result is not fully drained, flushed, and closed.
+
+Only `serve` and `web` currently coordinate SIGINT/SIGTERM with structured
+shutdown. An OS signal delivered to another command, including the TUI parent,
+can bypass the root or worker cleanup path and abandon telemetry. A
+command-wide signal coordinator remains required before those paths can claim
+graceful signal shutdown.
+
+## Privacy and bounded cardinality
+
+Raw provider and model identifiers are mapped before emission. Provider values
+collapse to `anthropic`, `openai`, `azure`, `google`, `amazon`, `github`,
+`openrouter`, `opencode`, `local`, `custom`, or `unknown`. Model values collapse
+to a known family (`claude`, `gemini`, `gemma`, `nemotron`, `gpt`, `llama`,
+`qwen`, `deepseek`, `mistral`, `grok`, `glm`, or `kimi`) or `custom`/`unknown`.
+Finish reasons, roles, runtimes, outcomes, retry attempts, and tool execution
+modes are closed enums.
+
+Tool names are reduced to categories: code search, file read/write, terminal,
+code execution, delegation, planning, human input, web, skill, MCP, provider,
+extension, other, or unknown. An unrecognized or dynamically named tool becomes
+`extension`; its raw name is not emitted.
+
+Prompts, system messages, model output, tool arguments and results, error text,
 commands, URLs, headers, file paths, working directories, repository or user
-names, API material, and raw session/message/tool-call IDs are never Relay
-metric attributes. Existing OpenCode OpenTelemetry remains independent; this
-spike does not duplicate its spans.
+names, credentials, and raw session, message, or tool-call IDs are not metric
+attributes. Durations and token values are measurements rather than attribute
+values. The activation health surface exposes diagnostic counts, not paths or
+diagnostic text.
 
-## Lifecycle and disabled parity
+Existing OpenCode OpenTelemetry remains independent. This adapter does not
+duplicate its spans or attach the Relay metrics to those span contexts.
 
-One process-global activation is reference counted across Effect application
-graphs. The last release flushes subscribers and closes the plugin activation.
-A later acquire waits for that close before initializing again. Explicit
-shutdown stops new acquisitions and performs a bounded flush/close.
+## Known limitations and deferred work
 
-The disabled LLM and tool paths return their original stream or settlement
-effect without adding observation wrappers. Relay is never allowed to change a
-provider request, tool result, retry decision, cancellation, or error in this
-phase.
+- This is observation-only integration. It has no Relay scopes, trace
+  parentage, context propagation, managed tool or LLM execution, Relay policy
+  enforcement, request/result mutation, or provider gateway routing.
+- No metric identifies a session, run, message, tool call, user, tenant, or
+  repository. That privacy boundary also means downstream metrics cannot
+  reconstruct per-session causal trees.
+- V1 AI SDK and V2 request-executor physical attempts are hidden below the host
+  stream. Cost is omitted because the host does not expose one reliable,
+  normalized value at these seams.
+- The non-streaming agent-generation call (`generateObject`) bypasses the
+  observed LLM stream service.
+- Nested work inside an observed tool is not automatically another tool
+  boundary. Code-mode child MCP calls and attachment preprocessing that invokes
+  helpers directly require their own attachment points.
+- V1 dynamic MCP tools are observed at their outer tool boundary, but unknown
+  dynamic names collapse to `extension`; MCP provenance is not complete. V2
+  core does not yet have canonical MCP or task-tool registration, so those paths
+  are not claimed as covered.
+- Direct subtasks have an outer delegation metric and child work may emit its
+  own independent metrics, but there is no Relay parent/child scope linking the
+  two.
+- Policy denial is represented as a blocked terminal outcome. There is no
+  provider-neutral decision event, permission-wait duration, or approval actor
+  dimension.
+- Plugin-host health does not probe exporter delivery. A collector outage can
+  coexist with `active` health; validate the destination and shutdown flush.
+- A standalone OpenCode binary does not yet carry a target-compatible Relay
+  addon. Bun compatibility beyond the pinned development environment and the
+  complete release target matrix remain unqualified.
 
-## Packaging blocker
+Managed execution should remain a separate change. In the pinned Bun probes, a
+throwing host `AsyncIterable` did not cross Relay's Node stream bridge with the
+required failure semantics, Relay JSON conversion rejected own properties whose
+value was `undefined`, and callback errors lost the host-specific class identity
+used by permission handling. Dedicated stream, JSON-boundary, and error-identity
+adapters need qualification before Relay can safely own OpenCode callbacks.
+Relay provider codecs also describe provider-wire payloads, while the default
+V1 seam exposes normalized AI SDK objects; attach a codec only at a matching
+native provider boundary.
 
-This branch deliberately does not add `nemo-relay-node` as a normal workspace
-dependency. The runtime-dynamic import prevents Bun from eagerly embedding all
-native packages, but it also means an installed development module must be
-resolvable at runtime. A released standalone OpenCode binary cannot rely on
-that arrangement.
+## Qualification
 
-Relay 0.9.3 publishes seven native variants covering Linux x64/arm64 glibc and
-musl, macOS arm64, and Windows x64/arm64. OpenCode builds twelve standalone
-targets, including two macOS x64 variants for which Relay has no artifact. In a
-local packaging probe, a naive import embedded every installed Relay addon and
-grew the Bun executable to roughly 215 MB.
+Run tests from their package directories, never from the repository root.
 
-First-class distribution therefore needs a target-pruned loader/package, an
-explicit macOS x64 policy or artifact, packaged-path tests, and CI execution on
-the complete OS/architecture/libc matrix. Relay declares Node.js 24 or newer;
-Bun compatibility was demonstrated locally but is not yet an advertised Relay
-support contract.
+```bash
+(cd packages/core && bun test \
+  test/observability-nemo-relay.test.ts \
+  test/session-runner-tool-events.test.ts \
+  test/session-runner-tool-registry.test.ts \
+  test/session-runner.test.ts \
+  --timeout 30000)
 
-## Why managed execution is deferred
+# Run these separately; concurrent Bun test processes can contend for a test port.
+(cd packages/opencode && bun test test/session/llm.test.ts --timeout 30000)
+(cd packages/opencode && bun test test/session/processor-effect.test.ts --timeout 30000)
+(cd packages/opencode && bun test test/session/prompt.test.ts --timeout 30000)
 
-Basic Relay 0.9.3 operation works on Bun 1.3.14/macOS arm64, including scope
-isolation, metrics, plugin activation, managed tools, and the successful typed
-stream path. The OpenCode adapter's activation, metric, flush, and close path
-was also exercised against the published 0.9.3 addon. Three semantic gaps
-block safe managed execution in OpenCode:
+(cd packages/core && bun typecheck)
+(cd packages/opencode && bun typecheck)
+```
 
-1. A throwing host `AsyncIterable` passed through `typedLlmStreamExecute`
-   produced an unhandled Bun rejection while Relay observed normal EOF. Relay
-   needs a fallible Node stream bridge before it can own OpenCode streaming.
-2. Relay JSON conversion rejects own properties whose value is `undefined`.
-   OpenCode tool values require an explicit recursive JSON-boundary codec.
-3. Callback errors cross N-API as generic `Error` values. OpenCode relies on
-   identities such as `PermissionV1.RejectedError`, so a managed adapter must
-   capture and rethrow the original host error.
+The focused suite covers disabled parity, invalid configuration, supported and
+unsupported runtime loading, report/health projection, lazy streams,
+resubscription, usage aggregation, cancellation, blocked outcomes, duplicate
+tool terminals, provider tools, V1 retry generations, shared owners, activation
+races, bounded drain, failed flush/close, and shutdown retry.
 
-Relay provider codecs also describe provider-wire payloads, while OpenCode's
-default AI SDK seam exposes normalized SDK objects. Codec claims must be made
-only at a matching native provider boundary.
+### Relay-backed live exercise
 
-## Next qualification gates
+Use the published 0.9.3 addon, a real subscriber, and an actual OpenCode model
+stream. A minimal local ATOF file subscriber is sufficient to prove delivery:
 
-Before proposing this upstream, add target-pruned packaging, full disabled and
-activation tests, stream error/cancellation coverage for both V1 runtimes,
-remaining V2 model-call coverage, command-wide graceful shutdown, concurrent
-session tests, and an end-to-end run using a real Relay subscriber. Managed
-model/tool middleware should remain a separate phase after the Relay stream
-bridge and JSON/error adapters are fixed.
+```toml
+version = 1
+
+[[components]]
+kind = "observability"
+enabled = true
+
+[components.config]
+version = 4
+
+[components.config.atof]
+enabled = true
+
+[[components.config.atof.sinks]]
+type = "file"
+output_directory = "/absolute/path/to/relay-output"
+filename = "events.jsonl"
+mode = "append"
+```
+
+Install `nemo-relay-node@0.9.3` outside the workspace or otherwise make its
+entry point resolvable. First check activation, then run inference through the
+same CLI and provider configuration used in production:
+
+```bash
+export OPENCODE_NEMO_RELAY=1
+export OPENCODE_NEMO_RELAY_RUNTIME_MODULE=/absolute/path/to/node_modules/nemo-relay-node/index.js
+export OPENCODE_NEMO_RELAY_PLUGINS_TOML=/absolute/path/to/plugins.toml
+
+bun run --cwd packages/opencode src/index.ts debug nemo-relay
+bun run --cwd packages/opencode src/index.ts run \
+  --model provider/model \
+  "Read one harmless project file, then reply with a one-line summary."
+
+rg 'opencode\.(runtime|agent|llm|model|tool)' /absolute/path/to/relay-output/events.jsonl
+```
+
+A passing exercise requires more than process exit zero:
+
+- health is `active` with the expected configuration and no unexpected
+  degradation;
+- the model completes through the real host stream and the requested tool, when
+  selected, completes normally;
+- the file contains activation, turn, host-stream, route, and applicable token
+  and tool measurements with schema version 2;
+- no prompt, output, path, raw model/provider ID, call ID, or credential appears
+  in emitted metric attributes;
+- the command exits without an incomplete-shutdown warning; and
+- the final records are present after exit, proving that subscriber flush and
+  activation close ran.
+
+Repeat the exercise for both V1 AI SDK and native runtimes, V2 when enabled, a
+tool failure, policy rejection, cancellation, host retry, partial stream close,
+and concurrent sessions before treating a packaged target as qualified.

@@ -2,6 +2,7 @@ import { Effect } from "effect"
 import { effectCmd } from "../effect-cmd"
 import { withNetworkOptions, resolveNetworkOptions } from "../network"
 import { Flag } from "@opencode-ai/core/flag/flag"
+import { shutdownServer, waitForTerminationSignal } from "../signal"
 
 export const ServeCommand = effectCmd({
   command: "serve",
@@ -19,6 +20,6 @@ export const ServeCommand = effectCmd({
     const server = yield* Effect.promise(() => Server.listen(opts))
     console.log(`opencode server listening on http://${server.hostname}:${server.port}`)
 
-    yield* Effect.never
+    yield* waitForTerminationSignal.pipe(Effect.ensuring(shutdownServer(server)))
   }),
 })
