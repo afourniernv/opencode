@@ -41,6 +41,7 @@ for (const api of ["chat", "messages", "responses"] as const) {
           const generate = LLMClient.generate(
             LLM.request({
               model,
+              cache: api === "messages" ? "none" : undefined,
               prompt: "Use get_weather to look up the current weather in Paris.",
               tools: [weather],
               toolChoice,
@@ -82,6 +83,7 @@ for (const api of ["chat", "messages", "responses"] as const) {
         const response = yield* LLMClient.generate(
           LLM.request({
             model,
+            cache: api === "messages" ? "none" : undefined,
             messages: [
               Message.user([
                 { type: "text", text: "Read the three words in this image. Reply only with those words in order." },
@@ -107,6 +109,7 @@ for (const api of ["chat", "messages", "responses"] as const) {
         const response = yield* LLMClient.generate(
           LLM.request({
             model,
+            cache: api === "messages" ? "none" : undefined,
             prompt: "Return a JSON object containing the capital city of France.",
             generation: { maxTokens: 4096 },
             http: {

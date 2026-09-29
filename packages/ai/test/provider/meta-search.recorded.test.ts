@@ -23,6 +23,7 @@ for (const api of ["responses", "messages"] as const) {
       Effect.gen(function* () {
         const request = LLM.request({
           model: meta[api]("muse-spark-1.3"),
+          cache: api === "messages" ? "none" : undefined,
           prompt:
             "Use web search to find NASA's page identifying the first person to walk on the Moon. Answer in one sentence with a source citation.",
           tools: [Meta.webSearch()],

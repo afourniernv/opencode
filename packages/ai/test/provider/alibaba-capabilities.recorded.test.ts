@@ -27,6 +27,7 @@ for (const api of ["chat", "messages", "responses"] as const) {
           Effect.gen(function* () {
             const request = LLM.request({
               model: alibaba[api]("qwen3.7-plus"),
+              cache: api === "messages" ? "none" : undefined,
               providerOptions:
                 api === "messages"
                   ? { thinking: { type: enabled ? "enabled" : "disabled", ...(enabled ? { budgetTokens: 1024 } : {}) } }
@@ -61,6 +62,7 @@ for (const api of ["chat", "messages", "responses"] as const) {
           const response = yield* LLMClient.generate(
             LLM.request({
               model: alibaba[api]("qwen3.8-flash"),
+              cache: api === "messages" ? "none" : undefined,
               providerOptions: api === "messages" ? { thinking: { type: "disabled" } } : { enableThinking: false },
               messages: [
                 Message.user([
@@ -84,6 +86,7 @@ for (const api of ["chat", "messages", "responses"] as const) {
           const response = yield* LLMClient.generate(
             LLM.request({
               model: alibaba[api]("qwen3.8-max"),
+              cache: api === "messages" ? "none" : undefined,
               prompt: "Find the current weather in Paris.",
               providerOptions: api === "messages" ? { thinking: { type: "disabled" } } : { reasoningEffort: "none" },
               tools: [
@@ -137,6 +140,7 @@ record("messages").effect.with(
       const response = yield* LLMClient.generate(
         LLM.request({
           model: alibaba.messages("qwen3.8-max"),
+          cache: "none",
           prompt: 'Return a JSON object with one key "city" set to the capital city of France.',
           providerOptions: {
             thinking: { type: "disabled" },
