@@ -94,7 +94,6 @@ describe("MiniMax recorded", () => {
         Effect.gen(function* () {
           const request = LLM.request({
             model: item.model,
-            cache: item.api === "messages" ? "none" : undefined,
             prompt: "What is 173 multiplied by 219? Reply with only the final integer.",
             generation: { maxTokens: 1536 },
           })
@@ -129,7 +128,6 @@ describe("MiniMax recorded", () => {
         const response = yield* LLMClient.generate(
           LLM.request({
             model: minimax.model("MiniMax-M3"),
-            cache: "none",
             prompt: "Use get_weather to look up the current weather in Paris.",
             tools: [weather],
             toolChoice: ToolChoice.named("get_weather"),
@@ -181,7 +179,6 @@ describe("MiniMax recorded", () => {
         Effect.gen(function* () {
           const request = LLM.request({
             model: item.model,
-            cache: item.api === "messages" ? "none" : undefined,
             prompt:
               "Look up the current weather in Paris using get_weather before answering. After receiving the result, report the weather in one short sentence.",
             tools: [weather],

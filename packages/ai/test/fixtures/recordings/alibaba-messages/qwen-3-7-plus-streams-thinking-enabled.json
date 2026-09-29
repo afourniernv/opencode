@@ -21,7 +21,7 @@
         "headers": {
           "content-type": "application/json"
         },
-        "body": "{\"model\":\"qwen3.7-plus\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"What is 173 multiplied by 219? Reply with only the final integer.\"}]}],\"stream\":true,\"max_tokens\":4096,\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":1024}}"
+        "body": "{\"model\":\"qwen3.7-plus\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"What is 173 multiplied by 219? Reply with only the final integer.\",\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"stream\":true,\"max_tokens\":4096,\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":1024}}"
       },
       "response": {
         "status": 200,

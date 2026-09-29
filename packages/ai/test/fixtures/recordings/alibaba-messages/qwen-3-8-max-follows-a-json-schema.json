@@ -20,7 +20,7 @@
         "headers": {
           "content-type": "application/json"
         },
-        "body": "{\"model\":\"qwen3.8-max\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Return a JSON object with one key \\\"city\\\" set to the capital city of France.\"}]}],\"stream\":true,\"max_tokens\":1024,\"thinking\":{\"type\":\"disabled\"},\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"additionalProperties\":false}}}}"
+        "body": "{\"model\":\"qwen3.8-max\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Return a JSON object with one key \\\"city\\\" set to the capital city of France.\",\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"stream\":true,\"max_tokens\":1024,\"thinking\":{\"type\":\"disabled\"},\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"additionalProperties\":false}}}}"
       },
       "response": {
         "status": 200,

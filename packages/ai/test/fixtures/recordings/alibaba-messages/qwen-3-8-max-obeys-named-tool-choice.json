@@ -21,7 +21,7 @@
         "headers": {
           "content-type": "application/json"
         },
-        "body": "{\"model\":\"qwen3.8-max\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Find the current weather in Paris.\"}]}],\"tools\":[{\"name\":\"get_weather\",\"description\":\"Get weather in a city\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"enum\":[\"Paris\"]}},\"required\":[\"city\"]}}],\"tool_choice\":{\"type\":\"tool\",\"name\":\"get_weather\"},\"stream\":true,\"max_tokens\":4096,\"thinking\":{\"type\":\"disabled\"}}"
+        "body": "{\"model\":\"qwen3.8-max\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Find the current weather in Paris.\",\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"tools\":[{\"name\":\"get_weather\",\"description\":\"Get weather in a city\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"enum\":[\"Paris\"]}},\"required\":[\"city\"]},\"cache_control\":{\"type\":\"ephemeral\"}}],\"tool_choice\":{\"type\":\"tool\",\"name\":\"get_weather\"},\"stream\":true,\"max_tokens\":4096,\"thinking\":{\"type\":\"disabled\"}}"
       },
       "response": {
         "status": 200,

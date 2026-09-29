@@ -15,7 +15,7 @@
         "headers": {
           "content-type": "application/json"
         },
-        "body": "{\"model\":\"kimi-k3\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"What is 173 multiplied by 219? Reply with only the final integer.\"}]}],\"stream\":true,\"max_tokens\":4096,\"output_config\":{\"effort\":\"max\"}}"
+        "body": "{\"model\":\"kimi-k3\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"What is 173 multiplied by 219? Reply with only the final integer.\",\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"stream\":true,\"max_tokens\":4096,\"output_config\":{\"effort\":\"max\"}}"
       },
       "response": {
         "status": 200,

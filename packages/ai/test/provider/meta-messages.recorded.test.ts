@@ -23,7 +23,6 @@ for (const mode of ["adaptive", "enabled"] as const) {
       Effect.gen(function* () {
         const request = LLM.request({
           model,
-          cache: "none",
           prompt: "What is 173 multiplied by 219? Reply with only the final integer.",
           generation: { maxTokens: 2048 },
           providerOptions: {
@@ -63,7 +62,6 @@ recorded.effect.with(
     Effect.gen(function* () {
       const request = LLM.request({
         model,
-        cache: "none",
         prompt:
           "Look up the current weather in Paris using lookup_weather. After receiving the result, report Paris's weather in one short sentence.",
         tools: [

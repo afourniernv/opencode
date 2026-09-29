@@ -15,7 +15,7 @@
         "headers": {
           "content-type": "application/json"
         },
-        "body": "{\"model\":\"kimi-k3\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Use get_weather to look up the current weather in Paris.\"}]}],\"tools\":[{\"name\":\"get_weather\",\"description\":\"Get the current weather in a city\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"enum\":[\"Paris\"]}},\"required\":[\"city\"],\"additionalProperties\":false}}],\"tool_choice\":{\"type\":\"any\"},\"stream\":true,\"max_tokens\":4096,\"output_config\":{\"effort\":\"low\"}}"
+        "body": "{\"model\":\"kimi-k3\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Use get_weather to look up the current weather in Paris.\",\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"tools\":[{\"name\":\"get_weather\",\"description\":\"Get the current weather in a city\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"enum\":[\"Paris\"]}},\"required\":[\"city\"],\"additionalProperties\":false},\"cache_control\":{\"type\":\"ephemeral\"}}],\"tool_choice\":{\"type\":\"any\"},\"stream\":true,\"max_tokens\":4096,\"output_config\":{\"effort\":\"low\"}}"
       },
       "response": {
         "status": 200,

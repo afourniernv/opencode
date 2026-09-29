@@ -23,7 +23,6 @@ for (const api of ["chat", "messages", "responses"] as const) {
               apiKey,
               providerOptions: api === "messages" ? { effort } : { reasoningEffort: effort },
             })[api]("kimi-k3"),
-            cache: api === "messages" ? "none" : undefined,
             prompt: "What is 173 multiplied by 219? Reply with only the final integer.",
             generation: { maxTokens: 4096 },
           })
@@ -109,7 +108,6 @@ for (const item of [
       Effect.gen(function* () {
         const request = LLM.request({
           model: Moonshot.configure({ apiKey, providerOptions: item.options })[item.api](item.model),
-          cache: item.api === "messages" ? "none" : undefined,
           prompt:
             "Use get_weather to look up the current weather in Paris. After receiving the result, report the weather in one short sentence.",
           tools: [weather],
