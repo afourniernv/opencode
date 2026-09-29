@@ -3,7 +3,7 @@ import { Protocol } from "../route/protocol.js"
 import type { LLMRequest } from "../schema/index.js"
 import { AnthropicMessages } from "./anthropic-messages.js"
 import { MetaResponses } from "./meta-responses.js"
-import { JsonObject, optionalArray, ProviderShared } from "./shared.js"
+import { optionalArray, ProviderShared } from "./shared.js"
 
 const WebSearch = Schema.Struct({
   type: Schema.Literal("web_search"),
@@ -12,12 +12,7 @@ const WebSearch = Schema.Struct({
 })
 const Body = Schema.Struct({
   ...AnthropicMessages.AnthropicMessagesBody.fields,
-  tools: optionalArray(
-    Schema.Union([
-      Schema.Struct({ name: Schema.String, description: Schema.String, input_schema: JsonObject }),
-      WebSearch,
-    ]),
-  ),
+  tools: optionalArray(Schema.Union([AnthropicMessages.AnthropicTool, WebSearch])),
 })
 
 const fromRequest = Effect.fn("MetaMessages.fromRequest")(function* (request: LLMRequest) {

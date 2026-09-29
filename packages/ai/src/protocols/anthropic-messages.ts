@@ -250,7 +250,7 @@ const AnthropicMessage = Schema.Union([
 ]).pipe(Schema.toTaggedUnion("role"))
 type AnthropicMessage = Schema.Schema.Type<typeof AnthropicMessage>
 
-const AnthropicTool = Schema.Struct({
+export const AnthropicTool = Schema.Struct({
   name: Schema.String,
   description: Schema.String,
   input_schema: JsonObject,
