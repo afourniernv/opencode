@@ -55,6 +55,7 @@ import { ReferenceGuidance } from "@opencode-ai/core/reference/guidance"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Location } from "@opencode-ai/core/location"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import * as NemoRelay from "@opencode-ai/core/observability/nemo-relay"
 import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
 import { asc, eq } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
@@ -71,6 +72,15 @@ let toolExecutionsStarted: Deferred.Deferred<void> | undefined
 let toolExecutionsReady = 5
 let activeToolExecutions = 0
 let maxActiveToolExecutions = 0
+const relayObservations: NemoRelay.LlmCompleted[] = []
+const relay = Layer.succeed(
+  NemoRelay.Service,
+  NemoRelay.Service.of({
+    status: { state: "active" },
+    llmCompleted: (input) => Effect.sync(() => relayObservations.push(input)),
+    toolCompleted: () => Effect.void,
+  }),
+)
 const client = Layer.succeed(
   LLMClient.Service,
   LLMClient.Service.of({
@@ -235,6 +245,7 @@ const runnerLayer = AppNodeBuilder.build(SessionRunnerLLM.node, [
   [ReferenceGuidance.node, referenceGuidance],
   [PermissionV2.node, permission],
   [Config.node, config],
+  [NemoRelay.node, relay],
 ])
 const execution = Layer.effect(
   SessionExecution.Service,
@@ -285,6 +296,7 @@ const it = testEffect(
       [Snapshot.node, Snapshot.noopLayer],
       [SessionExecution.node, execution],
       [Config.node, config],
+      [NemoRelay.node, relay],
     ],
   ),
 )
@@ -329,6 +341,7 @@ const setup = Effect.gen(function* () {
   toolExecutionsReady = 5
   activeToolExecutions = 0
   maxActiveToolExecutions = 0
+  relayObservations.length = 0
   yield* db
     .insert(ProjectTable)
     .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
@@ -1464,6 +1477,25 @@ describe("SessionRunnerLLM", () => {
               },
             },
           ],
+        },
+      ])
+      expect(relayObservations).toEqual([
+        {
+          role: "primary",
+          runtime: "native",
+          provider: "fake",
+          model: "fake-model",
+          outcome: "success",
+          finish: "tool-calls",
+          durationMs: expect.any(Number),
+          tokens: {
+            inputTotal: 10,
+            inputNonCached: 8,
+            inputCacheRead: 2,
+            inputCacheWrite: undefined,
+            outputTotal: 4,
+            outputReasoning: 1,
+          },
         },
       ])
     }),

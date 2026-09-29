@@ -25,6 +25,7 @@ import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
+import * as NemoRelay from "@opencode-ai/core/observability/nemo-relay"
 
 const DOOM_LOOP_THRESHOLD = 3
 export type Result = "compact" | "stop" | "continue"
@@ -94,6 +95,7 @@ const layer = Layer.effect(
     const image = yield* Image.Service
     const events = yield* EventV2Bridge.Service
     const database = yield* Database.Service
+    const relay = yield* NemoRelay.Service
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
@@ -168,6 +170,8 @@ const layer = Layer.effect(
       ) {
         const match = yield* readToolCall(toolCallID)
         if (!match || match.part.state.status !== "running") return
+        const end = Date.now()
+        const providerExecuted = match.part.metadata?.providerExecuted === true
         yield* session.updatePart({
           ...match.part,
           state: {
@@ -176,16 +180,28 @@ const layer = Layer.effect(
             output: output.output,
             metadata: output.metadata,
             title: output.title,
-            time: { start: match.part.state.time.start, end: Date.now() },
+            time: { start: match.part.state.time.start, end },
             attachments: output.attachments,
           },
         })
+        if (relay.status.state === "active")
+          yield* relay.toolCompleted({
+            name: match.part.tool,
+            outcome: "success",
+            execution: providerExecuted ? "provider" : "local",
+            durationMs: providerExecuted ? undefined : end - match.part.state.time.start,
+          })
         yield* settleToolCall(toolCallID)
       })
 
       const failToolCall = Effect.fn("SessionProcessor.failToolCall")(function* (toolCallID: string, error: unknown) {
         const match = yield* readToolCall(toolCallID)
         if (!match || match.part.state.status !== "running") return false
+        const end = Date.now()
+        const providerExecuted = match.part.metadata?.providerExecuted === true
+        const rejected = error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError
+        const cancelled =
+          !rejected && typeof error === "object" && error !== null && "name" in error && error.name === "AbortError"
         yield* session.updatePart({
           ...match.part,
           state: {
@@ -194,10 +210,17 @@ const layer = Layer.effect(
             error: errorMessage(error),
             // Keep metadata streamed while running so failures retain progress detail (e.g. execute's child calls).
             metadata: match.part.state.metadata,
-            time: { start: match.part.state.time.start, end: Date.now() },
+            time: { start: match.part.state.time.start, end },
           },
         })
-        if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
+        if (relay.status.state === "active")
+          yield* relay.toolCompleted({
+            name: match.part.tool,
+            outcome: rejected ? "blocked" : cancelled ? "cancelled" : "failed",
+            execution: providerExecuted ? "provider" : "local",
+            durationMs: providerExecuted ? undefined : end - match.part.state.time.start,
+          })
+        if (rejected) {
           ctx.blocked = ctx.shouldBreak
         }
         yield* settleToolCall(toolCallID)
@@ -604,6 +627,17 @@ const layer = Layer.effect(
               time: { start: "time" in part.state ? part.state.time.start : end, end },
             },
           })
+          const providerExecuted = part.metadata?.providerExecuted === true
+          if (relay.status.state === "active")
+            yield* relay.toolCompleted({
+              name: part.tool,
+              outcome: "cancelled",
+              execution: providerExecuted ? "provider" : "local",
+              durationMs:
+                providerExecuted || !("time" in part.state) || part.state.time.start === undefined
+                  ? undefined
+                  : end - part.state.time.start,
+            })
         }
         ctx.toolcalls = {}
         ctx.assistantMessage.time.completed = Date.now()
@@ -726,6 +760,7 @@ export const node = LayerNode.make({
     Image.node,
     EventV2Bridge.node,
     Database.node,
+    NemoRelay.node,
   ],
 })
 

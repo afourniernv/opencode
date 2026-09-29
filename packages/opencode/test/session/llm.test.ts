@@ -28,6 +28,7 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { LayerNodePlatform } from "@opencode-ai/core/effect/app-node-platform"
 import { ProviderError } from "@/provider/error"
+import * as NemoRelay from "@opencode-ai/core/observability/nemo-relay"
 
 type ConfigModel = NonNullable<NonNullable<ConfigV1.Info["provider"]>[string]["models"]>[string]
 
@@ -78,11 +79,13 @@ function llmLayerWithExecutor(
   options: {
     executor?: Layer.Layer<RequestExecutor.Service>
     flags?: Partial<RuntimeFlags.Info>
+    relay?: Layer.Layer<NemoRelay.Service>
   } = {},
 ) {
   return AppNodeBuilder.build(LLM.node, [
     [RuntimeFlags.node, RuntimeFlags.layer(options.flags)],
     ...(options.executor ? ([[LayerNodePlatform.requestExecutor, options.executor]] as const) : []),
+    ...(options.relay ? ([[NemoRelay.node, options.relay]] as const) : []),
   ])
 }
 
@@ -1481,6 +1484,15 @@ describe("session.llm.stream", () => {
     "streams OpenAI through native runtime when opted in",
     () =>
       Effect.gen(function* () {
+        const observed: NemoRelay.LlmCompleted[] = []
+        const relay = Layer.succeed(
+          NemoRelay.Service,
+          NemoRelay.Service.of({
+            status: { state: "active" },
+            llmCompleted: (input) => Effect.sync(() => observed.push(input)),
+            toolCompleted: () => Effect.void,
+          }),
+        )
         const model = loadFixture("openai", "gpt-5.2").model
         const chunks = [
           { type: "response.created", response: { id: "resp-native" } },
@@ -1514,7 +1526,7 @@ describe("session.llm.stream", () => {
           temperature: 0.2,
         } satisfies Agent.Info
 
-        yield* drainWith(llmLayerWithExecutor({ flags: { experimentalNativeLlm: true } }), {
+        yield* drainWith(llmLayerWithExecutor({ flags: { experimentalNativeLlm: true }, relay }), {
           user: {
             id: MessageID.make("msg_user-native"),
             sessionID,
@@ -1540,6 +1552,15 @@ describe("session.llm.stream", () => {
         expect(capture.body.include).toEqual(["reasoning.encrypted_content"])
         expect(JSON.stringify(capture.body.input)).toContain("You are a helpful assistant.")
         expect(capture.body.input).toContainEqual({ role: "user", content: [{ type: "input_text", text: "Hello" }] })
+        expect(observed).toHaveLength(1)
+        expect(observed[0]).toMatchObject({
+          role: "primary",
+          runtime: "native",
+          provider: "openai",
+          model: model.id,
+          outcome: "success",
+          finish: "stop",
+        })
       }),
     { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
   )

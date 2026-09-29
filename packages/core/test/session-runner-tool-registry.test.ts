@@ -4,6 +4,7 @@ import { AgentV2 } from "@opencode-ai/core/agent"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ApplicationTools } from "@opencode-ai/core/tool/application-tools"
+import * as NemoRelay from "@opencode-ai/core/observability/nemo-relay"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
@@ -29,8 +30,26 @@ const outputStore = Layer.mock(ToolOutputStore.Service, {
     )
   },
 })
+const relayObservations: NemoRelay.ToolCompleted[] = []
+const relay = Layer.succeed(
+  NemoRelay.Service,
+  NemoRelay.Service.of({
+    status: { state: "active" },
+    llmCompleted: () => Effect.void,
+    toolCompleted: (input) =>
+      Effect.sync(() => {
+        relayObservations.push(input)
+      }),
+  }),
+)
 const registryLayer = AppNodeBuilder.build(ToolRegistry.node, [[ToolOutputStore.node, outputStore]])
 const it = testEffect(registryLayer)
+const observed = testEffect(
+  AppNodeBuilder.build(ToolRegistry.node, [
+    [ToolOutputStore.node, outputStore],
+    [NemoRelay.node, relay],
+  ]),
+)
 const integrated = testEffect(
   AppNodeBuilder.build(LayerNode.group([ApplicationTools.node, ToolRegistry.node]), [
     [ToolOutputStore.node, outputStore],
@@ -200,6 +219,76 @@ describe("ToolRegistry", () => {
           Effect.catchDefect(Effect.succeed),
         ),
       ).toBe("unexpected executor defect")
+    }),
+  )
+
+  observed.effect("observes only settled calls with conservative outcomes", () =>
+    Effect.gen(function* () {
+      relayObservations.length = 0
+      const service = yield* ToolRegistry.Service
+      yield* service.register({
+        echo: make(),
+        failed: Tool.make({
+          description: "Failed",
+          input: Schema.Struct({}),
+          output: Schema.Struct({ ok: Schema.Boolean }),
+          execute: () => Effect.fail(new Tool.Failure({ message: "Denied" })),
+        }),
+      })
+
+      expect(yield* executeTool(service, call("echo"))).toEqual({ type: "text", value: "echo" })
+      expect(
+        yield* executeTool(service, {
+          sessionID,
+          ...identity,
+          call: { type: "tool-call", id: "failed", name: "failed", input: {} },
+        }),
+      ).toEqual({ type: "error", value: "Denied" })
+      expect(yield* executeTool(service, call("missing"))).toEqual({ type: "error", value: "Unknown tool: missing" })
+      expect(
+        yield* executeTool(service, {
+          ...call("echo", "provider-echo"),
+          call: { ...call("echo", "provider-echo").call, providerExecuted: true },
+        }),
+      ).toEqual({ type: "text", value: "echo" })
+
+      expect(relayObservations).toHaveLength(3)
+      expect(relayObservations[0]).toMatchObject({ name: "echo", execution: "local", outcome: "success" })
+      expect(relayObservations[0]?.durationMs).toBeNumber()
+      expect(relayObservations[1]).toMatchObject({ name: "failed", execution: "local", outcome: "failed" })
+      expect(relayObservations[1]?.durationMs).toBeNumber()
+      expect(relayObservations[2]).toEqual({ name: "echo", execution: "provider", outcome: "success" })
+    }),
+  )
+
+  observed.effect("records a purely interrupted settlement once as cancelled", () =>
+    Effect.gen(function* () {
+      relayObservations.length = 0
+      const service = yield* ToolRegistry.Service
+      const started = yield* Deferred.make<void>()
+      yield* service.register({
+        waiting: Tool.make({
+          description: "Wait forever",
+          input: Schema.Struct({}),
+          output: Schema.Struct({}),
+          execute: () => Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)),
+        }),
+      })
+      const settlement = yield* settleTool(service, {
+        sessionID,
+        ...identity,
+        call: { type: "tool-call", id: "waiting", name: "waiting", input: {} },
+      }).pipe(Effect.forkChild)
+      yield* Deferred.await(started)
+      yield* Fiber.interrupt(settlement)
+
+      expect(relayObservations).toHaveLength(1)
+      expect(relayObservations[0]).toMatchObject({
+        name: "waiting",
+        execution: "local",
+        outcome: "cancelled",
+      })
+      expect(relayObservations[0]?.durationMs).toBeNumber()
     }),
   )
 
