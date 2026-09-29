@@ -84,22 +84,27 @@ export const responseHttp = (response: HttpClientResponse.HttpClientResponse) =>
     headers: headerDetails(response.headers),
   })
 
-const decodeProviderBody = Schema.decodeUnknownOption(
-  Schema.fromJsonString(
-    Schema.Struct({
-      message: Schema.optionalKey(Schema.String),
-      error: Schema.optionalKey(Schema.Struct({ message: Schema.optionalKey(Schema.String) })),
-    }),
-  ),
-)
+const decodeProviderBody = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown))
+const MAX_BODY_MESSAGE_CHARS = 1000
 
+// Providers disagree on error body layouts. Known message fields are shown as-is;
+// any other body is appended raw so the provider's explanation is never dropped.
 const providerMessage = (status: number, body: string | void) => {
-  const decoded = body === undefined ? undefined : Option.getOrUndefined(decodeProviderBody(body))
-  return (
-    [decoded?.error?.message, decoded?.message].find((message) => message?.trim()) ??
-    `Provider request failed with HTTP ${status}`
-  )
+  const fallback = `Provider request failed with HTTP ${status}`
+  const text = body?.trim()
+  if (!text) return fallback
+  const decoded = Option.getOrUndefined(decodeProviderBody(text))
+  const error = isRecord(decoded) ? decoded.error : undefined
+  const message = [isRecord(error) ? error.message : undefined, error, isRecord(decoded) ? decoded.message : undefined]
+    .filter((value): value is string => typeof value === "string")
+    .find((value) => value.trim())
+  if (message) return message
+  // HTML error pages from gateways and proxies carry markup, not an explanation.
+  if (/^<(?:!doctype|html)/i.test(text)) return fallback
+  return `${fallback}: ${text.length > MAX_BODY_MESSAGE_CHARS ? `${text.slice(0, MAX_BODY_MESSAGE_CHARS)}…` : text}`
 }
+
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null
 
 const statusError = (response: HttpClientResponse.HttpClientResponse) =>
   Effect.gen(function* () {
