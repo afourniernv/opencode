@@ -468,19 +468,19 @@ const reusedCallIDLLM = Layer.succeed(
     stream: () =>
       Stream.make(
         LLMEvent.stepStart({ index: 0 }),
-        LLMEvent.toolInputStart({ id: "call-reused", name: "lookup" }),
-        LLMEvent.toolInputEnd({ id: "call-reused", name: "lookup" }),
-        LLMEvent.toolCall({ id: "call-reused", name: "lookup", input: { generation: 1 } }),
+        LLMEvent.toolInputStart({ id: "__proto__", name: "lookup" }),
+        LLMEvent.toolInputEnd({ id: "__proto__", name: "lookup" }),
+        LLMEvent.toolCall({ id: "__proto__", name: "lookup", input: { generation: 1 } }),
         LLMEvent.toolResult({
-          id: "call-reused",
+          id: "__proto__",
           name: "lookup",
           result: { type: "json", value: { title: "First", output: "one", metadata: {} } },
         }),
-        LLMEvent.toolInputStart({ id: "call-reused", name: "lookup" }),
-        LLMEvent.toolInputEnd({ id: "call-reused", name: "lookup" }),
-        LLMEvent.toolCall({ id: "call-reused", name: "lookup", input: { generation: 2 } }),
+        LLMEvent.toolInputStart({ id: "__proto__", name: "lookup" }),
+        LLMEvent.toolInputEnd({ id: "__proto__", name: "lookup" }),
+        LLMEvent.toolCall({ id: "__proto__", name: "lookup", input: { generation: 2 } }),
         LLMEvent.toolResult({
-          id: "call-reused",
+          id: "__proto__",
           name: "lookup",
           result: { type: "json", value: { title: "Second", output: "two", metadata: {} } },
         }),
@@ -527,10 +527,12 @@ type ConcurrentToolEvent =
   | { readonly phase: "start"; readonly tool: string; readonly parent: string | undefined }
   | { readonly phase: "permission"; readonly tool: string | undefined; readonly parent: string | undefined }
   | { readonly phase: "execute"; readonly tool: string; readonly parent: string | undefined }
+  | { readonly phase: "finalize"; readonly tool: string; readonly parent: string | undefined }
   | { readonly phase: "end"; readonly tool: string; readonly outcome: NemoRelay.ToolOutcome }
 
 let concurrentStreamStarted = defer<void>()
 let concurrentStreamRelease = defer<void>()
+let concurrentBeginToolDefect = false
 const concurrentToolEvents: ConcurrentToolEvent[] = []
 const concurrentToolLLM = Layer.succeed(
   LLM.Service,
@@ -549,15 +551,25 @@ const concurrentToolRelay = Layer.succeed(
   NemoRelay.Service,
   NemoRelay.Service.of({
     ...concurrentToolBaseRelay,
+    detached: (effect) => effect.pipe(Effect.provideService(CurrentTestRelayScope, undefined)),
     observeTurn: (_input, effect) => effect.pipe(Effect.provideService(CurrentTestRelayScope, "turn")),
     beginTool: (input) =>
       Effect.gen(function* () {
+        if (concurrentBeginToolDefect) {
+          concurrentBeginToolDefect = false
+          return yield* Effect.die("simulated beginTool defect")
+        }
         const name = input.name ?? "unknown"
+        let completed = false
         concurrentToolEvents.push({ phase: "start", tool: name, parent: yield* CurrentTestRelayScope })
         return {
           run: (effect) => effect.pipe(Effect.provideService(CurrentTestRelayScope, name)),
           complete: (outcome) =>
-            Effect.sync(() => concurrentToolEvents.push({ phase: "end", tool: name, outcome })),
+            Effect.sync(() => {
+              if (completed) return
+              completed = true
+              concurrentToolEvents.push({ phase: "end", tool: name, outcome })
+            }),
         } satisfies NemoRelay.ToolObservation
       }),
     permissionEvaluated: () =>
@@ -1313,7 +1325,125 @@ itRetryMetadata.live("session.processor forwards enriched retry metadata to Rela
   ),
 )
 
-itConcurrentTool.live("session.processor scopes concurrent callbacks under their Tool and closes in completion order", () =>
+itConcurrentTool.live(
+  "session.processor scopes concurrent callbacks under their Tool and closes in completion order",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          concurrentStreamStarted = defer<void>()
+          concurrentStreamRelease = defer<void>()
+          concurrentToolEvents.length = 0
+
+          const { processors, session, provider } = yield* boot()
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "concurrent tools")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors
+            .create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+            .pipe(Effect.provideService(CurrentTestRelayScope, "run"))
+          const process = yield* handle
+            .process({
+              user: {
+                id: parent.id,
+                sessionID: chat.id,
+                role: "user",
+                time: parent.time,
+                agent: parent.agent,
+                model: { providerID: ref.providerID, modelID: ref.modelID },
+              } satisfies SessionV1.User,
+              sessionID: chat.id,
+              model: mdl,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: "concurrent tools" }],
+              tools: {},
+            })
+            .pipe(Effect.forkChild)
+
+          yield* Effect.promise(() => concurrentStreamStarted.promise)
+          const firstStarted = yield* Deferred.make<void>()
+          const secondStarted = yield* Deferred.make<void>()
+          const releaseFirst = yield* Deferred.make<void>()
+          const releaseSecond = yield* Deferred.make<void>()
+
+          const execute = (
+            toolCallID: string,
+            name: string,
+            started: Deferred.Deferred<void>,
+            release: Deferred.Deferred<void>,
+          ) =>
+            Effect.promise(() =>
+              handle.executeTool(
+                { toolCallID, name, input: { value: name } },
+                Effect.gen(function* () {
+                  const active = yield* CurrentTestRelayScope
+                  concurrentToolEvents.push({ phase: "execute", tool: name, parent: active })
+                  concurrentToolEvents.push({ phase: "permission", tool: active, parent: active })
+                  yield* Deferred.succeed(started, undefined)
+                  yield* Deferred.await(release)
+                  return { title: name, metadata: {}, output: `${name} complete` }
+                }),
+              ),
+            ).pipe(Effect.tap((output) => handle.completeToolCall(toolCallID, output)))
+
+          const first = yield* execute("call-first", "first", firstStarted, releaseFirst).pipe(Effect.forkChild)
+          const second = yield* execute("call-second", "second", secondStarted, releaseSecond).pipe(Effect.forkChild)
+          yield* Effect.all([Deferred.await(firstStarted), Deferred.await(secondStarted)])
+
+          yield* Deferred.succeed(releaseSecond, undefined)
+          yield* Fiber.join(second)
+          yield* Deferred.succeed(releaseFirst, undefined)
+          yield* Fiber.join(first)
+          concurrentStreamRelease.resolve()
+          expect(yield* Fiber.join(process)).toBe("continue")
+
+          expect(concurrentToolEvents.filter((event) => event.phase === "start")).toEqual(
+            expect.arrayContaining([
+              { phase: "start", tool: "first", parent: "turn" },
+              { phase: "start", tool: "second", parent: "turn" },
+            ]),
+          )
+          expect(concurrentToolEvents.filter((event) => event.phase === "execute")).toEqual(
+            expect.arrayContaining([
+              { phase: "execute", tool: "first", parent: "first" },
+              { phase: "execute", tool: "second", parent: "second" },
+            ]),
+          )
+          expect(concurrentToolEvents.filter((event) => event.phase === "permission")).toEqual(
+            expect.arrayContaining([
+              { phase: "permission", tool: "first", parent: "first" },
+              { phase: "permission", tool: "second", parent: "second" },
+            ]),
+          )
+          expect(concurrentToolEvents.filter((event) => event.phase === "end")).toEqual([
+            { phase: "end", tool: "second", outcome: "success" },
+            { phase: "end", tool: "first", outcome: "success" },
+          ])
+          const calls = (yield* MessageV2.parts(msg.id)).filter(
+            (part): part is SessionV1.ToolPart => part.type === "tool",
+          )
+          expect(calls).toHaveLength(2)
+          expect(calls.every((part) => part.state.status === "completed")).toBe(true)
+
+          const starts = concurrentToolEvents.filter((event) => event.phase === "start").length
+          const lateScope = yield* Effect.promise(() =>
+            handle.executeTool(
+              { toolCallID: "call-late", name: "late", input: {} },
+              Effect.gen(function* () {
+                return yield* CurrentTestRelayScope
+              }),
+            ),
+          )
+          expect(lateScope).toBeUndefined()
+          expect(concurrentToolEvents.filter((event) => event.phase === "start")).toHaveLength(starts)
+        }),
+      { config: cfg },
+    ),
+)
+
+itConcurrentTool.live("session.processor closes callback admission and interrupts accepted tools before the Turn", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
@@ -1323,7 +1453,7 @@ itConcurrentTool.live("session.processor scopes concurrent callbacks under their
 
         const { processors, session, provider } = yield* boot()
         const chat = yield* session.create({})
-        const parent = yield* user(chat.id, "concurrent tools")
+        const parent = yield* user(chat.id, "interrupt accepted tool")
         const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
         const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
         const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
@@ -1341,76 +1471,297 @@ itConcurrentTool.live("session.processor scopes concurrent callbacks under their
             model: mdl,
             agent: agent(),
             system: [],
-            messages: [{ role: "user", content: "concurrent tools" }],
+            messages: [{ role: "user", content: "interrupt accepted tool" }],
             tools: {},
           })
           .pipe(Effect.forkChild)
 
         yield* Effect.promise(() => concurrentStreamStarted.promise)
-        const firstStarted = yield* Deferred.make<void>()
-        const secondStarted = yield* Deferred.make<void>()
-        const releaseFirst = yield* Deferred.make<void>()
-        const releaseSecond = yield* Deferred.make<void>()
-
-        const execute = (
-          toolCallID: string,
-          name: string,
-          started: Deferred.Deferred<void>,
-          release: Deferred.Deferred<void>,
-        ) =>
-          Effect.promise(() =>
-            handle.executeTool(
-              { toolCallID, name, input: { value: name } },
-              Effect.gen(function* () {
-                const active = yield* CurrentTestRelayScope
-                concurrentToolEvents.push({ phase: "execute", tool: name, parent: active })
-                concurrentToolEvents.push({ phase: "permission", tool: active, parent: active })
-                yield* Deferred.succeed(started, undefined)
-                yield* Deferred.await(release)
-                return { title: name, metadata: {}, output: `${name} complete` }
-              }),
+        const started = yield* Deferred.make<void>()
+        const callback = handle
+          .executeTool(
+            { toolCallID: "call-slow", name: "slow", input: {} },
+            Effect.gen(function* () {
+              const active = yield* CurrentTestRelayScope
+              concurrentToolEvents.push({ phase: "execute", tool: "slow", parent: active })
+              concurrentToolEvents.push({ phase: "permission", tool: active, parent: active })
+              yield* Deferred.succeed(started, undefined)
+              return yield* Effect.never
+            }).pipe(
+              Effect.ensuring(
+                Effect.gen(function* () {
+                  concurrentToolEvents.push({
+                    phase: "finalize",
+                    tool: "slow",
+                    parent: yield* CurrentTestRelayScope,
+                  })
+                }),
+              ),
             ),
-          ).pipe(Effect.tap((output) => handle.completeToolCall(toolCallID, output)))
+          )
+          .then(
+            () => ({ ok: true as const }),
+            () => ({ ok: false as const }),
+          )
 
-        const first = yield* execute("call-first", "first", firstStarted, releaseFirst).pipe(Effect.forkChild)
-        const second = yield* execute("call-second", "second", secondStarted, releaseSecond).pipe(Effect.forkChild)
-        yield* Effect.all([Deferred.await(firstStarted), Deferred.await(secondStarted)])
-
-        yield* Deferred.succeed(releaseSecond, undefined)
-        yield* Fiber.join(second)
-        yield* Deferred.succeed(releaseFirst, undefined)
-        yield* Fiber.join(first)
+        yield* Deferred.await(started)
         concurrentStreamRelease.resolve()
         expect(yield* Fiber.join(process)).toBe("continue")
+        expect(yield* Effect.promise(() => callback)).toEqual({ ok: false })
 
-        expect(concurrentToolEvents.filter((event) => event.phase === "start")).toEqual(
-          expect.arrayContaining([
-            { phase: "start", tool: "first", parent: "turn" },
-            { phase: "start", tool: "second", parent: "turn" },
-          ]),
-        )
-        expect(concurrentToolEvents.filter((event) => event.phase === "execute")).toEqual(
-          expect.arrayContaining([
-            { phase: "execute", tool: "first", parent: "first" },
-            { phase: "execute", tool: "second", parent: "second" },
-          ]),
-        )
-        expect(concurrentToolEvents.filter((event) => event.phase === "permission")).toEqual(
-          expect.arrayContaining([
-            { phase: "permission", tool: "first", parent: "first" },
-            { phase: "permission", tool: "second", parent: "second" },
-          ]),
-        )
+        const finalized = concurrentToolEvents.findIndex((event) => event.phase === "finalize")
+        const completed = concurrentToolEvents.findIndex((event) => event.phase === "end")
+        expect(finalized).toBeGreaterThanOrEqual(0)
+        expect(completed).toBeGreaterThan(finalized)
+        expect(concurrentToolEvents.filter((event) => event.phase === "start")).toEqual([
+          { phase: "start", tool: "slow", parent: "turn" },
+        ])
+        expect(concurrentToolEvents.filter((event) => event.phase === "execute")).toEqual([
+          { phase: "execute", tool: "slow", parent: "slow" },
+        ])
+        expect(concurrentToolEvents.filter((event) => event.phase === "permission")).toEqual([
+          { phase: "permission", tool: "slow", parent: "slow" },
+        ])
+        expect(concurrentToolEvents.filter((event) => event.phase === "finalize")).toEqual([
+          { phase: "finalize", tool: "slow", parent: "slow" },
+        ])
         expect(concurrentToolEvents.filter((event) => event.phase === "end")).toEqual([
-          { phase: "end", tool: "second", outcome: "success" },
+          { phase: "end", tool: "slow", outcome: "cancelled" },
+        ])
+      }),
+    { config: cfg },
+  ),
+)
+
+itConcurrentTool.live("session.processor rejects overlapping reuse of a tool call id without merging generations", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        concurrentStreamStarted = defer<void>()
+        concurrentStreamRelease = defer<void>()
+        concurrentToolEvents.length = 0
+
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "overlapping tool id")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const process = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "overlapping tool id" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+
+        yield* Effect.promise(() => concurrentStreamStarted.promise)
+        const started = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        let duplicateExecuted = false
+        const first = handle.executeTool(
+          { toolCallID: "call-reused", name: "first", input: {} },
+          Effect.gen(function* () {
+            yield* Deferred.succeed(started, undefined)
+            yield* Deferred.await(release)
+            return { title: "first", metadata: {}, output: "first" }
+          }),
+        )
+        yield* Deferred.await(started)
+        const duplicate = handle
+          .executeTool(
+            { toolCallID: "call-reused", name: "duplicate", input: {} },
+            Effect.sync(() => {
+              duplicateExecuted = true
+              return { title: "duplicate", metadata: {}, output: "duplicate" }
+            }),
+          )
+          .then(
+            () => ({ ok: true as const }),
+            (error) => ({ ok: false as const, message: error instanceof Error ? error.message : String(error) }),
+          )
+
+        const duplicateResult = yield* Effect.promise(() => duplicate)
+        expect(duplicateResult.ok).toBe(false)
+        expect(duplicateResult).toEqual(expect.objectContaining({ message: expect.stringContaining("Duplicate") }))
+        expect(duplicateExecuted).toBe(false)
+
+        yield* Deferred.succeed(release, undefined)
+        const output = yield* Effect.promise(() => first)
+        yield* handle.completeToolCall("call-reused", output)
+        concurrentStreamRelease.resolve()
+        expect(yield* Fiber.join(process)).toBe("continue")
+        expect(concurrentToolEvents.filter((event) => event.phase === "start")).toEqual([
+          { phase: "start", tool: "first", parent: "turn" },
+        ])
+        expect(concurrentToolEvents.filter((event) => event.phase === "end")).toEqual([
           { phase: "end", tool: "first", outcome: "success" },
         ])
-        const calls = (yield* MessageV2.parts(msg.id)).filter(
-          (part): part is SessionV1.ToolPart => part.type === "tool",
-        )
-        expect(calls).toHaveLength(2)
-        expect(calls.every((part) => part.state.status === "completed")).toBe(true)
       }),
+    { config: cfg },
+  ),
+)
+
+itConcurrentTool.live("session.processor bounds interruption of non-cooperative tool callbacks", () =>
+  provideTmpdirInstance(
+    (dir) => {
+      const started = defer<void>()
+      const release = defer<void>()
+      return Effect.gen(function* () {
+        concurrentStreamStarted = defer<void>()
+        concurrentStreamRelease = defer<void>()
+        concurrentBeginToolDefect = false
+        concurrentToolEvents.length = 0
+
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "non-cooperative tool")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const process = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "non-cooperative tool" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+
+        yield* Effect.promise(() => concurrentStreamStarted.promise)
+        const callback = handle
+          .executeTool(
+            { toolCallID: "call-stuck", name: "stuck", input: {} },
+            Effect.uninterruptible(
+              Effect.gen(function* () {
+                const active = yield* CurrentTestRelayScope
+                concurrentToolEvents.push({ phase: "execute", tool: "stuck", parent: active })
+                started.resolve()
+                yield* Effect.promise(() => release.promise)
+                return { title: "stuck", metadata: {}, output: "released" }
+              }),
+            ),
+          )
+          .then(
+            () => ({ ok: true as const }),
+            () => ({ ok: false as const }),
+          )
+
+        yield* Effect.promise(() => started.promise)
+        const cleanupStarted = Date.now()
+        concurrentStreamRelease.resolve()
+        expect(yield* Fiber.join(process)).toBe("continue")
+        expect(Date.now() - cleanupStarted).toBeLessThan(2_000)
+        expect(concurrentToolEvents.filter((event) => event.phase === "end")).toEqual([
+          { phase: "end", tool: "stuck", outcome: "failed" },
+        ])
+
+        release.resolve()
+        expect(yield* Effect.promise(() => callback)).toEqual({ ok: false })
+        expect(concurrentToolEvents.filter((event) => event.phase === "end")).toHaveLength(1)
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            release.resolve()
+          }),
+        ),
+      )
+    },
+    { config: cfg },
+  ),
+)
+
+itConcurrentTool.live("session.processor rolls back callback ownership when Relay admission fails", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        concurrentStreamStarted = defer<void>()
+        concurrentStreamRelease = defer<void>()
+        concurrentBeginToolDefect = true
+        concurrentToolEvents.length = 0
+
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "retry failed admission")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const process = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "retry failed admission" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+
+        yield* Effect.promise(() => concurrentStreamStarted.promise)
+        const first = yield* Effect.promise(() =>
+          handle
+            .executeTool(
+              { toolCallID: "call-retry", name: "retry", input: { attempt: 1 } },
+              Effect.succeed({ title: "first", metadata: {}, output: "first" }),
+            )
+            .then(
+              () => ({ ok: true as const }),
+              () => ({ ok: false as const }),
+            ),
+        )
+        expect(first).toEqual({ ok: false })
+
+        const output = yield* Effect.promise(() =>
+          handle.executeTool(
+            { toolCallID: "call-retry", name: "retry", input: { attempt: 2 } },
+            Effect.succeed({ title: "second", metadata: {}, output: "second" }),
+          ),
+        )
+        yield* handle.completeToolCall("call-retry", output)
+        concurrentStreamRelease.resolve()
+        expect(yield* Fiber.join(process)).toBe("continue")
+        expect(concurrentToolEvents.filter((event) => event.phase === "start")).toEqual([
+          { phase: "start", tool: "retry", parent: "turn" },
+        ])
+        expect(concurrentToolEvents.filter((event) => event.phase === "end")).toEqual([
+          { phase: "end", tool: "retry", outcome: "success" },
+        ])
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            concurrentBeginToolDefect = false
+          }),
+        ),
+      ),
     { config: cfg },
   ),
 )
@@ -2234,7 +2585,7 @@ itMissingPart.live("session.processor effect tests settle Relay when an active t
   ),
 )
 
-itReusedCallID.live("session.processor effect tests observe each reused provider call-id generation", () =>
+itReusedCallID.live("session.processor observes each reused reserved-property call-id generation", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
