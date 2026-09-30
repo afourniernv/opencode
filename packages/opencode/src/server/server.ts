@@ -12,7 +12,7 @@ import { disposeMiddleware } from "./routes/instance/httpapi/lifecycle"
 import { WebSocketTracker } from "./routes/instance/httpapi/websocket-tracker"
 import { PublicApi } from "./routes/instance/httpapi/public"
 import type { CorsOptions } from "@opencode-ai/server/cors"
-import { lazy } from "@/util/lazy"
+import { createDefaultServerLifecycle, type DefaultServerCloseOptions } from "./default-lifecycle"
 
 // @ts-ignore This global is needed to prevent ai-sdk from logging warnings to stdout https://github.com/vercel/ai/blob/2dc67e0ef538307f21368db32d5a12345d98831b/packages/ai/src/logger/log-warnings.ts#L85
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -22,11 +22,6 @@ export type Listener = {
   port: number
   url: URL
   stop: (close?: boolean) => Promise<void>
-}
-
-type ServerApp = {
-  fetch(request: Request): Response | Promise<Response>
-  request(input: string | URL | Request, init?: RequestInit): Response | Promise<Response>
 }
 
 type ListenOptions = CorsOptions & {
@@ -53,31 +48,25 @@ class ListenerServerService extends Context.Service<ListenerServerService, Liste
   "@opencode/ListenerServer",
 ) {}
 
-export const Default = lazy(() => {
-  const web = HttpApiApp.webHandler()
-  const handler = web.handler
-  const app: ServerApp = {
-    fetch: (request: Request) => handler(request, HttpApiApp.context),
-    request(input, init) {
-      return app.fetch(input instanceof Request ? input : new Request(new URL(input, "http://localhost"), init))
-    },
-  }
-  return { app, dispose: web.dispose }
+const defaultLifecycle = createDefaultServerLifecycle({
+  create: () => {
+    const web = HttpApiApp.createWebHandler()
+    return {
+      fetch: (request: Request) => web.handler(request, HttpApiApp.context),
+      dispose: web.dispose,
+    }
+  },
 })
 
-/** Close the lazily-created in-process HTTP service graph, if it was used. */
-export async function disposeDefault() {
-  if (!Default.loaded()) return
-  const current = Default()
-  try {
-    await current.dispose()
-  } finally {
-    // A later in-process use must build a fresh handler rather than reusing a
-    // service graph whose scope has already been closed.
-    HttpApiApp.webHandler.reset()
-    Default.reset()
-  }
-}
+export const Default = Object.assign(() => defaultLifecycle.get(), {
+  loaded: () => defaultLifecycle.loaded(),
+})
+
+/** Fence and close the current generation while allowing a later test/in-process reuse. */
+export const disposeDefault = (options?: DefaultServerCloseOptions) => defaultLifecycle.close(options)
+
+/** Permanently fence in-process request admission before process-global teardown. */
+export const shutdownDefault = (options?: DefaultServerCloseOptions) => defaultLifecycle.shutdown(options)
 
 export async function openapi() {
   return OpenApi.fromApi(PublicApi)

@@ -146,9 +146,10 @@ try {
       // The in-process HTTP handler owns a scoped service graph separate from
       // AppRuntime. Close it first so detached request work (including title
       // generation) cannot keep Relay observations open during final drain.
-      stopServer: async () => {
+      stopServer: async (timeoutMs) => {
+        const startedAt = performance.now()
         const { Server } = await import("./server/server")
-        await Server.disposeDefault()
+        await Server.shutdownDefault({ timeoutMs: Math.max(0, timeoutMs - (performance.now() - startedAt)) })
       },
       // Direct commands dispose their InstanceContext in effectCmd. Closing the
       // managed runtime then releases the remaining process-global services.

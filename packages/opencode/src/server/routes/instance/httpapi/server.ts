@@ -314,12 +314,13 @@ export function createRoutes(
 
 export const routes = createRoutes()
 
-export const webHandler = lazy(() =>
+export const createWebHandler = () =>
   HttpRouter.toWebHandler(routes, {
     disableLogger: true,
     memoMap,
     middleware: disposeMiddleware,
-  }),
-)
+  })
+
+export const webHandler = lazy(createWebHandler)
 
 export * as HttpApiApp from "./server"
