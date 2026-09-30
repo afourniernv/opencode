@@ -10,6 +10,7 @@ import { Session } from "@/session/session"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { SessionProcessor } from "@/session/processor"
 import { SessionTools } from "@/session/tools"
+import { toolSemanticCategory } from "@/session/tool-semantics"
 import { Tool } from "@/tool/tool"
 import { ToolRegistry } from "@/tool/registry"
 import { Truncate } from "@/tool/truncate"
@@ -35,10 +36,10 @@ const model = {
   api: { id: "test-model" },
 } as Provider.Model
 
-function fakeMcp() {
+function fakeMcp(tools: Record<string, MCP.McpTool> = {}, clients: Record<string, MCP.McpTool["client"]> = {}) {
   return MCP.Service.of({
-    tools: () => Effect.succeed({}),
-    clients: () => Effect.succeed({}),
+    tools: () => Effect.succeed(tools),
+    clients: () => Effect.succeed(clients),
   } as Partial<MCP.Interface> as MCP.Interface)
 }
 
@@ -61,38 +62,40 @@ const fakeTruncate = Truncate.Service.of({
   limits: () => Effect.succeed({ maxLines: 2000, maxBytes: 50 * 1024 }),
 } satisfies Truncate.Interface)
 
-const layer = Layer.mergeAll(
-  Layer.succeed(Plugin.Service, fakePlugin),
-  Layer.succeed(Permission.Service, fakePermission),
-  Layer.succeed(MCP.Service, fakeMcp()),
-  Layer.succeed(Truncate.Service, fakeTruncate),
-  RuntimeFlags.layer(),
-  Layer.succeed(
-    ToolRegistry.Service,
-    ToolRegistry.Service.of({
-      ids: () => Effect.succeed(["timing"]),
-      all: () => Effect.succeed([]),
-      named: () => Effect.die("unused"),
-      tools: () =>
-        Effect.succeed([
-          {
-            id: "timing",
-            description: "updates metadata more than once",
-            parameters: Schema.Struct({}),
-            jsonSchema: { type: "object", properties: {} },
-            execute: (_args, ctx) =>
-              Effect.gen(function* () {
-                yield* ctx.metadata({ metadata: { output: "first" } })
-                yield* ctx.metadata({ metadata: { output: "second" } })
-                return { title: "timing", metadata: {}, output: "done" }
-              }),
-          } satisfies Tool.Def,
-        ]),
-    }),
-  ),
-)
+function testLayer(mcp = fakeMcp()) {
+  return Layer.mergeAll(
+    Layer.succeed(Plugin.Service, fakePlugin),
+    Layer.succeed(Permission.Service, fakePermission),
+    Layer.succeed(MCP.Service, mcp),
+    Layer.succeed(Truncate.Service, fakeTruncate),
+    RuntimeFlags.layer(),
+    Layer.succeed(
+      ToolRegistry.Service,
+      ToolRegistry.Service.of({
+        ids: () => Effect.succeed(["timing"]),
+        all: () => Effect.succeed([]),
+        named: () => Effect.die("unused"),
+        tools: () =>
+          Effect.succeed([
+            {
+              id: "timing",
+              description: "updates metadata more than once",
+              parameters: Schema.Struct({}),
+              jsonSchema: { type: "object", properties: {} },
+              execute: (_args, ctx) =>
+                Effect.gen(function* () {
+                  yield* ctx.metadata({ metadata: { output: "first" } })
+                  yield* ctx.metadata({ metadata: { output: "second" } })
+                  return { title: "timing", metadata: {}, output: "done" }
+                }),
+            } satisfies Tool.Def,
+          ]),
+      }),
+    ),
+  )
+}
 
-const it = testEffect(layer)
+const it = testEffect(testLayer())
 
 it.effect("preserves running tool start time across metadata updates", () =>
   Effect.gen(function* () {
@@ -163,5 +166,62 @@ it.effect("preserves running tool start time across metadata updates", () =>
     if (state.state.status === "running") {
       expect(state.state.time.start).toBe(100)
     }
+  }),
+)
+
+const dynamicMcpKey = "private-server_finance_lookup"
+const resourceClient = {
+  getServerCapabilities: () => ({ resources: {} }),
+} as MCP.McpTool["client"]
+const dynamicMcp = fakeMcp(
+  {
+    [dynamicMcpKey]: {
+      def: {
+        name: "finance_lookup",
+        description: "Looks up private financial data",
+        inputSchema: { type: "object", properties: {} },
+      },
+      client: {} as MCP.McpTool["client"],
+    },
+  },
+  { "resource-server": resourceClient },
+)
+const itDynamicMcp = testEffect(testLayer(dynamicMcp))
+
+itDynamicMcp.effect("marks dynamic MCP tools without changing ordinary tool semantics", () =>
+  Effect.gen(function* () {
+    const processor = {
+      message: {
+        id: messageID,
+        sessionID,
+        role: "assistant",
+        parentID: MessageID.ascending(),
+        agent: "build",
+        mode: "build",
+        path: { cwd: "/tmp", root: "/tmp" },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ModelV2.ID.make("test-model"),
+        providerID: ProviderV2.ID.make("test"),
+        time: { created: 1 },
+      } satisfies SessionV1.Assistant,
+      updateToolCall: () => Effect.succeed(undefined),
+      completeToolCall: () => Effect.void,
+    } satisfies Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
+
+    const tools = yield* SessionTools.resolve({
+      agent,
+      model,
+      session: { id: sessionID, permission: [] } as unknown as Session.Info,
+      processor,
+      bypassAgentCheck: false,
+      messages: [],
+      promptOps: {} as never,
+    })
+
+    expect(toolSemanticCategory(tools[dynamicMcpKey])).toBe("mcp")
+    expect(toolSemanticCategory(tools.timing)).toBeUndefined()
+    expect(toolSemanticCategory(tools.list_mcp_resources)).toBeUndefined()
+    expect(Object.getOwnPropertySymbols(tools[dynamicMcpKey])).toEqual([])
   }),
 )

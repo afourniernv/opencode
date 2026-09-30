@@ -9,6 +9,7 @@ import { makeLocationNode } from "../effect/app-node"
 import { FSUtil } from "../fs-util"
 import { LocationMutation } from "../location-mutation"
 import { AppProcess } from "../process"
+import { isSignalExitError } from "../cross-spawn-spawner"
 import { PermissionV2 } from "../permission"
 import { PositiveInt } from "../schema"
 import { ToolRegistry } from "./registry"
@@ -36,6 +37,7 @@ const StructuredOutput = Schema.Struct({
   exit: Schema.Number.pipe(Schema.optional),
   truncated: Schema.Boolean,
   timeout: Schema.Boolean.pipe(Schema.optional),
+  signal: Schema.Boolean.pipe(Schema.optional),
 })
 
 const Output = Schema.Struct({
@@ -53,11 +55,18 @@ const modelOutput = (output: Output) => {
     ? `\n\nWarnings:\n${output.warnings.map((warning) => `- ${warning}`).join("\n")}`
     : ""
   if (output.timeout) return `${warnings.trimStart()}${warnings ? "\n\n" : ""}Command timed out before completion.`
+  if (output.signal)
+    return `${warnings.trimStart()}${warnings ? "\n\n" : ""}Command terminated after receiving a process signal.`
   return `${warnings.trimStart()}${warnings ? "\n\n" : ""}Command exited with code ${output.exit}.`
 }
 
 const isTimeout = (error: AppProcess.AppProcessError) =>
   error.cause instanceof Error && error.cause.message === "Timed out"
+const isSignal = (error: AppProcess.AppProcessError) => isSignalExitError(error.cause)
+type ProcessSettlement =
+  | { readonly kind: "exit"; readonly result: AppProcess.RunResult }
+  | { readonly kind: "timeout" }
+  | { readonly kind: "signal" }
 
 /**
  * Minimal V2 core shell boundary. Keep parity debt visible without pulling the
@@ -114,6 +123,7 @@ const layer = Layer.effectDiscard(
             truncated: output.truncated,
             ...(output.exit === undefined ? {} : { exit: output.exit }),
             ...(output.timeout === undefined ? {} : { timeout: output.timeout }),
+            ...(output.signal === undefined ? {} : { signal: output.signal }),
           }),
           toModelOutput: ({ output }) => [
             { type: "text", text: output.output },
@@ -163,18 +173,25 @@ const layer = Layer.effectDiscard(
                 forceKillAfter: Duration.seconds(3),
               })
               const timeout = input.timeout ?? DEFAULT_TIMEOUT_MS
-              const result = yield* appProcess
+              const settlement = yield* appProcess
                 .run(command, {
                   combineOutput: true,
                   timeout: Duration.millis(timeout),
                   maxOutputBytes: MAX_CAPTURE_BYTES,
                 })
                 .pipe(
-                  Effect.catchTag("AppProcessError", (error) =>
-                    isTimeout(error) ? Effect.succeed(undefined) : Effect.fail(error),
+                  Effect.map((result): ProcessSettlement => ({ kind: "exit", result })),
+                  Effect.catchTag(
+                    "AppProcessError",
+                    (error): Effect.Effect<ProcessSettlement, AppProcess.AppProcessError> =>
+                      isTimeout(error)
+                        ? Effect.succeed({ kind: "timeout" })
+                        : isSignal(error)
+                          ? Effect.succeed({ kind: "signal" })
+                          : Effect.fail(error),
                   ),
                 )
-              if (!result) {
+              if (settlement.kind === "timeout") {
                 return {
                   output: `Command exceeded timeout of ${timeout} ms. Retry with a larger timeout if the command is expected to take longer.`,
                   truncated: false,
@@ -182,7 +199,16 @@ const layer = Layer.effectDiscard(
                   ...(warnings.length ? { warnings } : {}),
                 }
               }
+              if (settlement.kind === "signal") {
+                return {
+                  output: "Command terminated after receiving a process signal.",
+                  truncated: false,
+                  signal: true,
+                  ...(warnings.length ? { warnings } : {}),
+                }
+              }
 
+              const result = settlement.result
               const output = result.output?.toString("utf8") || "(no output)"
               const notice = result.outputTruncated
                 ? "[output capture truncated at the in-memory safety limit]"
