@@ -269,6 +269,43 @@ describe("ToolRegistry", () => {
     }),
   )
 
+  observed.effect("records bounded terminal results without treating non-zero exits as tool failures", () =>
+    Effect.gen(function* () {
+      relayObservations.length = 0
+      const service = yield* ToolRegistry.Service
+      const terminal = Tool.make({
+        description: "Terminal result",
+        input: Schema.Struct({ result: Schema.Literals(["zero", "nonzero", "timeout"]) }),
+        output: Schema.Struct({
+          exit: Schema.Number.pipe(Schema.optional),
+          timeout: Schema.Boolean.pipe(Schema.optional),
+        }),
+        execute: ({ result }) =>
+          Effect.succeed(result === "timeout" ? { timeout: true } : { exit: result === "zero" ? 0 : 7421 }),
+      })
+      yield* service.register({ bash: terminal, shell: terminal, customer_extension: terminal })
+
+      const execute = (name: string, result: "zero" | "nonzero" | "timeout") =>
+        executeTool(service, {
+          sessionID,
+          ...identity,
+          call: { type: "tool-call", id: `call-${name}-${result}`, name, input: { result } },
+        })
+      yield* execute("bash", "nonzero")
+      yield* execute("shell", "zero")
+      yield* execute("bash", "timeout")
+      yield* execute("customer_extension", "nonzero")
+
+      expect(relayObservations).toEqual([
+        expect.objectContaining({ name: "bash", outcome: "success", terminalResult: "nonzero_exit" }),
+        expect.objectContaining({ name: "shell", outcome: "success", terminalResult: "zero_exit" }),
+        expect.objectContaining({ name: "bash", outcome: "success", terminalResult: "timeout" }),
+        expect.objectContaining({ name: "customer_extension", outcome: "success" }),
+      ])
+      expect(relayObservations[3]).not.toHaveProperty("terminalResult")
+    }),
+  )
+
   observed.effect("records a purely interrupted settlement once as cancelled", () =>
     Effect.gen(function* () {
       relayObservations.length = 0

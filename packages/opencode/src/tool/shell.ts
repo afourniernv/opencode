@@ -13,6 +13,7 @@ import { fileURLToPath } from "url"
 import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Shell } from "@opencode-ai/core/shell"
+import { isSignalExitError } from "@opencode-ai/core/cross-spawn-spawner"
 import { ShellID } from "./shell/id"
 
 import * as Truncate from "./truncate"
@@ -446,6 +447,7 @@ export const ShellTool = Tool.define(
       let cut = false
       let expired = false
       let aborted = false
+      let signaled = false
 
       const closeSink = Effect.fnUntraced(function* () {
         const stream = sink
@@ -540,7 +542,14 @@ export const ShellTool = Tool.define(
           const timeout = Effect.sleep(`${input.timeout + 100} millis`)
 
           const exit = yield* Effect.raceAll([
-            handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
+            handle.exitCode.pipe(
+              Effect.map((code) => ({ kind: "exit" as const, code })),
+              Effect.catch((error) =>
+                isSignalExitError(error)
+                  ? Effect.succeed({ kind: "signal" as const, code: null })
+                  : Effect.fail(error),
+              ),
+            ),
             abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
             timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
           ])
@@ -553,6 +562,7 @@ export const ShellTool = Tool.define(
             expired = true
             yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
           }
+          if (exit.kind === "signal") signaled = true
 
           return exit.kind === "exit" ? exit.code : null
         }),
@@ -565,6 +575,7 @@ export const ShellTool = Tool.define(
         )
       }
       if (aborted) meta.push("User aborted the command")
+      if (signaled) meta.push("Shell command terminated after receiving a process signal")
       const raw = list.map((item) => item.text).join("")
       const end = tail(raw, limits.maxLines, limits.maxBytes)
       if (end.cut) cut = true
@@ -588,6 +599,9 @@ export const ShellTool = Tool.define(
           output: last || preview(output),
           exit: code,
           truncated: cut,
+          ...(expired ? { timeout: true } : {}),
+          ...(aborted ? { aborted: true } : {}),
+          ...(signaled ? { signal: true } : {}),
           ...(cut && file ? { outputPath: file } : {}),
         },
         output,

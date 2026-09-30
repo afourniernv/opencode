@@ -94,7 +94,7 @@ const registryLayer = Layer.effect(
               ? { result, output: bounded.output, outputPaths: bounded.outputPaths }
               : { result, output: bounded.output }
           })
-          return yield* restore(settlement).pipe(
+          return yield* observation.run(restore(settlement)).pipe(
             Effect.onExit((exit) => {
               const blocked =
                 Exit.isFailure(exit) &&
@@ -117,7 +117,15 @@ const registryLayer = Layer.effect(
                   : Cause.hasInterruptsOnly(exit.cause)
                     ? "cancelled"
                     : "failed"
-              return observation.complete(outcome).pipe(Effect.catchCause(() => Effect.void))
+              const terminalResult =
+                Exit.isSuccess(exit) &&
+                exit.value.result.type !== "error" &&
+                NemoRelay.toolCategory(input.call.name) === "terminal"
+                  ? NemoRelay.terminalResultFamily(exit.value.output?.structured)
+                  : undefined
+              return observation
+                .complete(outcome, terminalResult === undefined ? undefined : { terminalResult })
+                .pipe(Effect.catchCause(() => Effect.void))
             }),
           )
         }),
