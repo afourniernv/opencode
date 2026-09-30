@@ -74,9 +74,15 @@ export const rpc = {
   async shutdown() {
     try {
       return await shutdownProcess({
-        stopServer: async () => {
-          if (server) await server.stop(true)
-          await Server.disposeDefault()
+        stopServer: async (timeoutMs) => {
+          const listener = server
+          server = undefined
+          const settled = await Promise.allSettled([
+            Server.shutdownDefault({ timeoutMs }),
+            ...(listener ? [Promise.resolve().then(() => listener.stop(true))] : []),
+          ])
+          const failures = settled.flatMap((result) => (result.status === "rejected" ? [result.reason] : []))
+          if (failures.length) throw new AggregateError(failures, "Server shutdown was incomplete")
         },
         disposeInstances: () => InstanceRuntime.disposeAllInstances(),
         disposeRuntime: () => AppRuntime.dispose(),
