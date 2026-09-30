@@ -1,7 +1,7 @@
 export * as PermissionV2 from "./permission"
 
 import { makeLocationNode } from "./effect/app-node"
-import { Context, Deferred, Effect as EffectRuntime, Layer, Schema } from "effect"
+import { Cause, Context, Deferred, Effect as EffectRuntime, Exit, Layer, Schema } from "effect"
 import { Permission } from "@opencode-ai/schema/permission"
 import { EventV2 } from "./event"
 import { Location } from "./location"
@@ -105,6 +105,7 @@ interface Pending {
   readonly request: Request
   readonly agent?: AgentV2.ID
   readonly deferred: Deferred.Deferred<void, DeclinedError | CorrectedError>
+  claimed?: boolean
   resolution?: NemoRelay.PermissionResolution
 }
 
@@ -118,6 +119,41 @@ const layer = Layer.effect(
     const saved = yield* PermissionSaved.Service
     const relay = yield* NemoRelay.Service
     const pending = new Map<ID, Pending>()
+
+    function remove(item: Pending) {
+      if (pending.get(item.request.id) === item) pending.delete(item.request.id)
+    }
+
+    function claim(id: ID, expected?: Pending) {
+      const item = pending.get(id)
+      if (!item || item.claimed || (expected && item !== expected)) return undefined
+      item.claimed = true
+      return item
+    }
+
+    function rollback(item: Pending) {
+      if (pending.get(item.request.id) !== item) return
+      item.claimed = false
+      item.resolution = undefined
+    }
+
+    const publishClaimed = (item: Pending, reply: Reply): EffectRuntime.Effect<void> => {
+      return events
+        .publish(Event.Replied, {
+          sessionID: item.request.sessionID,
+          requestID: item.request.id,
+          reply,
+        })
+        .pipe(
+          EffectRuntime.catchCause((cause) =>
+            EffectRuntime.logError("Permission reply notification failed", {
+              eventType: Event.Replied.type,
+              interrupted: Cause.hasInterrupts(cause),
+            }),
+          ),
+          EffectRuntime.asVoid,
+        )
+    }
 
     yield* EffectRuntime.addFinalizer(() =>
       EffectRuntime.forEach(
@@ -190,7 +226,7 @@ const layer = Layer.effect(
           pending.set(request.id, item)
           yield* events
             .publish(Event.Asked, request)
-            .pipe(EffectRuntime.onError(() => EffectRuntime.sync(() => pending.delete(request.id))))
+            .pipe(EffectRuntime.onError(() => EffectRuntime.sync(() => remove(item))))
           return item
         }),
       )
@@ -229,7 +265,7 @@ const layer = Layer.effect(
               EffectRuntime.catchTag("PermissionV2.DeclinedError", (error) => EffectRuntime.die(error)),
               EffectRuntime.ensuring(
                 EffectRuntime.sync(() => {
-                  pending.delete(item.request.id)
+                  remove(item)
                 }),
               ),
             ),
@@ -242,45 +278,47 @@ const layer = Layer.effect(
     const reply = EffectRuntime.fn("PermissionV2.reply")((input: ReplyInput) =>
       EffectRuntime.uninterruptible(
         EffectRuntime.gen(function* () {
-          const existing = pending.get(input.requestID)
+          const existing = claim(input.requestID)
           if (!existing) return yield* new NotFoundError({ requestID: input.requestID })
-          yield* events.publish(Event.Replied, {
-            sessionID: existing.request.sessionID,
-            requestID: existing.request.id,
-            reply: input.reply,
-          })
+          const resolution = input.reply === "reject" && input.message ? "corrected" : input.reply
+
+          if (input.reply === "always" && existing.request.save?.length) {
+            yield* saved
+              .add({
+                projectID: location.project.id,
+                action: existing.request.action,
+                resources: existing.request.save,
+              })
+              .pipe(
+                EffectRuntime.onExit((exit) =>
+                  Exit.isFailure(exit) ? EffectRuntime.sync(() => rollback(existing)) : EffectRuntime.void,
+                ),
+              )
+          }
+          yield* publishClaimed(existing, input.reply)
 
           if (input.reply === "reject") {
-            existing.resolution = input.message ? "corrected" : "reject"
+            existing.resolution = resolution
             yield* Deferred.fail(
               existing.deferred,
               input.message ? new CorrectedError({ feedback: input.message }) : new DeclinedError(),
             )
-            pending.delete(input.requestID)
+            remove(existing)
             for (const [id, item] of pending) {
               if (item.request.sessionID !== existing.request.sessionID) continue
-              item.resolution = "reject"
-              yield* events.publish(Event.Replied, {
-                sessionID: item.request.sessionID,
-                requestID: item.request.id,
-                reply: "reject",
-              })
-              yield* Deferred.fail(item.deferred, new DeclinedError())
-              pending.delete(id)
+              const claimed = claim(id, item)
+              if (!claimed) continue
+              yield* publishClaimed(claimed, "reject")
+              claimed.resolution = "reject"
+              yield* Deferred.fail(claimed.deferred, new DeclinedError())
+              remove(claimed)
             }
             return
           }
 
-          if (input.reply === "always" && existing.request.save?.length) {
-            yield* saved.add({
-              projectID: location.project.id,
-              action: existing.request.action,
-              resources: existing.request.save,
-            })
-          }
-          existing.resolution = input.reply
+          existing.resolution = resolution
           yield* Deferred.succeed(existing.deferred, undefined)
-          pending.delete(input.requestID)
+          remove(existing)
           if (input.reply !== "always" || !existing.request.save?.length) return
 
           const rememberedRules = yield* savedRules()
@@ -298,14 +336,12 @@ const layer = Layer.effect(
               )
             )
               continue
-            item.resolution = "always"
-            yield* events.publish(Event.Replied, {
-              sessionID: item.request.sessionID,
-              requestID: item.request.id,
-              reply: "always",
-            })
-            yield* Deferred.succeed(item.deferred, undefined)
-            pending.delete(id)
+            const claimed = claim(id, item)
+            if (!claimed) continue
+            yield* publishClaimed(claimed, "always")
+            claimed.resolution = "always"
+            yield* Deferred.succeed(claimed.deferred, undefined)
+            remove(claimed)
           }
         }),
       ),

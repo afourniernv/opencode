@@ -73,10 +73,12 @@ let toolExecutionsReady = 5
 let activeToolExecutions = 0
 let maxActiveToolExecutions = 0
 const relayObservations: NemoRelay.LlmStreamCompleted[] = []
+const relayRunObservations: NemoRelay.RunCompleted[] = []
 const relayTurnObservations: Array<NemoRelay.TurnStarted & { readonly outcome: NemoRelay.TurnOutcome }> = []
 const relayToolObservations: NemoRelay.ToolCompleted[] = []
 const relayCompactionObservations: NemoRelay.CompactionCompleted[] = []
 const relayCompactionAttemptObservations: NemoRelay.CompactionAttemptCompleted[] = []
+let relayTurnCompletionHook: Effect.Effect<void> = Effect.void
 const relayAdapter = NemoRelay.makeForTesting(
   {
     MetricKind: { Counter: "counter", Histogram: "histogram" },
@@ -86,7 +88,9 @@ const relayAdapter = NemoRelay.makeForTesting(
   },
   {
     llmStreamCompleted: (input) => Effect.sync(() => relayObservations.push(input)),
-    turnCompleted: (input) => Effect.sync(() => relayTurnObservations.push(input)),
+    runCompleted: (input) => Effect.sync(() => relayRunObservations.push(input)),
+    turnCompleted: (input) =>
+      Effect.sync(() => relayTurnObservations.push(input)).pipe(Effect.andThen(relayTurnCompletionHook)),
     toolCompleted: (input) => Effect.sync(() => relayToolObservations.push(input)),
     compactionAttemptCompleted: (input) => Effect.sync(() => relayCompactionAttemptObservations.push(input)),
     compactionCompleted: (input) => Effect.sync(() => relayCompactionObservations.push(input)),
@@ -366,10 +370,12 @@ const setup = Effect.gen(function* () {
   activeToolExecutions = 0
   maxActiveToolExecutions = 0
   relayObservations.length = 0
+  relayRunObservations.length = 0
   relayTurnObservations.length = 0
   relayToolObservations.length = 0
   relayCompactionObservations.length = 0
   relayCompactionAttemptObservations.length = 0
+  relayTurnCompletionHook = Effect.void
   snapshotCaptureHook = Effect.succeed(undefined)
   yield* db
     .insert(ProjectTable)
@@ -2893,6 +2899,7 @@ describe("SessionRunnerLLM", () => {
 
       expect(exit._tag).toBe("Failure")
       if (exit._tag === "Failure") expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+      expect(relayRunObservations.at(-1)?.outcome).toBe("blocked")
       expect(relayTurnObservations.at(-1)?.outcome).toBe("blocked")
       expect(requests).toHaveLength(1)
       expect(yield* session.context(sessionID)).toMatchObject([
@@ -2908,6 +2915,79 @@ describe("SessionRunnerLLM", () => {
           ],
         },
       ])
+    }),
+  )
+
+  it.effect("reports a cleanup defect after permission decline as failed", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const registry = yield* ToolRegistry.Service
+      const { db } = yield* Database.Service
+      yield* registry.register({
+        declined_cleanup: Tool.make({
+          description: "Decline before an injected cleanup defect",
+          input: Schema.Struct({}),
+          output: Schema.Struct({}),
+          execute: () =>
+            db
+              .run("ALTER TABLE event RENAME TO event_declined_cleanup_failure")
+              .pipe(Effect.orDie, Effect.andThen(Effect.die(new PermissionV2.DeclinedError()))),
+        }),
+      })
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Decline then fail cleanup" }), resume: false })
+
+      requests.length = 0
+      response = [
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "call-declined-cleanup", name: "declined_cleanup", input: {} }),
+        LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+        LLMEvent.finish({ reason: "tool-calls" }),
+      ]
+
+      const exit = yield* session
+        .resume(sessionID)
+        .pipe(
+          Effect.exit,
+          Effect.ensuring(db.run("ALTER TABLE event_declined_cleanup_failure RENAME TO event").pipe(Effect.ignore)),
+        )
+
+      expect(exit._tag).toBe("Failure")
+      expect(relayRunObservations.at(-1)?.outcome).toBe("failed")
+      expect(relayTurnObservations.at(-1)?.outcome).toBe("failed")
+    }),
+  )
+
+  it.effect("reports a turn completion defect after permission decline as a failed run", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const registry = yield* ToolRegistry.Service
+      yield* registry.register({
+        declined_completion: Tool.make({
+          description: "Decline before an injected turn completion defect",
+          input: Schema.Struct({}),
+          output: Schema.Struct({}),
+          execute: () => Effect.die(new PermissionV2.DeclinedError()),
+        }),
+      })
+      yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Decline then fail turn completion" }),
+        resume: false,
+      })
+      relayTurnCompletionHook = Effect.die("injected turn completion failure")
+
+      response = [
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "call-declined-completion", name: "declined_completion", input: {} }),
+        LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+        LLMEvent.finish({ reason: "tool-calls" }),
+      ]
+
+      expect((yield* session.resume(sessionID).pipe(Effect.exit))._tag).toBe("Failure")
+      expect(relayTurnObservations.at(-1)?.outcome).toBe("blocked")
+      expect(relayRunObservations.at(-1)?.outcome).toBe("failed")
     }),
   )
 
@@ -3000,6 +3080,7 @@ describe("SessionRunnerLLM", () => {
 
       expect(exit._tag).toBe("Failure")
       if (exit._tag === "Failure") expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+      expect(relayRunObservations.at(-1)?.outcome).toBe("blocked")
       expect(relayTurnObservations.at(-1)?.outcome).toBe("blocked")
       expect(requests).toHaveLength(1)
       expect(yield* session.context(sessionID)).toMatchObject([
@@ -3120,6 +3201,7 @@ describe("SessionRunnerLLM", () => {
       streamStarted = undefined
 
       expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBeTrue()
+      expect(relayRunObservations.at(-1)?.outcome).toBe("cancelled")
       expect(requests).toHaveLength(1)
       yield* session.interrupt(sessionID)
     }),
@@ -3277,6 +3359,7 @@ describe("SessionRunnerLLM", () => {
       yield* session.resume(sessionID)
 
       expect(requests).toHaveLength(1)
+      expect(relayRunObservations.at(-1)?.outcome).toBe("failed")
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "user", text: "Fail durably" },
         { type: "assistant", finish: "error", error: { type: "unknown", message: "Provider unavailable" } },
@@ -3342,6 +3425,7 @@ describe("SessionRunnerLLM", () => {
       responseStream = Stream.fail(failure)
 
       expect(yield* session.resume(sessionID).pipe(Effect.flip)).toBe(failure)
+      expect(relayRunObservations.at(-1)?.outcome).toBe("failed")
       yield* replaySessionProjection(sessionID)
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "user", text: "Fail raw stream durably" },

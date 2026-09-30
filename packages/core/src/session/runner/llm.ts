@@ -330,9 +330,9 @@ const layer = Layer.effect(
           if (stream._tag === "Failure" && Cause.hasInterrupts(stream.cause)) yield* FiberSet.clear(toolFibers)
           const settled = yield* restore(awaitToolFibers(toolFibers)).pipe(Effect.exit)
           if (settled._tag === "Failure" && isUserDeclined(settled.cause)) {
-            state.blocked = true
             yield* FiberSet.clear(toolFibers)
             yield* withPublication(publisher.failUnsettledTools("Tool execution interrupted", false, "cancelled"))
+            state.blocked = true
             return yield* Effect.interrupt
           }
           if (
@@ -450,17 +450,22 @@ const layer = Layer.effect(
       let promotion: SessionInput.Delivery | undefined = hasSteer ? "steer" : hasQueue ? "queue" : undefined
       let shouldRun = input.force || hasSteer || hasQueue
       while (shouldRun) {
+        const state: TurnState = { blocked: false }
         yield* relay.observeRun(
           { runtime: "v2" },
           Effect.gen(function* () {
             let needsContinuation = true
             let step = 1
             while (needsContinuation) {
-              const state: TurnState = { blocked: false }
               const result = yield* relay.observeTurn(
                 { runtime: "v2", role: "primary" },
                 runTurn(input.sessionID, promotion, step, state),
-                (exit) => (state.blocked ? "blocked" : Exit.isSuccess(exit) ? exit.value.outcome : undefined),
+                (exit) =>
+                  state.blocked && Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)
+                    ? "blocked"
+                    : Exit.isSuccess(exit)
+                      ? exit.value.outcome
+                      : undefined,
               )
               needsContinuation = result.needsContinuation
               step = result.step + 1
@@ -468,6 +473,8 @@ const layer = Layer.effect(
               if (!needsContinuation) needsContinuation = yield* SessionInput.hasPending(db, input.sessionID, "steer")
             }
           }),
+          (exit) =>
+            state.blocked && Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause) ? "blocked" : undefined,
         )
         shouldRun = yield* SessionInput.hasPending(db, input.sessionID, "queue")
         promotion = shouldRun ? "queue" : undefined
