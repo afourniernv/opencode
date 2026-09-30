@@ -6,6 +6,7 @@ import { Deferred, Effect, Layer, Context } from "effect"
 import os from "os"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import * as NemoRelay from "@opencode-ai/core/observability/nemo-relay"
 
 export const Event = PermissionV1.Event
 
@@ -18,6 +19,7 @@ export interface Interface {
 interface PendingEntry {
   info: PermissionV1.Request
   deferred: Deferred.Deferred<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>
+  resolution?: NemoRelay.PermissionResolution
 }
 
 interface State {
@@ -43,6 +45,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
+    const relay = yield* NemoRelay.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Permission.state")(function* (ctx) {
         void ctx
@@ -54,6 +57,7 @@ const layer = Layer.effect(
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
             for (const item of state.pending.values()) {
+              item.resolution = "cancelled"
               yield* Deferred.fail(item.deferred, new PermissionV1.RejectedError())
             }
             state.pending.clear()
@@ -73,6 +77,11 @@ const layer = Layer.effect(
         const rule = evaluate(request.permission, pattern, ruleset, approved)
         yield* Effect.logInfo("evaluated", { permission: request.permission, pattern, action: rule })
         if (rule.action === "deny") {
+          yield* relay.permissionEvaluated({
+            runtime: "v1",
+            family: NemoRelay.permissionFamily(request.permission),
+            effect: "deny",
+          })
           return yield* new PermissionV1.DeniedError({
             ruleset: ruleset.filter((rule) => Wildcard.match(request.permission, rule.permission)),
           })
@@ -81,7 +90,14 @@ const layer = Layer.effect(
         needsAsk = true
       }
 
-      if (!needsAsk) return
+      if (!needsAsk) {
+        yield* relay.permissionEvaluated({
+          runtime: "v1",
+          family: NemoRelay.permissionFamily(request.permission),
+          effect: "allow",
+        })
+        return
+      }
 
       const id = request.id ?? PermissionV1.ID.ascending()
       const info: PermissionV1.Request = {
@@ -96,13 +112,23 @@ const layer = Layer.effect(
       yield* Effect.logInfo("asking", { id, permission: info.permission, patterns: info.patterns })
 
       const deferred = yield* Deferred.make<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>()
-      pending.set(id, { info, deferred })
+      const entry: PendingEntry = { info, deferred }
+      pending.set(id, entry)
+      yield* relay.permissionEvaluated({
+        runtime: "v1",
+        family: NemoRelay.permissionFamily(info.permission),
+        effect: "ask",
+      })
       yield* events.publish(Event.Asked, info)
-      return yield* Effect.ensuring(
-        Deferred.await(deferred),
-        Effect.sync(() => {
-          pending.delete(id)
-        }),
+      return yield* relay.observePermissionWait(
+        { runtime: "v1", family: NemoRelay.permissionFamily(info.permission) },
+        Effect.ensuring(
+          Deferred.await(deferred),
+          Effect.sync(() => {
+            pending.delete(id)
+          }),
+        ),
+        () => entry.resolution,
       )
     })
 
@@ -119,6 +145,7 @@ const layer = Layer.effect(
       })
 
       if (input.reply === "reject") {
+        existing.resolution = input.message ? "corrected" : "reject"
         yield* Deferred.fail(
           existing.deferred,
           input.message
@@ -129,6 +156,7 @@ const layer = Layer.effect(
         for (const [id, item] of pending.entries()) {
           if (item.info.sessionID !== existing.info.sessionID) continue
           pending.delete(id)
+          item.resolution = "reject"
           yield* events.publish(Event.Replied, {
             sessionID: item.info.sessionID,
             requestID: item.info.id,
@@ -139,6 +167,7 @@ const layer = Layer.effect(
         return
       }
 
+      existing.resolution = input.reply
       yield* Deferred.succeed(existing.deferred, undefined)
       if (input.reply === "once") return
 
@@ -157,6 +186,7 @@ const layer = Layer.effect(
         )
         if (!ok) continue
         pending.delete(id)
+        item.resolution = "always"
         yield* events.publish(Event.Replied, {
           sessionID: item.info.sessionID,
           requestID: item.info.id,
@@ -218,6 +248,6 @@ export function visibleTools<T>(tools: Record<string, T>, ruleset: PermissionV1.
   return Object.fromEntries(Object.entries(tools).filter(([name]) => !hidden.has(name)))
 }
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node] })
+export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node, NemoRelay.node] })
 
 export * as Permission from "."

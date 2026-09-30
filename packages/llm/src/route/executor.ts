@@ -1,4 +1,4 @@
-import { Cause, Context, Effect, Layer, Random } from "effect"
+import { Cause, Clock, Context, Effect, Exit, Layer, Random } from "effect"
 import {
   FetchHttpClient,
   Headers,
@@ -31,6 +31,76 @@ export interface Interface {
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/LLM/RequestExecutor") {}
+
+export type AttemptOrdinal = "first" | "second" | "third_or_later"
+export type AttemptStatusFamily = "none" | "1xx" | "2xx" | "3xx" | "4xx" | "5xx" | "other"
+export type AttemptErrorKind =
+  | "authentication"
+  | "content_policy"
+  | "invalid_provider_output"
+  | "invalid_request"
+  | "no_route"
+  | "provider_internal"
+  | "quota_exceeded"
+  | "rate_limit"
+  | "transport"
+  | "unknown_provider"
+  | "unknown"
+
+export type AttemptEvent =
+  | {
+      readonly type: "started"
+      readonly attempt: AttemptOrdinal
+    }
+  | {
+      readonly type: "completed"
+      readonly attempt: AttemptOrdinal
+      readonly outcome: "success"
+      readonly durationMs: number
+      readonly statusFamily: AttemptStatusFamily
+      readonly willRetry: false
+    }
+  | {
+      readonly type: "completed"
+      readonly attempt: AttemptOrdinal
+      readonly outcome: "failed"
+      readonly durationMs: number
+      readonly statusFamily: AttemptStatusFamily
+      readonly errorKind: AttemptErrorKind
+      readonly retryable: boolean
+      readonly willRetry: boolean
+    }
+  | {
+      readonly type: "completed"
+      readonly attempt: AttemptOrdinal
+      readonly outcome: "cancelled"
+      readonly durationMs: number
+      readonly statusFamily: "none"
+      readonly willRetry: false
+    }
+  | {
+      readonly type: "retry-scheduled"
+      readonly attempt: AttemptOrdinal
+      readonly nextAttempt: AttemptOrdinal
+      readonly delayMs: number
+      readonly delaySource: "retry_after" | "backoff"
+    }
+
+export type AttemptObserver = (event: AttemptEvent) => Effect.Effect<void>
+
+/**
+ * Optional, fiber-local observation of physical HTTP attempts owned by this
+ * executor. One `started`/`completed` pair is emitted per transport request;
+ * `retry-scheduled` is emitted after a retryable failure and before its delay.
+ * A successful attempt completes when response headers and status are
+ * available; streaming body consumption remains owned by the route parser.
+ * Events intentionally expose only bounded diagnostic dimensions, never
+ * request URLs, headers, bodies, request IDs, or provider error messages.
+ */
+export const CurrentAttemptObserver = Context.Reference<AttemptObserver | undefined>(
+  "@opencode/LLM/RequestExecutor/CurrentAttemptObserver",
+  { defaultValue: () => undefined },
+)
 
 const BODY_LIMIT = 16_384
 const MAX_RETRIES = 2
@@ -350,17 +420,153 @@ const retryDelay = (error: LLMError, attempt: number) => {
   ).pipe(Effect.map((delay) => Math.round(delay)))
 }
 
-const retryStatusFailures = <A, R>(
-  effect: Effect.Effect<A, LLMError, R>,
+const attemptOrdinal = (attempt: number): AttemptOrdinal => {
+  if (attempt <= 0) return "first"
+  if (attempt === 1) return "second"
+  return "third_or_later"
+}
+
+const statusFamily = (status: number | undefined): AttemptStatusFamily => {
+  if (status === undefined) return "none"
+  if (status >= 100 && status < 200) return "1xx"
+  if (status >= 200 && status < 300) return "2xx"
+  if (status >= 300 && status < 400) return "3xx"
+  if (status >= 400 && status < 500) return "4xx"
+  if (status >= 500 && status < 600) return "5xx"
+  return "other"
+}
+
+const errorStatus = (error: LLMError) => {
+  if ("http" in error.reason) return error.reason.http?.response?.status
+  if ("status" in error.reason) return error.reason.status
+  return undefined
+}
+
+const errorKind = (error: LLMError): AttemptErrorKind => {
+  switch (error.reason._tag) {
+    case "Authentication":
+      return "authentication"
+    case "ContentPolicy":
+      return "content_policy"
+    case "InvalidProviderOutput":
+      return "invalid_provider_output"
+    case "InvalidRequest":
+      return "invalid_request"
+    case "NoRoute":
+      return "no_route"
+    case "ProviderInternal":
+      return "provider_internal"
+    case "QuotaExceeded":
+      return "quota_exceeded"
+    case "RateLimit":
+      return "rate_limit"
+    case "Transport":
+      return "transport"
+    case "UnknownProvider":
+      return "unknown_provider"
+    default:
+      return "unknown"
+  }
+}
+
+const notify = (observer: AttemptObserver | undefined, event: AttemptEvent) => {
+  if (!observer) return Effect.void
+  return observer(event).pipe(
+    Effect.catchCause((cause) => (Cause.hasInterrupts(cause) ? Effect.failCause(cause) : Effect.void)),
+  )
+}
+
+const retryStatusFailures = <R>(
+  effect: Effect.Effect<HttpClientResponse.HttpClientResponse, LLMError, R>,
   retries = MAX_RETRIES,
   attempt = 0,
-): Effect.Effect<A, LLMError, R> =>
-  Effect.catchTag(effect, "LLM.Error", (error): Effect.Effect<A, LLMError, R> => {
-    if (!error.retryable || retries <= 0) return Effect.fail(error)
-    return retryDelay(error, attempt).pipe(
-      Effect.flatMap((delay) => Effect.sleep(delay)),
-      Effect.flatMap(() => retryStatusFailures(effect, retries - 1, attempt + 1)),
+): Effect.Effect<HttpClientResponse.HttpClientResponse, LLMError, R> =>
+  Effect.gen(function* () {
+    const observer = yield* CurrentAttemptObserver
+    const ordinal = attemptOrdinal(attempt)
+    yield* notify(observer, { type: "started", attempt: ordinal })
+    const started = yield* Clock.currentTimeMillis
+    const exit = yield* Effect.exit(effect).pipe(
+      Effect.onExit((result) => {
+        if (Exit.isSuccess(result) || !Cause.hasInterrupts(result.cause)) return Effect.void
+        return Clock.currentTimeMillis.pipe(
+          Effect.flatMap((ended) =>
+            notify(observer, {
+              type: "completed",
+              attempt: ordinal,
+              outcome: "cancelled",
+              durationMs: Math.max(0, ended - started),
+              statusFamily: "none",
+              willRetry: false,
+            }),
+          ),
+        )
+      }),
     )
+    const durationMs = Math.max(0, (yield* Clock.currentTimeMillis) - started)
+
+    if (Exit.isSuccess(exit)) {
+      yield* notify(observer, {
+        type: "completed",
+        attempt: ordinal,
+        outcome: "success",
+        durationMs,
+        statusFamily: statusFamily(exit.value.status),
+        willRetry: false,
+      })
+      return exit.value
+    }
+
+    if (Cause.hasInterrupts(exit.cause)) {
+      yield* notify(observer, {
+        type: "completed",
+        attempt: ordinal,
+        outcome: "cancelled",
+        durationMs,
+        statusFamily: "none",
+        willRetry: false,
+      })
+      return yield* Effect.failCause(exit.cause)
+    }
+
+    const failure = exit.cause.reasons.find(Cause.isFailReason)?.error
+    if (!(failure instanceof LLMError)) {
+      yield* notify(observer, {
+        type: "completed",
+        attempt: ordinal,
+        outcome: "failed",
+        durationMs,
+        statusFamily: "none",
+        errorKind: "unknown",
+        retryable: false,
+        willRetry: false,
+      })
+      return yield* Effect.failCause(exit.cause)
+    }
+
+    const willRetry = failure.retryable && retries > 0
+    yield* notify(observer, {
+      type: "completed",
+      attempt: ordinal,
+      outcome: "failed",
+      durationMs,
+      statusFamily: statusFamily(errorStatus(failure)),
+      errorKind: errorKind(failure),
+      retryable: failure.retryable,
+      willRetry,
+    })
+    if (!willRetry) return yield* Effect.failCause(exit.cause)
+
+    const delay = yield* retryDelay(failure, attempt)
+    yield* notify(observer, {
+      type: "retry-scheduled",
+      attempt: ordinal,
+      nextAttempt: attemptOrdinal(attempt + 1),
+      delayMs: delay,
+      delaySource: failure.retryAfterMs === undefined ? "backoff" : "retry_after",
+    })
+    yield* Effect.sleep(delay)
+    return yield* retryStatusFailures(effect, retries - 1, attempt + 1)
   })
 
 export const layer: Layer.Layer<Service, never, HttpClient.HttpClient> = Layer.effect(

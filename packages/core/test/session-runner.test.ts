@@ -75,6 +75,8 @@ let maxActiveToolExecutions = 0
 const relayObservations: NemoRelay.LlmStreamCompleted[] = []
 const relayTurnObservations: Array<NemoRelay.TurnStarted & { readonly outcome: NemoRelay.TurnOutcome }> = []
 const relayToolObservations: NemoRelay.ToolCompleted[] = []
+const relayCompactionObservations: NemoRelay.CompactionCompleted[] = []
+const relayCompactionAttemptObservations: NemoRelay.CompactionAttemptCompleted[] = []
 const relayAdapter = NemoRelay.makeForTesting(
   {
     MetricKind: { Counter: "counter", Histogram: "histogram" },
@@ -86,6 +88,8 @@ const relayAdapter = NemoRelay.makeForTesting(
     llmStreamCompleted: (input) => Effect.sync(() => relayObservations.push(input)),
     turnCompleted: (input) => Effect.sync(() => relayTurnObservations.push(input)),
     toolCompleted: (input) => Effect.sync(() => relayToolObservations.push(input)),
+    compactionAttemptCompleted: (input) => Effect.sync(() => relayCompactionAttemptObservations.push(input)),
+    compactionCompleted: (input) => Effect.sync(() => relayCompactionObservations.push(input)),
   },
 )
 const relay = Layer.succeed(NemoRelay.Service, NemoRelay.Service.of(relayAdapter))
@@ -364,6 +368,8 @@ const setup = Effect.gen(function* () {
   relayObservations.length = 0
   relayTurnObservations.length = 0
   relayToolObservations.length = 0
+  relayCompactionObservations.length = 0
+  relayCompactionAttemptObservations.length = 0
   snapshotCaptureHook = Effect.succeed(undefined)
   yield* db
     .insert(ProjectTable)
@@ -1213,6 +1219,15 @@ describe("SessionRunnerLLM", () => {
       expect(continuation).not.toContain("EARLIER_END")
       expect(continuation).toContain("<recent-context>\n[Assistant]: Earlier answer")
       expect(continuation).toContain(`RECENT_BOUNDARY ${"b".repeat(3_000)} RECENT_END`)
+      expect(relayCompactionObservations).toHaveLength(1)
+      expect(relayCompactionAttemptObservations).toEqual([
+        expect.objectContaining({ runtime: "v2", trigger: "proactive", outcome: "success" }),
+      ])
+      expect(relayCompactionObservations[0]).toMatchObject({ runtime: "v2" })
+      expect(relayCompactionObservations[0].sourceEstimatedTokens).toBeGreaterThan(
+        relayCompactionObservations[0].summaryEstimatedTokens,
+      )
+      expect(relayCompactionObservations[0].retainedRecentEstimatedTokens).toBeGreaterThan(0)
     }),
   )
 
@@ -1266,10 +1281,34 @@ describe("SessionRunnerLLM", () => {
         { type: "compaction", summary: "## Objective\n- Recover overflow" },
         { type: "assistant", finish: "stop" },
       ])
+      expect(relayCompactionAttemptObservations).toEqual([
+        expect.objectContaining({ runtime: "v2", trigger: "overflow_recovery", outcome: "success" }),
+      ])
       yield* replaySessionProjection(sessionID)
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "compaction" },
         { type: "assistant", finish: "stop" },
+      ])
+    }),
+  )
+
+  it.effect("reports overflow recovery as not possible when there is no history to summarize", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      currentModel = recoveryModel
+      requests.length = 0
+      responses = [[LLMEvent.providerError({ message: "prompt too long", classification: "context-overflow" })]]
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Only message" }), resume: false })
+      yield* session.resume(sessionID)
+
+      expect(requests).toHaveLength(1)
+      expect(relayCompactionAttemptObservations).toEqual([
+        expect.objectContaining({ runtime: "v2", trigger: "overflow_recovery", outcome: "not_possible" }),
+      ])
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "user", text: "Only message" },
+        { type: "assistant", finish: "error", error: { message: "prompt too long" } },
       ])
     }),
   )
@@ -1342,6 +1381,9 @@ describe("SessionRunnerLLM", () => {
         { type: "user", text: "Continue" },
         { type: "assistant", finish: "error", error: { message: "prompt too long" } },
       ])
+      expect(relayCompactionAttemptObservations).toEqual([
+        expect.objectContaining({ runtime: "v2", trigger: "overflow_recovery", outcome: "failed" }),
+      ])
     }),
   )
 
@@ -1367,6 +1409,9 @@ describe("SessionRunnerLLM", () => {
       streamGate = undefined
       expect(requests).toHaveLength(2)
       expect((yield* session.context(sessionID)).some((message) => message.type === "compaction")).toBe(false)
+      expect(relayCompactionAttemptObservations).toEqual([
+        expect.objectContaining({ runtime: "v2", trigger: "overflow_recovery", outcome: "cancelled" }),
+      ])
     }),
   )
 
@@ -1509,9 +1554,13 @@ describe("SessionRunnerLLM", () => {
           runtime: "native",
           provider: "fake",
           model: "fake-model",
+          protocol: "openai-chat",
+          contextLimit: undefined,
           outcome: "success",
           finish: "tool-calls",
           durationMs: expect.any(Number),
+          firstOutput: { kind: "reasoning", latencyMs: expect.any(Number) },
+          providerError: undefined,
           tokens: {
             inputTotal: 10,
             inputNonCached: 8,
@@ -1520,6 +1569,7 @@ describe("SessionRunnerLLM", () => {
             outputTotal: 4,
             outputReasoning: 1,
           },
+          inputContextUtilizations: [],
         },
       ])
     }),

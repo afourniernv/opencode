@@ -286,6 +286,7 @@ describe("tool.shell permissions", () => {
         ),
       ),
     )
+
   }
 
   for (const item of ps) {
@@ -1034,6 +1035,8 @@ describe("tool.shell abort", () => {
           )
           expect(res.output).toContain("before")
           expect(res.output).toContain("User aborted the command")
+          expect(res.metadata.aborted).toBe(true)
+          expect(res.metadata.timeout).toBeUndefined()
           expect(collected.length).toBeGreaterThan(0)
         }),
       ),
@@ -1052,6 +1055,8 @@ describe("tool.shell abort", () => {
           })
           expect(result.output).toContain("shell tool terminated command after exceeding timeout")
           expect(result.output).toContain("retry with a larger timeout value in milliseconds")
+          expect(result.metadata.timeout).toBe(true)
+          expect(result.metadata.aborted).toBeUndefined()
         }),
       ),
     15_000,
@@ -1091,6 +1096,24 @@ describe("tool.shell abort", () => {
         }),
       ),
     )
+
+    it.live("reports a signaled child without waiting for timeout or exposing the signal", () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const result = yield* run({
+            command: `kill -TERM $$`,
+            timeout: 5_000,
+          })
+          expect(result.metadata.exit).toBeNull()
+          expect(result.metadata.signal).toBe(true)
+          expect(result.metadata.timeout).toBeUndefined()
+          expect(result.metadata.aborted).toBeUndefined()
+          expect(result.output).toContain("terminated after receiving a process signal")
+          expect(result.output).not.toContain("SIGTERM")
+        }),
+      ),
+    )
   }
 
   it.live("returns non-zero exit code", () =>
@@ -1101,6 +1124,8 @@ describe("tool.shell abort", () => {
           command: `exit 42`,
         })
         expect(result.metadata.exit).toBe(42)
+        expect(result.metadata.timeout).toBeUndefined()
+        expect(result.metadata.aborted).toBeUndefined()
       }),
     ),
   )

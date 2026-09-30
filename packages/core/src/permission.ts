@@ -10,6 +10,7 @@ import { SessionV2 } from "./session"
 import { SessionStore } from "./session/store"
 import { Wildcard } from "./util/wildcard"
 import { PermissionSaved } from "./permission/saved"
+import * as NemoRelay from "./observability/nemo-relay"
 
 export { Effect, Rule, Ruleset } from "@opencode-ai/schema/permission"
 const missingAgentPermissions: Permission.Ruleset = [{ action: "*", resource: "*", effect: "deny" }]
@@ -104,6 +105,7 @@ interface Pending {
   readonly request: Request
   readonly agent?: AgentV2.ID
   readonly deferred: Deferred.Deferred<void, DeclinedError | CorrectedError>
+  resolution?: NemoRelay.PermissionResolution
 }
 
 const layer = Layer.effect(
@@ -114,12 +116,18 @@ const layer = Layer.effect(
     const agents = yield* AgentV2.Service
     const sessions = yield* SessionStore.Service
     const saved = yield* PermissionSaved.Service
+    const relay = yield* NemoRelay.Service
     const pending = new Map<ID, Pending>()
 
     yield* EffectRuntime.addFinalizer(() =>
-      EffectRuntime.forEach(pending.values(), (item) => Deferred.fail(item.deferred, new DeclinedError()), {
-        discard: true,
-      }).pipe(
+      EffectRuntime.forEach(
+        pending.values(),
+        (item) => {
+          item.resolution = "cancelled"
+          return Deferred.fail(item.deferred, new DeclinedError())
+        },
+        { discard: true },
+      ).pipe(
         EffectRuntime.ensuring(
           EffectRuntime.sync(() => {
             pending.clear()
@@ -177,7 +185,7 @@ const layer = Layer.effect(
       EffectRuntime.uninterruptible(
         EffectRuntime.gen(function* () {
           const deferred = yield* Deferred.make<void, DeclinedError | CorrectedError>()
-          const item = { request, agent, deferred }
+          const item: Pending = { request, agent, deferred }
           if (pending.has(request.id)) return yield* EffectRuntime.die(`Duplicate pending permission ID: ${request.id}`)
           pending.set(request.id, item)
           yield* events
@@ -191,6 +199,11 @@ const layer = Layer.effect(
       const result = yield* evaluateInput(input)
       const value = request(input)
       if (result.effect === "ask") yield* create(value, input.agent)
+      yield* relay.permissionEvaluated({
+        runtime: "v2",
+        family: NemoRelay.permissionFamily(input.action),
+        effect: result.effect,
+      })
       return { id: value.id, effect: result.effect }
     })
 
@@ -198,6 +211,11 @@ const layer = Layer.effect(
       EffectRuntime.uninterruptibleMask((restore) =>
         EffectRuntime.gen(function* () {
           const result = yield* evaluateInput(input)
+          yield* relay.permissionEvaluated({
+            runtime: "v2",
+            family: NemoRelay.permissionFamily(input.action),
+            effect: result.effect,
+          })
           if (result.effect === "deny") {
             return yield* new BlockedError({
               rules: relevant(input, result.rules),
@@ -205,13 +223,17 @@ const layer = Layer.effect(
           }
           if (result.effect === "allow") return
           const item = yield* create(request(input), input.agent)
-          return yield* restore(Deferred.await(item.deferred)).pipe(
-            EffectRuntime.catchTag("PermissionV2.DeclinedError", (error) => EffectRuntime.die(error)),
-            EffectRuntime.ensuring(
-              EffectRuntime.sync(() => {
-                pending.delete(item.request.id)
-              }),
+          return yield* relay.observePermissionWait(
+            { runtime: "v2", family: NemoRelay.permissionFamily(input.action) },
+            restore(Deferred.await(item.deferred)).pipe(
+              EffectRuntime.catchTag("PermissionV2.DeclinedError", (error) => EffectRuntime.die(error)),
+              EffectRuntime.ensuring(
+                EffectRuntime.sync(() => {
+                  pending.delete(item.request.id)
+                }),
+              ),
             ),
+            () => item.resolution,
           )
         }),
       ),
@@ -229,6 +251,7 @@ const layer = Layer.effect(
           })
 
           if (input.reply === "reject") {
+            existing.resolution = input.message ? "corrected" : "reject"
             yield* Deferred.fail(
               existing.deferred,
               input.message ? new CorrectedError({ feedback: input.message }) : new DeclinedError(),
@@ -236,6 +259,7 @@ const layer = Layer.effect(
             pending.delete(input.requestID)
             for (const [id, item] of pending) {
               if (item.request.sessionID !== existing.request.sessionID) continue
+              item.resolution = "reject"
               yield* events.publish(Event.Replied, {
                 sessionID: item.request.sessionID,
                 requestID: item.request.id,
@@ -254,6 +278,7 @@ const layer = Layer.effect(
               resources: existing.request.save,
             })
           }
+          existing.resolution = input.reply
           yield* Deferred.succeed(existing.deferred, undefined)
           pending.delete(input.requestID)
           if (input.reply !== "always" || !existing.request.save?.length) return
@@ -273,6 +298,7 @@ const layer = Layer.effect(
               )
             )
               continue
+            item.resolution = "always"
             yield* events.publish(Event.Replied, {
               sessionID: item.request.sessionID,
               requestID: item.request.id,
@@ -306,5 +332,5 @@ export const locationLayer = layer.pipe(Layer.provideMerge(AgentV2.locationLayer
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [EventV2.node, Location.node, AgentV2.node, SessionStore.node, PermissionSaved.node],
+  deps: [EventV2.node, Location.node, AgentV2.node, SessionStore.node, PermissionSaved.node, NemoRelay.node],
 })

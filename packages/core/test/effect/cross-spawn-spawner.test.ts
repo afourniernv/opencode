@@ -3,7 +3,7 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { Effect, Exit, Stream } from "effect"
-import type * as PlatformError from "effect/PlatformError"
+import * as PlatformError from "effect/PlatformError"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -11,6 +11,25 @@ import { testEffect } from "../lib/effect"
 
 const live = LayerNode.compile(CrossSpawnSpawner.node)
 const fx = testEffect(live)
+
+describe("signal exit classification", () => {
+  const failure = (method: string) =>
+    PlatformError.systemError({
+      _tag: "Unknown",
+      module: "ChildProcess",
+      method,
+      cause: new Error("PRIVATE_SIGNAL_DETAIL"),
+    })
+
+  fx.effect(
+    "recognizes only ChildProcess.exitCode platform failures",
+    Effect.sync(() => {
+      expect(CrossSpawnSpawner.isSignalExitError(failure("exitCode"))).toBe(true)
+      expect(CrossSpawnSpawner.isSignalExitError(failure("spawn"))).toBe(false)
+      expect(CrossSpawnSpawner.isSignalExitError(new Error("PRIVATE_SIGNAL_DETAIL"))).toBe(false)
+    }),
+  )
+})
 
 function js(code: string, opts?: ChildProcess.CommandOptions) {
   return ChildProcess.make("node", ["-e", code], opts)

@@ -249,6 +249,8 @@ const layer = Layer.effect(
           runtime: "native",
           provider: model.provider,
           model: model.id,
+          protocol: model.route.protocol,
+          contextLimit: model.route.defaults.limits?.context,
         },
         llm.stream(request),
       )
@@ -448,20 +450,25 @@ const layer = Layer.effect(
       let promotion: SessionInput.Delivery | undefined = hasSteer ? "steer" : hasQueue ? "queue" : undefined
       let shouldRun = input.force || hasSteer || hasQueue
       while (shouldRun) {
-        let needsContinuation = true
-        let step = 1
-        while (needsContinuation) {
-          const state: TurnState = { blocked: false }
-          const result = yield* relay.observeTurn(
-            { runtime: "v2", role: "primary" },
-            runTurn(input.sessionID, promotion, step, state),
-            (exit) => (state.blocked ? "blocked" : Exit.isSuccess(exit) ? exit.value.outcome : undefined),
-          )
-          needsContinuation = result.needsContinuation
-          step = result.step + 1
-          promotion = "steer"
-          if (!needsContinuation) needsContinuation = yield* SessionInput.hasPending(db, input.sessionID, "steer")
-        }
+        yield* relay.observeRun(
+          { runtime: "v2" },
+          Effect.gen(function* () {
+            let needsContinuation = true
+            let step = 1
+            while (needsContinuation) {
+              const state: TurnState = { blocked: false }
+              const result = yield* relay.observeTurn(
+                { runtime: "v2", role: "primary" },
+                runTurn(input.sessionID, promotion, step, state),
+                (exit) => (state.blocked ? "blocked" : Exit.isSuccess(exit) ? exit.value.outcome : undefined),
+              )
+              needsContinuation = result.needsContinuation
+              step = result.step + 1
+              promotion = "steer"
+              if (!needsContinuation) needsContinuation = yield* SessionInput.hasPending(db, input.sessionID, "steer")
+            }
+          }),
+        )
         shouldRun = yield* SessionInput.hasPending(db, input.sessionID, "queue")
         promotion = shouldRun ? "queue" : undefined
       }
