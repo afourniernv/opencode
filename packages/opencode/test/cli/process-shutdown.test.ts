@@ -1,13 +1,23 @@
 import { describe, expect, test } from "bun:test"
-import { shutdownProcess, type ProcessShutdownStage } from "../../src/cli/process-shutdown"
+import {
+  PROCESS_SHUTDOWN_TIMEOUT_MS,
+  PROCESS_SHUTDOWN_WATCHDOG_MS,
+  shutdownProcess,
+  type ProcessShutdownStage,
+} from "../../src/cli/process-shutdown"
 
 const complete = { drained: true, flushed: true, closed: true } as const
 
 describe("process shutdown", () => {
+  test("keeps the worker watchdog outside the complete process deadline", () => {
+    expect(PROCESS_SHUTDOWN_WATCHDOG_MS).toBeGreaterThan(PROCESS_SHUTDOWN_TIMEOUT_MS)
+  })
+
   test("stops admission and disposes producers before Relay", async () => {
     const order: ProcessShutdownStage[] = []
     const result = await shutdownProcess({
-      stopServer: async () => {
+      stopServer: async (timeoutMs) => {
+        expect(timeoutMs).toBe(1_500)
         order.push("server")
       },
       disposeInstances: async () => {
@@ -17,7 +27,7 @@ describe("process shutdown", () => {
         order.push("runtime")
       },
       shutdownRelay: async (timeoutMs) => {
-        expect(timeoutMs).toBeGreaterThan(0)
+        expect(timeoutMs).toBe(5_000)
         order.push("relay")
         return complete
       },
@@ -38,7 +48,8 @@ describe("process shutdown", () => {
         order.push("runtime")
         throw new Error("runtime cleanup failed")
       },
-      shutdownRelay: async () => {
+      shutdownRelay: async (timeoutMs) => {
+        expect(timeoutMs).toBe(5_000)
         order.push("relay")
         return complete
       },
@@ -53,9 +64,12 @@ describe("process shutdown", () => {
     const result = await shutdownProcess({
       disposeRuntime: () => {
         order.push("runtime")
-        return new Promise(() => {})
+        // Finish after the stage watchdog so the test proves timeout behavior
+        // without leaking a permanently pending task into suite teardown.
+        return new Promise((resolve) => setTimeout(resolve, 20))
       },
-      shutdownRelay: async () => {
+      shutdownRelay: async (timeoutMs) => {
+        expect(timeoutMs).toBe(45)
         order.push("relay")
         return complete
       },

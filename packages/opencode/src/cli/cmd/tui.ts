@@ -14,6 +14,7 @@ import { writeHeapSnapshot } from "v8"
 import { ServerAuth } from "@/server/auth"
 import { validateSession } from "../tui/validate-session"
 import { win32InstallCtrlCGuard } from "@opencode-ai/tui/terminal-win32"
+import { PROCESS_SHUTDOWN_WATCHDOG_MS } from "@/cli/process-shutdown"
 
 declare global {
   const OPENCODE_WORKER_PATH: string
@@ -224,7 +225,7 @@ export const TuiThreadCommand = cmd({
         stopped = true
         process.off("SIGUSR2", reload)
         try {
-          const result = await withTimeout(client.call("shutdown", undefined), 8_000)
+          const result = await withTimeout(client.call("shutdown", undefined), PROCESS_SHUTDOWN_WATCHDOG_MS)
           if (!result.ok) UI.error(`Worker cleanup was incomplete (${result.failures.join(", ")})`)
         } catch {
           UI.error("Worker cleanup timed out; terminating it")
