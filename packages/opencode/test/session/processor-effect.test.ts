@@ -4,8 +4,8 @@ import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { tool } from "ai"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer, Stream } from "effect"
+import { APICallError, tool } from "ai"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
@@ -28,6 +28,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { LLMEvent } from "@opencode-ai/llm"
 import * as NemoRelay from "@opencode-ai/core/observability/nemo-relay"
+import { markDynamicMcpTool } from "@/session/tool-semantics"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -271,6 +272,122 @@ const localSuccessEnv = LayerNode.compile(root, [
 ])
 const itLocalSuccess = testEffect(localSuccessEnv)
 
+const terminalResultLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "call-nonzero", name: "bash" }),
+        LLMEvent.toolInputEnd({ id: "call-nonzero", name: "bash" }),
+        LLMEvent.toolCall({ id: "call-nonzero", name: "bash", input: {} }),
+        LLMEvent.toolResult({
+          id: "call-nonzero",
+          name: "bash",
+          result: {
+            type: "json",
+            value: { title: "Private command", output: "private output", metadata: { exit: 7421 } },
+          },
+        }),
+        LLMEvent.toolInputStart({ id: "call-zero", name: "shell" }),
+        LLMEvent.toolInputEnd({ id: "call-zero", name: "shell" }),
+        LLMEvent.toolCall({ id: "call-zero", name: "shell", input: {} }),
+        LLMEvent.toolResult({
+          id: "call-zero",
+          name: "shell",
+          result: { type: "json", value: { title: "Shell", output: "ok", metadata: { exit: 0 } } },
+        }),
+        LLMEvent.toolInputStart({ id: "call-timeout", name: "bash" }),
+        LLMEvent.toolInputEnd({ id: "call-timeout", name: "bash" }),
+        LLMEvent.toolCall({ id: "call-timeout", name: "bash", input: {} }),
+        LLMEvent.toolResult({
+          id: "call-timeout",
+          name: "bash",
+          result: {
+            type: "json",
+            value: { title: "Bash", output: "timed out", metadata: { exit: null, timeout: true } },
+          },
+        }),
+        LLMEvent.toolInputStart({ id: "call-extension", name: "customer_extension" }),
+        LLMEvent.toolInputEnd({ id: "call-extension", name: "customer_extension" }),
+        LLMEvent.toolCall({ id: "call-extension", name: "customer_extension", input: {} }),
+        LLMEvent.toolResult({
+          id: "call-extension",
+          name: "customer_extension",
+          result: {
+            type: "json",
+            value: { title: "Extension", output: "ok", metadata: { exit: 19, timeout: true } },
+          },
+        }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      ),
+  }),
+)
+const terminalResultObservations: NemoRelay.ToolCompleted[] = []
+const terminalResultRelay = Layer.succeed(
+  NemoRelay.Service,
+  NemoRelay.Service.of(
+    NemoRelay.makeForTesting(
+      {
+        MetricKind: { Counter: "counter", Histogram: "histogram" },
+        MetricValueType: { U64: "u64", F64: "f64" },
+        metric() {},
+        flushSubscribers: async () => {},
+      },
+      { toolCompleted: (input) => Effect.sync(() => terminalResultObservations.push(input)) },
+    ),
+  ),
+)
+const terminalResultEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, terminalResultLLM],
+  [NemoRelay.node, terminalResultRelay],
+])
+const itTerminalResult = testEffect(terminalResultEnv)
+
+const dynamicMcpToolName = "private-server_finance_lookup"
+const dynamicMcpLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "call-mcp", name: dynamicMcpToolName }),
+        LLMEvent.toolInputEnd({ id: "call-mcp", name: dynamicMcpToolName }),
+        LLMEvent.toolCall({ id: "call-mcp", name: dynamicMcpToolName, input: {} }),
+        LLMEvent.toolResult({
+          id: "call-mcp",
+          name: dynamicMcpToolName,
+          result: { type: "json", value: { title: "MCP", output: "ok", metadata: {} } },
+        }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      ),
+  }),
+)
+const dynamicMcpToolObservations: NemoRelay.ToolCompleted[] = []
+const dynamicMcpRelay = Layer.succeed(
+  NemoRelay.Service,
+  NemoRelay.Service.of(
+    NemoRelay.makeForTesting(
+      {
+        MetricKind: { Counter: "counter", Histogram: "histogram" },
+        MetricValueType: { U64: "u64", F64: "f64" },
+        metric() {},
+        flushSubscribers: async () => {},
+      },
+      { toolCompleted: (input) => Effect.sync(() => dynamicMcpToolObservations.push(input)) },
+    ),
+  ),
+)
+const dynamicMcpEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, dynamicMcpLLM],
+  [NemoRelay.node, dynamicMcpRelay],
+])
+const itDynamicMcp = testEffect(dynamicMcpEnv)
+
 const interruptedToolObservations: NemoRelay.ToolCompleted[] = []
 const interruptedRelay = Layer.succeed(
   NemoRelay.Service,
@@ -402,6 +519,102 @@ const relayMetrics = {
   metric() {},
   flushSubscribers: async () => {},
 }
+
+const CurrentTestRelayScope = Context.Reference<string | undefined>("@opencode/test/CurrentRelayScope", {
+  defaultValue: () => undefined,
+})
+type ConcurrentToolEvent =
+  | { readonly phase: "start"; readonly tool: string; readonly parent: string | undefined }
+  | { readonly phase: "permission"; readonly tool: string | undefined; readonly parent: string | undefined }
+  | { readonly phase: "execute"; readonly tool: string; readonly parent: string | undefined }
+  | { readonly phase: "end"; readonly tool: string; readonly outcome: NemoRelay.ToolOutcome }
+
+let concurrentStreamStarted = defer<void>()
+let concurrentStreamRelease = defer<void>()
+const concurrentToolEvents: ConcurrentToolEvent[] = []
+const concurrentToolLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.unwrap(
+        Effect.sync(() => concurrentStreamStarted.resolve()).pipe(
+          Effect.andThen(Effect.promise(() => concurrentStreamRelease.promise)),
+          Effect.as(Stream.empty),
+        ),
+      ),
+  }),
+)
+const concurrentToolBaseRelay = NemoRelay.makeForTesting(relayMetrics)
+const concurrentToolRelay = Layer.succeed(
+  NemoRelay.Service,
+  NemoRelay.Service.of({
+    ...concurrentToolBaseRelay,
+    observeTurn: (_input, effect) => effect.pipe(Effect.provideService(CurrentTestRelayScope, "turn")),
+    beginTool: (input) =>
+      Effect.gen(function* () {
+        const name = input.name ?? "unknown"
+        concurrentToolEvents.push({ phase: "start", tool: name, parent: yield* CurrentTestRelayScope })
+        return {
+          run: (effect) => effect.pipe(Effect.provideService(CurrentTestRelayScope, name)),
+          complete: (outcome) =>
+            Effect.sync(() => concurrentToolEvents.push({ phase: "end", tool: name, outcome })),
+        } satisfies NemoRelay.ToolObservation
+      }),
+    permissionEvaluated: () =>
+      Effect.gen(function* () {
+        const parent = yield* CurrentTestRelayScope
+        concurrentToolEvents.push({ phase: "permission", tool: parent, parent })
+      }),
+  }),
+)
+const concurrentToolEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, concurrentToolLLM],
+  [NemoRelay.node, concurrentToolRelay],
+])
+const itConcurrentTool = testEffect(concurrentToolEnv)
+
+let retryMetadataStreamCalls = 0
+const retryMetadataLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () => {
+      retryMetadataStreamCalls++
+      if (retryMetadataStreamCalls === 1) {
+        return Stream.fail(
+          new APICallError({
+            message: "Too many requests",
+            url: "https://provider.invalid/v1/chat/completions",
+            requestBodyValues: {},
+            statusCode: 429,
+            responseHeaders: { "retry-after-ms": "0" },
+            responseBody: JSON.stringify({ error: { type: "rate_limit_error" } }),
+          }),
+        )
+      }
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      )
+    },
+  }),
+)
+const retryMetadataObservations: Parameters<NemoRelay.Interface["retryScheduled"]>[0][] = []
+const retryMetadataService = NemoRelay.makeForTesting(relayMetrics)
+const retryMetadataRelay = Layer.succeed(
+  NemoRelay.Service,
+  NemoRelay.Service.of({
+    ...retryMetadataService,
+    retryScheduled: (input) => Effect.sync(() => retryMetadataObservations.push(input)),
+  }),
+)
+const retryMetadataEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, retryMetadataLLM],
+  [NemoRelay.node, retryMetadataRelay],
+])
+const itRetryMetadata = testEffect(retryMetadataEnv)
 
 function policyFailureLLM(error: PermissionV1.Error) {
   return Layer.succeed(
@@ -1053,6 +1266,155 @@ it.live("session.processor effect tests publish retry status updates", () =>
   ),
 )
 
+itRetryMetadata.live("session.processor forwards enriched retry metadata to Relay", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        retryMetadataStreamCalls = 0
+        retryMetadataObservations.length = 0
+        const { processors, session, provider } = yield* boot()
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "retry metadata")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "retry metadata" }],
+          tools: {},
+        })
+
+        expect(value).toBe("continue")
+        expect(retryMetadataStreamCalls).toBe(2)
+        expect(retryMetadataObservations).toEqual([
+          {
+            runtime: "v1",
+            attempt: 1,
+            delayMs: 0,
+            delaySource: "retry_after",
+            errorKind: "rate_limit",
+          },
+        ])
+      }),
+    { config: cfg },
+  ),
+)
+
+itConcurrentTool.live("session.processor scopes concurrent callbacks under their Tool and closes in completion order", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        concurrentStreamStarted = defer<void>()
+        concurrentStreamRelease = defer<void>()
+        concurrentToolEvents.length = 0
+
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "concurrent tools")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const process = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "concurrent tools" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+
+        yield* Effect.promise(() => concurrentStreamStarted.promise)
+        const firstStarted = yield* Deferred.make<void>()
+        const secondStarted = yield* Deferred.make<void>()
+        const releaseFirst = yield* Deferred.make<void>()
+        const releaseSecond = yield* Deferred.make<void>()
+
+        const execute = (
+          toolCallID: string,
+          name: string,
+          started: Deferred.Deferred<void>,
+          release: Deferred.Deferred<void>,
+        ) =>
+          Effect.promise(() =>
+            handle.executeTool(
+              { toolCallID, name, input: { value: name } },
+              Effect.gen(function* () {
+                const active = yield* CurrentTestRelayScope
+                concurrentToolEvents.push({ phase: "execute", tool: name, parent: active })
+                concurrentToolEvents.push({ phase: "permission", tool: active, parent: active })
+                yield* Deferred.succeed(started, undefined)
+                yield* Deferred.await(release)
+                return { title: name, metadata: {}, output: `${name} complete` }
+              }),
+            ),
+          ).pipe(Effect.tap((output) => handle.completeToolCall(toolCallID, output)))
+
+        const first = yield* execute("call-first", "first", firstStarted, releaseFirst).pipe(Effect.forkChild)
+        const second = yield* execute("call-second", "second", secondStarted, releaseSecond).pipe(Effect.forkChild)
+        yield* Effect.all([Deferred.await(firstStarted), Deferred.await(secondStarted)])
+
+        yield* Deferred.succeed(releaseSecond, undefined)
+        yield* Fiber.join(second)
+        yield* Deferred.succeed(releaseFirst, undefined)
+        yield* Fiber.join(first)
+        concurrentStreamRelease.resolve()
+        expect(yield* Fiber.join(process)).toBe("continue")
+
+        expect(concurrentToolEvents.filter((event) => event.phase === "start")).toEqual(
+          expect.arrayContaining([
+            { phase: "start", tool: "first", parent: "turn" },
+            { phase: "start", tool: "second", parent: "turn" },
+          ]),
+        )
+        expect(concurrentToolEvents.filter((event) => event.phase === "execute")).toEqual(
+          expect.arrayContaining([
+            { phase: "execute", tool: "first", parent: "first" },
+            { phase: "execute", tool: "second", parent: "second" },
+          ]),
+        )
+        expect(concurrentToolEvents.filter((event) => event.phase === "permission")).toEqual(
+          expect.arrayContaining([
+            { phase: "permission", tool: "first", parent: "first" },
+            { phase: "permission", tool: "second", parent: "second" },
+          ]),
+        )
+        expect(concurrentToolEvents.filter((event) => event.phase === "end")).toEqual([
+          { phase: "end", tool: "second", outcome: "success" },
+          { phase: "end", tool: "first", outcome: "success" },
+        ])
+        const calls = (yield* MessageV2.parts(msg.id)).filter(
+          (part): part is SessionV1.ToolPart => part.type === "tool",
+        )
+        expect(calls).toHaveLength(2)
+        expect(calls.every((part) => part.state.status === "completed")).toBe(true)
+      }),
+    { config: cfg },
+  ),
+)
+
 it.live("session.processor effect tests compact on structured context overflow", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>
@@ -1635,6 +1997,119 @@ itLocalSuccess.live("session.processor effect tests observe completed local tool
         expect(localToolObservations).toEqual([
           {
             name: "lookup",
+            outcome: "success",
+            execution: "local",
+            durationMs: expect.any(Number),
+          },
+        ])
+      }),
+    { config: cfg },
+  ),
+)
+
+itTerminalResult.live("session.processor records bounded terminal results without failing successful tools", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        terminalResultObservations.length = 0
+        const { processors, session, provider } = yield* boot()
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "terminal results")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+        yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "terminal results" }],
+          tools: {},
+        })
+
+        expect(terminalResultObservations).toEqual([
+          expect.objectContaining({
+            name: "bash",
+            execution: "local",
+            outcome: "success",
+            terminalResult: "nonzero_exit",
+          }),
+          expect.objectContaining({
+            name: "shell",
+            execution: "local",
+            outcome: "success",
+            terminalResult: "zero_exit",
+          }),
+          expect.objectContaining({
+            name: "bash",
+            execution: "local",
+            outcome: "success",
+            terminalResult: "timeout",
+          }),
+          expect.objectContaining({
+            name: "customer_extension",
+            execution: "local",
+            outcome: "success",
+          }),
+        ])
+        expect(terminalResultObservations[3]).not.toHaveProperty("terminalResult")
+      }),
+    { config: cfg },
+  ),
+)
+
+itDynamicMcp.live("session.processor classifies marked dynamic MCP tools without parsing their names", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        dynamicMcpToolObservations.length = 0
+        const { processors, session, provider } = yield* boot()
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "dynamic MCP tool")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+        yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "dynamic MCP tool" }],
+          tools: {
+            [dynamicMcpToolName]: markDynamicMcpTool(
+              tool({
+                description: "Private MCP tool",
+                inputSchema: z.object({}),
+                execute: async () => ({ title: "MCP", output: "ok", metadata: {} }),
+              }),
+            ),
+          },
+        })
+
+        expect(dynamicMcpToolObservations).toEqual([
+          {
+            name: dynamicMcpToolName,
+            category: "mcp",
             outcome: "success",
             execution: "local",
             durationMs: expect.any(Number),

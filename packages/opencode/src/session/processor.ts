@@ -26,12 +26,23 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 import * as NemoRelay from "@opencode-ai/core/observability/nemo-relay"
+import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
+import { EffectBridge } from "@/effect/bridge"
+import { toolSemanticCategory } from "./tool-semantics"
 
 const DOOM_LOOP_THRESHOLD = 3
 export type Result = "compact" | "stop" | "continue"
 
 export interface Handle {
   readonly message: SessionV1.Assistant
+  readonly executeTool: <A, E>(
+    input: {
+      readonly toolCallID: string
+      readonly name: string
+      readonly input: Record<string, unknown>
+    },
+    effect: Effect.Effect<A, E>,
+  ) => Promise<A>
   readonly updateToolCall: (
     toolCallID: string,
     update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
@@ -98,6 +109,13 @@ const layer = Layer.effect(
     const database = yield* Database.Service
     const relay = yield* NemoRelay.Service
 
+    const callRole = (agent: string): NemoRelay.CallRole => {
+      if (agent === "compaction") return "compaction"
+      if (agent === "title") return "title"
+      if (agent === "summary") return "summary"
+      return "primary"
+    }
+
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
       // may execute tools internally before emitting start-step events,
@@ -115,7 +133,11 @@ const layer = Layer.effect(
         currentText: undefined,
         reasoningMap: {},
       }
+      const fallbackBridge = yield* EffectBridge.make()
+      const toolCallLocks = KeyedMutex.makeUnsafe<string>()
       let aborted = false
+      let activeToolCategories = new Map<string, NemoRelay.ToolCategory>()
+      let activeToolBridge: EffectBridge.Shape | undefined
       const claimedTerminalCallIDs = new Set<string>()
 
       const claimTerminal = (toolCallID: string) => {
@@ -218,7 +240,14 @@ const layer = Layer.effect(
               claimedTerminalCallIDs.delete(toolCallID)
               yield* Effect.failCause(updated.cause)
             }
-            const relayCompletion = match.call.relay?.complete("success")
+            const terminalResult =
+              match.part.metadata?.providerExecuted !== true && NemoRelay.toolCategory(match.part.tool) === "terminal"
+                ? NemoRelay.terminalResultFamily(output.metadata)
+                : undefined
+            const relayCompletion = match.call.relay?.complete(
+              "success",
+              terminalResult === undefined ? undefined : { terminalResult },
+            )
             if (relayCompletion) yield* relayCompletion
             yield* settleToolCall(toolCallID)
           }),
@@ -376,6 +405,66 @@ const layer = Layer.effect(
         return { call: ctx.toolcalls[input.id], part }
       })
 
+      const admitToolCall = <A, E, R>(toolCallID: string, effect: Effect.Effect<A, E, R>) =>
+        toolCallLocks.withLock(toolCallID)(effect)
+
+      const startToolCall = Effect.fn("SessionProcessor.startToolCall")(function* (input: {
+        id: string
+        name: string
+        value: Record<string, unknown>
+        providerExecuted?: boolean
+        providerMetadata?: SessionV1.ToolPart["metadata"]
+      }) {
+        return yield* admitToolCall(
+          input.id,
+          Effect.gen(function* () {
+            yield* ensureToolCall({ id: input.id, name: input.name, providerExecuted: input.providerExecuted })
+            const running = yield* updateToolCall(input.id, (match) => ({
+              ...match,
+              tool: input.name,
+              state:
+                match.state.status === "running"
+                  ? { ...match.state, input: input.value }
+                  : {
+                      status: "running",
+                      input: input.value,
+                      time: { start: Date.now() },
+                    },
+              metadata: input.providerExecuted
+                ? { ...input.providerMetadata, providerExecuted: true }
+                : (input.providerMetadata ?? match.metadata),
+            }))
+            const observed = ctx.toolcalls[input.id]
+            if (running?.state.status === "running" && observed && !observed.relay) {
+              observed.relay = yield* relay.beginTool({
+                name: input.name,
+                category: activeToolCategories.get(input.name),
+                execution: running.metadata?.providerExecuted === true ? "provider" : "local",
+              })
+            }
+            return observed?.relay
+          }),
+        )
+      })
+
+      const executeTool: Handle["executeTool"] = (input, effect) => {
+        const bridge = activeToolBridge
+        // Tool callbacks are expected to run while process() owns an observed
+        // Turn. Preserve host behavior if a provider invokes one outside that
+        // lifetime, but do not invent a Tool parent under a stale Run context.
+        if (!bridge) return fallbackBridge.promise(effect)
+        return bridge.promise(
+          Effect.gen(function* () {
+            const observation = yield* startToolCall({
+              id: input.toolCallID,
+              name: input.name,
+              value: input.input,
+            })
+            return yield* (observation ? observation.run(effect) : effect)
+          }),
+        )
+      }
+
       const isFilePart = (value: unknown): value is SessionV1.FilePart => Schema.is(SessionV1.FilePart)(value)
 
       const toolResultOutput = (
@@ -440,15 +529,15 @@ const layer = Layer.effect(
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
-            yield* ensureToolCall(value)
+            yield* admitToolCall(value.id, ensureToolCall(value))
             return
 
           case "tool-input-delta":
-            yield* ensureToolCall(value)
+            yield* admitToolCall(value.id, ensureToolCall(value))
             return
 
           case "tool-input-end": {
-            yield* ensureToolCall(value)
+            yield* admitToolCall(value.id, ensureToolCall(value))
             return
           }
 
@@ -456,33 +545,16 @@ const layer = Layer.effect(
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
-            yield* ensureToolCall(value)
             const input = isRecord(value.input) ? value.input : { value: value.input }
-            const running = yield* updateToolCall(value.id, (match) => ({
-              ...match,
-              tool: value.name,
-              state:
-                match.state.status === "running"
-                  ? { ...match.state, input }
-                  : {
-                      status: "running",
-                      input,
-                      time: { start: Date.now() },
-                    },
-              metadata: match.metadata?.providerExecuted
-                ? { ...value.providerMetadata, providerExecuted: true }
-                : value.providerMetadata,
-            }))
-            const observed = ctx.toolcalls[value.id]
-            if (running?.state.status === "running" && observed && !observed.relay)
-              yield* Effect.uninterruptible(
-                relay
-                  .beginTool({
-                    name: value.name,
-                    execution: running.metadata?.providerExecuted === true ? "provider" : "local",
-                  })
-                  .pipe(Effect.tap((observation) => Effect.sync(() => (observed.relay = observation)))),
-              )
+            yield* Effect.uninterruptible(
+              startToolCall({
+                id: value.id,
+                name: value.name,
+                value: input,
+                providerExecuted: value.providerExecuted,
+                providerMetadata: value.providerMetadata,
+              }),
+            )
 
             const parts = yield* MessageV2.parts(ctx.assistantMessage.id).pipe(
               Effect.provideService(Database.Service, database),
@@ -588,6 +660,15 @@ const layer = Layer.effect(
               usage: value.usage ?? new Usage({}),
               metadata: value.providerMetadata,
             })
+            if (usage.costSource)
+              yield* relay.llmCostRecorded({
+                role: callRole(ctx.assistantMessage.agent),
+                agentRuntime: "v1",
+                provider: ctx.model.providerID,
+                model: ctx.model.id,
+                costUsd: usage.cost,
+                source: usage.costSource,
+              })
             ctx.assistantMessage.finish = value.reason
             ctx.assistantMessage.cost += usage.cost
             ctx.assistantMessage.tokens = usage.tokens
@@ -760,6 +841,12 @@ const layer = Layer.effect(
       })
 
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
+        activeToolCategories = new Map(
+          Object.entries(streamInput.tools).flatMap(([name, item]) => {
+            const category = toolSemanticCategory(item)
+            return category ? [[name, category] as const] : []
+          }),
+        )
         yield* Effect.logInfo("process", {
           "session.id": input.sessionID,
           messageID: input.assistantMessage.id,
@@ -770,6 +857,8 @@ const layer = Layer.effect(
         let unsettledOutcome: NemoRelay.ToolOutcome = "failed"
 
         const turn = Effect.gen(function* () {
+          const bridge = yield* EffectBridge.make()
+          activeToolBridge = bridge
           yield* Effect.gen(function* () {
             ctx.currentText = undefined
             ctx.reasoningMap = {}
@@ -813,7 +902,13 @@ const layer = Layer.effect(
                         action: info.action,
                         next: info.next,
                       }),
-                      relay.retryScheduled({ runtime: "v1", attempt: info.attempt }),
+                      relay.retryScheduled({
+                        runtime: "v1",
+                        attempt: info.attempt,
+                        delayMs: info.delayMs,
+                        delaySource: info.delaySource,
+                        errorKind: info.errorKind,
+                      }),
                     ],
                     { discard: true },
                   ),
@@ -821,20 +916,18 @@ const layer = Layer.effect(
             ),
             Effect.catch(halt),
             Effect.ensuring(Effect.suspend(() => cleanup(unsettledOutcome))),
+            Effect.ensuring(
+              Effect.sync(() => {
+                if (activeToolBridge === bridge) activeToolBridge = undefined
+              }),
+            ),
           )
 
           if (ctx.needsCompaction) return "compact"
           if (ctx.blocked || ctx.assistantMessage.error) return "stop"
           return "continue"
         })
-        const role: NemoRelay.CallRole =
-          streamInput.agent.name === "compaction"
-            ? "compaction"
-            : streamInput.agent.name === "title"
-              ? "title"
-              : streamInput.agent.name === "summary"
-                ? "summary"
-                : "primary"
+        const role = callRole(streamInput.agent.name)
         return yield* relay.observeTurn({ runtime: "v1", role }, turn, (exit) =>
           Exit.isSuccess(exit)
             ? exit.value === "stop"
@@ -852,6 +945,7 @@ const layer = Layer.effect(
         get message() {
           return ctx.assistantMessage
         },
+        executeTool,
         updateToolCall,
         completeToolCall,
         process,

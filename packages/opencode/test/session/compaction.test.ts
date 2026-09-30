@@ -202,6 +202,7 @@ function fake(
     get message() {
       return msg
     },
+    executeTool: (_input, effect) => Effect.runPromise(effect),
     updateToolCall: Effect.fn("TestSessionProcessor.updateToolCall")(() => Effect.succeed(undefined)),
     completeToolCall: Effect.fn("TestSessionProcessor.completeToolCall")(() => Effect.void),
     process: Effect.fn("TestSessionProcessor.process")(() => Effect.succeed(result)),
@@ -1780,6 +1781,7 @@ describe("SessionNs.getUsage", () => {
     expect(result.tokens.cache.read).toBe(0)
     expect(result.tokens.cache.write).toBe(0)
     expect(Number.isNaN(result.cost)).toBe(false)
+    expect(result.costSource).toBeUndefined()
   })
 
   test("ignores malformed cost fields", () => {
@@ -1814,6 +1816,26 @@ describe("SessionNs.getUsage", () => {
     })
 
     expect(result.cost).toBe(3 + 1.5)
+    expect(result.costSource).toBe("price_table_estimate")
+  })
+
+  test("omits cost provenance when a used token category has no positive resolved rate", () => {
+    const model = createModel({
+      context: 100_000,
+      output: 32_000,
+      cost: {
+        input: 3,
+        output: 15,
+        cache: { read: 0, write: 0 },
+      },
+    })
+    const result = SessionNs.getUsage({
+      model,
+      usage: usage({ inputTokens: 1_000, outputTokens: 100, cacheReadInputTokens: 200 }),
+    })
+
+    expect(result.cost).toBeGreaterThan(0)
+    expect(result.costSource).toBeUndefined()
   })
 
   test("uses authoritative Copilot billed cost when provided", () => {
@@ -1828,6 +1850,7 @@ describe("SessionNs.getUsage", () => {
     })
 
     expect(result.cost).toBe(0.04473525)
+    expect(result.costSource).toBe("provider_reported")
   })
 
   test("uses matching context cost tier before over-200k fallback", () => {

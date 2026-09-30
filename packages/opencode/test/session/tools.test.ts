@@ -128,6 +128,7 @@ it.effect("preserves running tool start time across metadata updates", () =>
         providerID: ProviderV2.ID.make("test"),
         time: { created: 1 },
       } satisfies SessionV1.Assistant,
+      executeTool: (_input, effect) => Effect.runPromise(effect),
       updateToolCall: (_toolCallID, update) =>
         Effect.sync(() => {
           const next = update(state)
@@ -136,7 +137,7 @@ it.effect("preserves running tool start time across metadata updates", () =>
           return state
         }),
       completeToolCall: () => Effect.void,
-    } satisfies Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
+    } satisfies Pick<SessionProcessor.Handle, "message" | "executeTool" | "updateToolCall" | "completeToolCall">
 
     const tools = yield* SessionTools.resolve({
       agent,
@@ -205,9 +206,10 @@ itDynamicMcp.effect("marks dynamic MCP tools without changing ordinary tool sema
         providerID: ProviderV2.ID.make("test"),
         time: { created: 1 },
       } satisfies SessionV1.Assistant,
+      executeTool: (_input, effect) => Effect.runPromise(effect),
       updateToolCall: () => Effect.succeed(undefined),
       completeToolCall: () => Effect.void,
-    } satisfies Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
+    } satisfies Pick<SessionProcessor.Handle, "message" | "executeTool" | "updateToolCall" | "completeToolCall">
 
     const tools = yield* SessionTools.resolve({
       agent,

@@ -18,7 +18,6 @@ import { MessageV2 } from "./message-v2"
 import { Session } from "./session"
 import { SessionProcessor } from "./processor"
 import { PartID } from "./schema"
-import { EffectBridge } from "@/effect/bridge"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { isRecord } from "@/util/record"
@@ -43,13 +42,12 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   agent: Agent.Info
   model: Provider.Model
   session: Session.Info
-  processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
+  processor: Pick<SessionProcessor.Handle, "message" | "executeTool" | "updateToolCall" | "completeToolCall">
   bypassAgentCheck: boolean
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
 }) {
   const tools: Record<string, AITool> = {}
-  const run = yield* EffectBridge.make()
   const plugin = yield* Plugin.Service
   const permission = yield* Permission.Service
   const registry = yield* ToolRegistry.Service
@@ -101,7 +99,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       description: item.description,
       inputSchema: jsonSchema(schema),
       execute(args, options) {
-        return run.promise(
+        return input.processor.executeTool(
+          { toolCallID: options.toolCallId, name: item.id, input: args },
           Effect.gen(function* () {
             const ctx = context(args, options)
             yield* plugin.trigger(
@@ -154,7 +153,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         }),
       ),
       execute(args, opts) {
-        return run.promise(
+        return input.processor.executeTool(
+          { toolCallID: opts.toolCallId, name: MCP_RESOURCE_TOOLS.list, input: toRecord(args) },
           Effect.gen(function* () {
             const parsed = parseListMcpResourcesArgs(args)
             const ctx = context(toRecord(args), opts)
@@ -237,7 +237,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         }),
       ),
       execute(args, opts) {
-        return run.promise(
+        return input.processor.executeTool(
+          { toolCallID: opts.toolCallId, name: MCP_RESOURCE_TOOLS.listTemplates, input: toRecord(args) },
           Effect.gen(function* () {
             const parsed = parseListMcpResourcesArgs(args)
             const ctx = context(toRecord(args), opts)
@@ -324,7 +325,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         }),
       ),
       execute(args, opts) {
-        return run.promise(
+        return input.processor.executeTool(
+          { toolCallID: opts.toolCallId, name: MCP_RESOURCE_TOOLS.read, input: toRecord(args) },
           Effect.gen(function* () {
             const parsed = parseReadMcpResourceArgs(args)
             const ctx = context(toRecord(args), opts)
@@ -397,7 +399,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     const transformed = ProviderTransform.schema(input.model, { ...schema, properties: schema.properties ?? {} })
     item.inputSchema = jsonSchema(transformed)
     item.execute = (args, opts) =>
-      run.promise(
+      input.processor.executeTool(
+        { toolCallID: opts.toolCallId, name: key, input: args },
         Effect.gen(function* () {
           const ctx = context(args, opts)
           yield* plugin.trigger(

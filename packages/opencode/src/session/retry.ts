@@ -29,6 +29,8 @@ export const RETRY_JITTER_FACTOR = 0.25
 export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
 export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
 export const RETRY_MAX_RETRIES = 5
+export type RetryDelaySource = "retry_after" | "backoff"
+export type RetryErrorKind = "rate_limit" | "quota_exceeded" | "provider_internal" | "transport" | "unknown"
 
 const RETRYABLE_MESSAGE_PATTERNS = [
   /429|500|502|503|504|524/i,
@@ -75,6 +77,40 @@ export function delay(attempt: number, error?: SessionV1.APIError, random = Math
   }
 
   return cap(Math.min(exponential(attempt, random), RETRY_MAX_DELAY_NO_HEADERS))
+}
+
+export function delaySource(error?: SessionV1.APIError): RetryDelaySource {
+  const headers = error?.data.responseHeaders
+  if (!headers) return "backoff"
+  const retryAfterMs = headers["retry-after-ms"]
+  if (retryAfterMs !== undefined && Number.isFinite(Number.parseFloat(retryAfterMs))) return "retry_after"
+  const retryAfter = headers["retry-after"]
+  if (retryAfter === undefined) return "backoff"
+  if (Number.isFinite(Number.parseFloat(retryAfter))) return "retry_after"
+  const parsed = Date.parse(retryAfter) - Date.now()
+  return Number.isFinite(parsed) && parsed > 0 ? "retry_after" : "backoff"
+}
+
+export function errorKind(error: Err): RetryErrorKind {
+  const api = SessionV1.APIError.isInstance(error) ? error : undefined
+  const status = api?.data.statusCode
+  const data = isRecord(error.data) ? error.data : {}
+  const message = [api?.data.message, api?.data.responseBody, data.message]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ")
+    .toLowerCase()
+  if (/freeusagelimiterror|gousagelimiterror|quota|usage limit/.test(message)) return "quota_exceeded"
+  if (status === 429 || /too[_ -]?many[_ -]?requests|rate[_ -]?limit|resource[_ -]?exhausted/.test(message))
+    return "rate_limit"
+  if (
+    /fetch failed|failed to fetch|network[-_\s]error|connection (?:error|refused|lost)|socket|econn|enotfound|eai_again|etimedout|timeout|timed out/.test(
+      message,
+    )
+  )
+    return "transport"
+  if ((status !== undefined && status >= 500) || /overload|unavailable|internal|server error/.test(message))
+    return "provider_internal"
+  return "unknown"
 }
 
 function exponential(attempt: number, random: number) {
@@ -183,7 +219,15 @@ function parseJSON(value: unknown) {
 export function policy(opts: {
   provider: string
   parse: (error: unknown) => Err
-  set: (input: { attempt: number; message: string; action?: Retryable["action"]; next: number }) => Effect.Effect<void>
+  set: (input: {
+    attempt: number
+    message: string
+    action?: Retryable["action"]
+    next: number
+    delayMs: number
+    delaySource: RetryDelaySource
+    errorKind: RetryErrorKind
+  }) => Effect.Effect<void>
 }) {
   return Schedule.fromStepWithMetadata(
     Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
@@ -199,6 +243,9 @@ export function policy(opts: {
           message: retry.message,
           action: retry.action,
           next: now + wait,
+          delayMs: wait,
+          delaySource: delaySource(SessionV1.APIError.isInstance(error) ? error : undefined),
+          errorKind: errorKind(error),
         })
         return [meta.attempt, Duration.millis(wait)] as [number, Duration.Duration]
       })
