@@ -15,6 +15,7 @@ import {
   toolDurationBucket,
   type LlmStreamCompleted,
   type LlmUnaryCompleted,
+  type PermissionResolution,
   type ToolCompleted,
 } from "@opencode-ai/core/observability/nemo-relay"
 
@@ -835,21 +836,87 @@ describe("NeMo Relay observability", () => {
     expect(completed.map((item) => item.outcome)).toEqual(["incomplete", "success"])
   })
 
-  test("records provider tools without claiming local execution latency", async () => {
+  test("preserves provider tool semantic categories without claiming local execution latency", async () => {
     const emissions: Emission[] = []
-    const relay = makeForTesting(driver(emissions))
-    const observation = await Effect.runPromise(
-      relay.beginTool({ name: "private_provider_tool", execution: "provider" }),
+    const records: TraceRecord[] = []
+    const relay = makeForTesting({ ...driver(emissions), ...traceDriver(records) })
+    const inferred = await Effect.runPromise(relay.beginTool({ name: "read", execution: "provider" }))
+    const explicit = await Effect.runPromise(
+      relay.beginTool({ name: "private_provider_tool", category: "mcp", execution: "provider" }),
     )
-    await Effect.runPromise(observation.complete("success", { terminalResult: "nonzero_exit" }))
+    await Effect.runPromise(inferred.complete("success", { terminalResult: "nonzero_exit" }))
+    await Effect.runPromise(explicit.complete("success", { terminalResult: "nonzero_exit" }))
 
-    expect(emissions[0]?.measurements).toHaveLength(1)
-    expect(emissions[0]?.measurements[0]?.attributes).toMatchObject({
-      category: "extension",
-      execution: "provider",
-      outcome: "success",
-    })
+    expect(
+      emissions.map((emission) => {
+        const attributes = emission.measurements[0]?.attributes
+        return {
+          category: attributes?.category,
+          execution: attributes?.execution,
+          outcome: attributes?.outcome,
+        }
+      }),
+    ).toEqual([
+      { category: "file_read", execution: "provider", outcome: "success" },
+      { category: "mcp", execution: "provider", outcome: "success" },
+    ])
+    expect(
+      records
+        .filter((record) => record.phase === "start" && record.kind === "tool")
+        .map(({ payload, metadata }) => ({ payload, metadata })),
+    ).toEqual([
+      {
+        payload: { category: "file_read", execution: "provider" },
+        metadata: expect.objectContaining({
+          "opencode.tool_category": "file_read",
+          "opencode.tool_execution": "provider",
+        }),
+      },
+      {
+        payload: { category: "mcp", execution: "provider" },
+        metadata: expect.objectContaining({
+          "opencode.tool_category": "mcp",
+          "opencode.tool_execution": "provider",
+        }),
+      },
+    ])
     expect(JSON.stringify(emissions)).not.toContain("private_provider_tool")
+    expect(JSON.stringify(records)).not.toContain("private_provider_tool")
+    expect(JSON.stringify({ emissions, records })).not.toContain("terminal_result")
+  })
+
+  test("maps permission wait resolutions to trace status without overstating cancellation", async () => {
+    const records: TraceRecord[] = []
+    const relay = makeForTesting({ ...driver(), ...traceDriver(records) })
+    const resolutions: PermissionResolution[] = ["once", "always", "reject", "corrected", "cancelled", "unknown"]
+
+    for (const resolution of resolutions)
+      await Effect.runPromise(
+        relay.observePermissionWait({ runtime: "v2", family: "filesystem" }, Effect.void, () => resolution),
+      )
+
+    const ended = records.filter((record) => record.phase === "end" && record.name === "opencode.permission.wait")
+    expect(ended.map((record) => record.metadata)).toEqual([
+      expect.objectContaining({ "opencode.permission_resolution": "once", "otel.status_code": "OK" }),
+      expect.objectContaining({ "opencode.permission_resolution": "always", "otel.status_code": "OK" }),
+      expect.objectContaining({
+        "opencode.permission_resolution": "reject",
+        "otel.status_code": "ERROR",
+        "error.type": "opencode.permission.reject",
+      }),
+      expect.objectContaining({
+        "opencode.permission_resolution": "corrected",
+        "otel.status_code": "ERROR",
+        "error.type": "opencode.permission.corrected",
+      }),
+      expect.objectContaining({ "opencode.permission_resolution": "cancelled", "otel.status_code": "UNSET" }),
+      expect.objectContaining({ "opencode.permission_resolution": "unknown", "otel.status_code": "UNSET" }),
+    ])
+    expect(
+      [ended[0], ended[1], ended[4], ended[5]].some((record) =>
+        JSON.stringify(record?.metadata).includes("error.type"),
+      ),
+    ).toBe(false)
   })
 
   test("records a bounded terminal result without changing successful tool status", async () => {
