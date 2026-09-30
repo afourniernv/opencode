@@ -1,10 +1,11 @@
 export * as QuestionV2 from "./question"
 
 import { makeLocationNode } from "./effect/app-node"
-import { Context, Deferred, Effect, Layer, Schema } from "effect"
+import { Context, Deferred, Effect, Exit, Layer, Schema } from "effect"
 import { Question } from "@opencode-ai/schema/question"
 import { EventV2 } from "./event"
 import { SessionSchema } from "./session/schema"
+import * as NemoRelay from "./observability/nemo-relay"
 
 export const ID = Question.ID
 export type ID = typeof ID.Type
@@ -65,6 +66,8 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
 interface Pending {
   readonly request: Request
   readonly deferred: Deferred.Deferred<ReadonlyArray<Answer>, RejectedError>
+  resolution?: NemoRelay.QuestionResolution
+  claimed?: boolean
 }
 
 /**
@@ -76,12 +79,18 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2.Service
+    const relay = yield* NemoRelay.Service
     const pending = new Map<ID, Pending>()
 
     yield* Effect.addFinalizer(() =>
-      Effect.forEach(pending.values(), (item) => Deferred.fail(item.deferred, new RejectedError()), {
-        discard: true,
-      }).pipe(
+      Effect.forEach(
+        pending.values(),
+        (item) => {
+          item.resolution = "cancelled"
+          return Deferred.fail(item.deferred, new RejectedError())
+        },
+        { discard: true },
+      ).pipe(
         Effect.ensuring(
           Effect.sync(() => {
             pending.clear()
@@ -96,9 +105,12 @@ const layer = Layer.effect(
           const id = ID.ascending()
           const deferred = yield* Deferred.make<ReadonlyArray<Answer>, RejectedError>()
           const request: Request = { id, ...input }
-          pending.set(id, { request, deferred })
+          const item: Pending = { request, deferred }
+          pending.set(id, item)
           return yield* events.publish(Event.Asked, request).pipe(
-            Effect.andThen(restore(Deferred.await(deferred))),
+            Effect.andThen(
+              relay.observeQuestionWait({ runtime: "v2" }, restore(Deferred.await(deferred)), () => item.resolution),
+            ),
             Effect.ensuring(
               Effect.sync(() => {
                 pending.delete(id)
@@ -113,12 +125,26 @@ const layer = Layer.effect(
       Effect.uninterruptible(
         Effect.gen(function* () {
           const existing = pending.get(input.requestID)
-          if (!existing) return yield* new NotFoundError({ requestID: input.requestID })
-          yield* events.publish(Event.Replied, {
-            sessionID: existing.request.sessionID,
-            requestID: existing.request.id,
-            answers: input.answers.map((answer) => [...answer]),
-          })
+          if (!existing || existing.claimed) return yield* new NotFoundError({ requestID: input.requestID })
+          existing.claimed = true
+          existing.resolution = "answered"
+          yield* events
+            .publish(Event.Replied, {
+              sessionID: existing.request.sessionID,
+              requestID: existing.request.id,
+              answers: input.answers.map((answer) => [...answer]),
+            })
+            .pipe(
+              Effect.onExit((exit) =>
+                Exit.isFailure(exit)
+                  ? Effect.sync(() => {
+                      if (pending.get(input.requestID) !== existing) return
+                      existing.claimed = false
+                      existing.resolution = undefined
+                    })
+                  : Effect.void,
+              ),
+            )
           yield* Deferred.succeed(existing.deferred, input.answers)
           pending.delete(input.requestID)
         }),
@@ -129,11 +155,25 @@ const layer = Layer.effect(
       Effect.uninterruptible(
         Effect.gen(function* () {
           const existing = pending.get(requestID)
-          if (!existing) return yield* new NotFoundError({ requestID })
-          yield* events.publish(Event.Rejected, {
-            sessionID: existing.request.sessionID,
-            requestID: existing.request.id,
-          })
+          if (!existing || existing.claimed) return yield* new NotFoundError({ requestID })
+          existing.claimed = true
+          existing.resolution = "rejected"
+          yield* events
+            .publish(Event.Rejected, {
+              sessionID: existing.request.sessionID,
+              requestID: existing.request.id,
+            })
+            .pipe(
+              Effect.onExit((exit) =>
+                Exit.isFailure(exit)
+                  ? Effect.sync(() => {
+                      if (pending.get(requestID) !== existing) return
+                      existing.claimed = false
+                      existing.resolution = undefined
+                    })
+                  : Effect.void,
+              ),
+            )
           yield* Deferred.fail(existing.deferred, new RejectedError())
           pending.delete(requestID)
         }),
@@ -150,4 +190,4 @@ const layer = Layer.effect(
 
 export const locationLayer = layer
 
-export const node = makeLocationNode({ service: Service, layer, deps: [EventV2.node] })
+export const node = makeLocationNode({ service: Service, layer, deps: [EventV2.node, NemoRelay.node] })

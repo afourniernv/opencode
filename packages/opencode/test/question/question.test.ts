@@ -10,10 +10,37 @@ import { SessionID } from "../../src/session/schema"
 import { testEffect } from "../lib/effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
+import * as NemoRelay from "@opencode-ai/core/observability/nemo-relay"
 
 const questionLayer = LayerNode.compile(LayerNode.group([Question.node, EventV2Bridge.node, CrossSpawnSpawner.node]))
 const it = testEffect(questionLayer)
 const lifecycle = testEffect(Layer.mergeAll(questionLayer, testInstanceStoreLayer))
+
+const observedQuestionWaits: NemoRelay.QuestionWaitCompleted[] = []
+const observedQuestionLayer = LayerNode.compile(
+  LayerNode.group([Question.node, EventV2Bridge.node, CrossSpawnSpawner.node]),
+  [
+    [
+      NemoRelay.node,
+      Layer.succeed(
+        NemoRelay.Service,
+        NemoRelay.Service.of(
+          NemoRelay.makeForTesting(
+            {
+              MetricKind: { Counter: "counter", Histogram: "histogram" },
+              MetricValueType: { U64: "u64", F64: "f64" },
+              metric() {},
+              flushSubscribers: async () => {},
+            },
+            { questionWaitCompleted: (input) => Effect.sync(() => observedQuestionWaits.push(input)) },
+          ),
+        ),
+      ),
+    ],
+  ],
+)
+const observedIt = testEffect(observedQuestionLayer)
+const observedLifecycle = testEffect(Layer.mergeAll(observedQuestionLayer, testInstanceStoreLayer))
 
 const askEffect = Effect.fn("QuestionTest.ask")(function* (input: {
   sessionID: SessionID
@@ -64,6 +91,47 @@ const waitForPending = Effect.fn("QuestionTest.waitForPending")(function* (count
     yield* Queue.take(asked).pipe(Effect.timeout("2 seconds"))
   }
 })
+
+observedIt.instance(
+  "ask - reports answered, rejected, and interrupted waits without question contents",
+  () =>
+    Effect.gen(function* () {
+      observedQuestionWaits.length = 0
+      const input = {
+        sessionID: SessionID.make("ses_question_observability"),
+        questions: [
+          {
+            question: "Private question text",
+            header: "Private header",
+            options: [{ label: "Private answer", description: "Private description" }],
+          },
+        ],
+      }
+
+      const answered = yield* askEffect(input).pipe(Effect.forkScoped)
+      let pending = yield* waitForPending(1)
+      yield* replyEffect({ requestID: pending[0]!.id, answers: [["Private answer"]] })
+      yield* Fiber.join(answered)
+
+      const rejected = yield* askEffect(input).pipe(Effect.forkScoped)
+      pending = yield* waitForPending(1)
+      yield* rejectEffect(pending[0]!.id)
+      yield* Fiber.await(rejected)
+
+      const cancelled = yield* askEffect(input).pipe(Effect.forkScoped)
+      yield* waitForPending(1)
+      yield* Fiber.interrupt(cancelled)
+
+      expect(observedQuestionWaits.map(({ runtime, resolution }) => ({ runtime, resolution }))).toEqual([
+        { runtime: "v1", resolution: "answered" },
+        { runtime: "v1", resolution: "rejected" },
+        { runtime: "v1", resolution: "cancelled" },
+      ])
+      expect(JSON.stringify(observedQuestionWaits)).not.toContain("Private")
+      expect(yield* listEffect).toEqual([])
+    }),
+  { git: true },
+)
 
 it.instance(
   "ask - remains pending until answered",
@@ -408,8 +476,9 @@ lifecycle.live("questions stay isolated by directory", () =>
   }),
 )
 
-lifecycle.live("pending question rejects on instance dispose", () =>
+observedLifecycle.live("pending question rejects on instance dispose and reports cancellation", () =>
   Effect.gen(function* () {
+    observedQuestionWaits.length = 0
     const dir = yield* tmpdirScoped({ git: true })
     const fiber = yield* askEffect({
       sessionID: SessionID.make("ses_dispose"),
@@ -432,11 +501,13 @@ lifecycle.live("pending question rejects on instance dispose", () =>
     const exit = yield* Fiber.await(fiber)
     expect(Exit.isFailure(exit)).toBe(true)
     if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(Question.RejectedError)
+    expect(observedQuestionWaits).toEqual([expect.objectContaining({ runtime: "v1", resolution: "cancelled" })])
   }),
 )
 
-lifecycle.live("pending question rejects on instance reload", () =>
+observedLifecycle.live("pending question rejects on instance reload and reports cancellation", () =>
   Effect.gen(function* () {
+    observedQuestionWaits.length = 0
     const dir = yield* tmpdirScoped({ git: true })
     const fiber = yield* askEffect({
       sessionID: SessionID.make("ses_reload"),
@@ -455,5 +526,6 @@ lifecycle.live("pending question rejects on instance reload", () =>
     const exit = yield* Fiber.await(fiber)
     expect(Exit.isFailure(exit)).toBe(true)
     if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(Question.RejectedError)
+    expect(observedQuestionWaits).toEqual([expect.objectContaining({ runtime: "v1", resolution: "cancelled" })])
   }),
 )
