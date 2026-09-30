@@ -226,6 +226,18 @@ const skillGuidance = Layer.mock(SkillGuidance.Service, {
     ),
 })
 const referenceGuidance = Layer.mock(ReferenceGuidance.Service, { load: () => Effect.succeed(SystemContext.empty) })
+let snapshotCaptureHook: Effect.Effect<Snapshot.ID | undefined> = Effect.succeed(undefined)
+const snapshot = Layer.succeed(
+  Snapshot.Service,
+  Snapshot.Service.of({
+    capture: () => Effect.suspend(() => snapshotCaptureHook),
+    files: () => Effect.succeed([]),
+    diff: () => Effect.succeed([]),
+    preview: () => Effect.succeed([]),
+    restore: () => Effect.void,
+    checkout: () => Effect.void,
+  }),
+)
 const config = Layer.succeed(
   Config.Service,
   Config.Service.of({
@@ -244,7 +256,7 @@ const config = Layer.succeed(
   }),
 )
 const runnerLayer = AppNodeBuilder.build(SessionRunnerLLM.node, [
-  [Snapshot.node, Snapshot.noopLayer],
+  [Snapshot.node, snapshot],
   [LayerNodePlatform.llmClient, client],
   [SessionRunnerModel.node, models],
   [SystemContextRegistry.node, systemContext],
@@ -301,7 +313,7 @@ const it = testEffect(
       [Location.node, Location.boundNode({ directory: AbsolutePath.make("/project") })],
       [SkillGuidance.node, skillGuidance],
       [ReferenceGuidance.node, referenceGuidance],
-      [Snapshot.node, Snapshot.noopLayer],
+      [Snapshot.node, snapshot],
       [SessionExecution.node, execution],
       [Config.node, config],
       [NemoRelay.node, relay],
@@ -352,6 +364,7 @@ const setup = Effect.gen(function* () {
   relayObservations.length = 0
   relayTurnObservations.length = 0
   relayToolObservations.length = 0
+  snapshotCaptureHook = Effect.succeed(undefined)
   yield* db
     .insert(ProjectTable)
     .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
@@ -3368,6 +3381,43 @@ describe("SessionRunnerLLM", () => {
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "user", text: "Fail hosted tool at EOF" },
         { type: "assistant", content: [{ type: "tool", id: "call-hosted-eof", state: { status: "error" } }] },
+      ])
+    }),
+  )
+
+  it.effect("closes hosted-tool Relay observations when post-stream snapshot persistence defects", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Fail after hosted tool stream" }),
+        resume: false,
+      })
+      response = [
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({
+          id: "call-hosted-post-stream-defect",
+          name: "web_search",
+          input: { query: "effect" },
+          providerExecuted: true,
+        }),
+        LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+        LLMEvent.finish({ reason: "tool-calls" }),
+      ]
+      let captures = 0
+      snapshotCaptureHook = Effect.sync(() => {
+        captures++
+        if (captures === 2) throw new Error("post-stream snapshot defect")
+        return undefined
+      })
+
+      const exit = yield* session.resume(sessionID).pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toEqual(new Error("post-stream snapshot defect"))
+      expect(relayToolObservations).toEqual([
+        expect.objectContaining({ name: "web_search", execution: "provider", outcome: "failed" }),
       ])
     }),
   )

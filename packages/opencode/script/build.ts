@@ -1,6 +1,9 @@
 #!/usr/bin/env bun
 
 import { $ } from "bun"
+import { mkdtemp, rm } from "fs/promises"
+import { createRequire } from "module"
+import { tmpdir } from "os"
 import path from "path"
 import { fileURLToPath } from "url"
 import { createSolidTransformPlugin } from "@opentui/solid/bun-plugin"
@@ -14,6 +17,7 @@ process.chdir(dir)
 const generated = await import("./generate.ts")
 
 import { Script } from "@opencode-ai/script"
+import corePkg from "../../core/package.json"
 import pkg from "../package.json"
 
 const singleFlag = process.argv.includes("--single")
@@ -22,6 +26,102 @@ const skipInstall = process.argv.includes("--skip-install")
 const sourcemapsFlag = process.argv.includes("--sourcemaps")
 const plugin = createSolidTransformPlugin()
 const skipEmbedWebUi = process.argv.includes("--skip-embed-web-ui")
+
+type BuildTarget = {
+  os: string
+  arch: "arm64" | "x64"
+  abi?: "musl"
+  avx2?: false
+}
+
+const relayModule = (target: BuildTarget) => {
+  if (target.os === "darwin") return target.arch === "arm64" ? "nemo-relay-node-darwin-arm64" : undefined
+  if (target.os === "linux") return `nemo-relay-node-linux-${target.arch}-${target.abi === "musl" ? "musl" : "gnu"}`
+  if (target.os === "win32") return `nemo-relay-node-win32-${target.arch}-msvc`
+  return undefined
+}
+
+const relayShimPath = path.resolve(dir, "opencode-nemo-relay-runtime.gen.ts")
+const relayAddonPath = path.resolve(dir, "opencode-nemo-relay.node")
+const relayPackageRequire = createRequire(
+  createRequire(path.resolve(dir, "../core/package.json")).resolve("nemo-relay-node"),
+)
+
+const relaySource = (target: BuildTarget) => {
+  const module = relayModule(target)
+  if (!module) return undefined
+  try {
+    // Full cross-builds install each target as a direct, no-save build input.
+    return fileURLToPath(import.meta.resolve(module))
+  } catch {
+    // Target-native/Nix installs expose the selected optional package beside
+    // core's pinned metapackage rather than beside this build script.
+    return relayPackageRequire.resolve(module)
+  }
+}
+
+const relayFiles = async (target: BuildTarget) => {
+  const source = relaySource(target)
+  if (!source) return {}
+  return {
+    [relayShimPath]: [
+      `import addonPath from ${JSON.stringify("./opencode-nemo-relay.node")} with { type: "file" }`,
+      `const relay = require(addonPath)`,
+      `export default relay`,
+    ].join("\n"),
+    [relayAddonPath]: await Bun.file(source).arrayBuffer(),
+  }
+}
+
+const probeRelayRuntime = async (binaryPath: string, supported: boolean) => {
+  const home = await mkdtemp(path.join(tmpdir(), "opencode-relay-build-"))
+  try {
+    const env = { ...process.env }
+    for (const key of Object.keys(env)) {
+      if (
+        key === "OPENCODE_PURE" ||
+        key.startsWith("OPENCODE_NEMO_RELAY") ||
+        key.startsWith("NEMO_RELAY_") ||
+        key.startsWith("OTEL_")
+      )
+        delete env[key]
+    }
+    const child = Bun.spawn([path.resolve(binaryPath), "debug", "nemo-relay"], {
+      env: {
+        ...env,
+        HOME: home,
+        USERPROFILE: home,
+        XDG_CONFIG_HOME: home,
+        APPDATA: home,
+        LOCALAPPDATA: home,
+        OPENCODE_NEMO_RELAY: "1",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ])
+    if (code !== 0) throw new Error(`debug nemo-relay exited ${code}: ${stderr.trim()}`)
+    const marker = '{\n  "service":'
+    const start = stdout.lastIndexOf(marker)
+    if (start < 0) throw new Error(`debug nemo-relay did not return status JSON: ${stdout.trim()} ${stderr.trim()}`)
+    const status = JSON.parse(stdout.slice(start)) as {
+      readonly service?: { readonly state?: string; readonly reason?: string }
+      readonly process?: { readonly phase?: string }
+    }
+    if (supported) {
+      if (status.service?.state !== "active" || status.process?.phase !== "active")
+        throw new Error(`embedded Relay runtime did not activate: ${stdout.trim()}`)
+    } else if (status.service?.state !== "unavailable" || status.service.reason !== "unsupported_platform") {
+      throw new Error(`unsupported Relay target was not reported explicitly: ${stdout.trim()}`)
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+}
 
 const createEmbeddedWebUIBundle = async () => {
   console.log(`Building Web UI to embed in the binary`)
@@ -50,12 +150,7 @@ const createEmbeddedWebUIBundle = async () => {
 const embeddedFileMap = skipEmbedWebUi ? null : await createEmbeddedWebUIBundle()
 const treeSitterWorker = await Bun.file(fileURLToPath(import.meta.resolve("@opentui/core/parser.worker"))).text()
 
-const allTargets: {
-  os: string
-  arch: "arm64" | "x64"
-  abi?: "musl"
-  avx2?: false
-}[] = [
+const allTargets: BuildTarget[] = [
   {
     os: "linux",
     arch: "arm64",
@@ -113,6 +208,11 @@ const allTargets: {
   },
 ]
 
+const relayVersion = corePkg.dependencies["nemo-relay-node"]
+const relayNativeModules = [
+  ...new Set(allTargets.map(relayModule).filter((item): item is string => item !== undefined)),
+]
+
 const targets = singleFlag
   ? allTargets.filter((item) => {
       if (item.os !== process.platform || item.arch !== process.arch) {
@@ -141,6 +241,9 @@ if (!skipInstall) {
   await $`bun install --os="*" --cpu="*" @opentui/core@${pkg.dependencies["@opentui/core"]}`
   await $`bun install --os="*" --cpu="*" @parcel/watcher@${pkg.dependencies["@parcel/watcher"]}`
   await $`bun install --os="*" --cpu="*" @ff-labs/fff-bun@${pkg.dependencies["@ff-labs/fff-bun"]}`
+  // Relay's platform packages are transitive optional dependencies. Install
+  // every target for cross-compilation, then embed only the selected one.
+  await $`bun install --os="*" --cpu="*" --no-save nemo-relay-node@${relayVersion} ${relayNativeModules.map((module) => `${module}@${relayVersion}`)}`
 }
 for (const item of targets) {
   const name = [
@@ -182,6 +285,7 @@ for (const item of targets) {
     files: {
       [treeSitterWorkerPath]: treeSitterWorker,
       ...(embeddedFileMap ? { "opencode-web-ui.gen.ts": embeddedFileMap } : {}),
+      ...(await relayFiles(item)),
     },
     entrypoints: [
       "./src/index.ts",
@@ -196,18 +300,30 @@ for (const item of targets) {
       OTUI_TREE_SITTER_WORKER_PATH: bunfsRoot + treeSitterWorkerPath,
       OPENCODE_WORKER_PATH: workerPath,
       OPENCODE_CHANNEL: `'${Script.channel}'`,
+      OPENCODE_NEMO_RELAY_BUNDLED_MODULE: relayModule(item) ? JSON.stringify(relayShimPath) : "undefined",
       OPENCODE_LIBC: item.os === "linux" ? `'${item.abi ?? "glibc"}'` : "",
       ...(item.os === "linux" ? { "process.env.OPENTUI_LIBC": JSON.stringify(item.abi ?? "glibc") } : {}),
     },
   })
 
+  const relayNativeSource = relaySource(item)
+  await Bun.write(`dist/${name}/bin/LICENSE`, Bun.file(path.resolve(dir, "../../LICENSE")))
+  if (relayNativeSource)
+    await Bun.write(
+      `dist/${name}/bin/LICENSE.nemo-relay`,
+      Bun.file(path.join(path.dirname(relayNativeSource), "LICENSE")),
+    )
+
   // Smoke test: only run if binary is for current platform
   if (item.os === process.platform && item.arch === process.arch && !item.abi) {
-    const binaryPath = `dist/${name}/bin/opencode`
+    const binaryPath = `dist/${name}/bin/opencode${item.os === "win32" ? ".exe" : ""}`
     console.log(`Running smoke test: ${binaryPath} --version`)
     try {
       const versionOutput = await $`${binaryPath} --version`.text()
       console.log(`Smoke test passed: ${versionOutput.trim()}`)
+      console.log(`Running packaged Relay activation test: ${binaryPath} debug nemo-relay`)
+      await probeRelayRuntime(binaryPath, relayModule(item) !== undefined)
+      console.log("Packaged Relay activation test passed")
     } catch (e) {
       console.error(`Smoke test failed for ${name}:`, e)
       process.exit(1)
@@ -220,6 +336,7 @@ for (const item of targets) {
       {
         name,
         version: Script.version,
+        license: relayNativeSource ? "MIT AND Apache-2.0" : "MIT",
         preferUnplugged: true,
         os: [item.os],
         cpu: [item.arch],

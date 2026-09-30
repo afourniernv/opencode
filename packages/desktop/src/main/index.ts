@@ -49,6 +49,7 @@ import { migrate } from "./migrate"
 import { cleanupStoreFiles } from "./store-cleanup"
 import { startBackgroundCli } from "./background-cli"
 import { setNativeTranslations } from "./native-translations"
+import { createQuitBarrier } from "./quit-barrier"
 
 const APP_NAMES: Record<string, string> = {
   dev: "OpenCode Dev",
@@ -165,12 +166,22 @@ const main = Effect.gen(function* () {
     },
   )
   const stopSidecars = async () => {
-    await killSidecar()
-    wslServers.stopAll()
+    try {
+      await killSidecar()
+    } finally {
+      wslServers.stopAll()
+    }
   }
+  const quitBarrier = createQuitBarrier({
+    stop: stopSidecars,
+    resume: () => app.quit(),
+    onError: (error) => logger.error("failed to stop sidecars before quit", error),
+  })
+  const stopSidecarsForExit = () =>
+    quitBarrier.stop().catch((error) => logger.error("failed to stop sidecars before quit", error))
   const relaunch = () => {
     setAppQuitting()
-    void stopSidecars().finally(() => {
+    void stopSidecarsForExit().then(() => {
       app.relaunch()
       app.quit()
     })
@@ -221,15 +232,13 @@ const main = Effect.gen(function* () {
     emitDeepLinks([url])
   })
 
-  app.on("before-quit", () => {
+  const onQuit = (event: Event) => {
     setAppQuitting()
-    void stopSidecars()
-  })
+    quitBarrier.onQuit(event)
+  }
 
-  app.on("will-quit", () => {
-    setAppQuitting()
-    void stopSidecars()
-  })
+  app.on("before-quit", onQuit)
+  app.on("will-quit", onQuit)
 
   app.on("child-process-gone", (_event, details) => {
     writeLog("utility", "child process gone", { details }, "error")
@@ -246,7 +255,7 @@ const main = Effect.gen(function* () {
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.on(signal, () => {
       setAppQuitting()
-      void stopSidecars().finally(() => app.quit())
+      void stopSidecarsForExit().then(() => app.quit())
     })
   }
 
@@ -271,7 +280,7 @@ const main = Effect.gen(function* () {
   app.setAsDefaultProtocolClient("opencode")
   registerRendererProtocol()
   setDockIcon()
-  const updater = setupAutoUpdater(stopSidecars)
+  const updater = setupAutoUpdater(quitBarrier.stop)
   const menuDeps = {
     trigger: (id: string) => {
       const win = getLastFocusedWindow()
