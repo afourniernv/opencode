@@ -322,7 +322,7 @@ const layer = Layer.effect(
             return blocked ? "blocked" : Cause.hasInterruptsOnly(cause) ? "cancelled" : "failed"
           }
 
-          return yield* restore(
+          const execution = restore(
             Effect.gen(function* () {
               const taskArgs = {
                 prompt: task.prompt,
@@ -474,13 +474,16 @@ const layer = Layer.effect(
                 synthetic: true,
               } satisfies SessionV1.TextPart)
             }),
-          ).pipe(
-            Effect.onExit((exit) =>
-              relayTool
-                .complete(Exit.isSuccess(exit) ? toolOutcome : outcomeFromCause(exit.cause))
-                .pipe(Effect.catchCause(() => Effect.void)),
-            ),
           )
+          return yield* relayTool
+            .run(execution)
+            .pipe(
+              Effect.onExit((exit) =>
+                relayTool
+                  .complete(Exit.isSuccess(exit) ? toolOutcome : outcomeFromCause(exit.cause))
+                  .pipe(Effect.catchCause(() => Effect.void)),
+              ),
+            )
         }),
       )
     })
@@ -1173,7 +1176,7 @@ const layer = Layer.effect(
               modelID: lastUser.model.modelID,
               providerID: lastUser.model.providerID,
               history: msgs,
-            }).pipe(Effect.ignore, Effect.forkIn(scope))
+            }).pipe(relay.detached, Effect.ignore, Effect.forkIn(scope))
 
           const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
           const task = tasks.pop()
@@ -1184,13 +1187,36 @@ const layer = Layer.effect(
           }
 
           if (task?.type === "compaction") {
-            const result = yield* compaction.process({
-              messages: msgs,
-              parentID: lastUser.id,
-              sessionID,
-              auto: task.auto,
-              overflow: task.overflow,
-            })
+            const started = performance.now()
+            const trigger: NemoRelay.CompactionTrigger = task.overflow
+              ? "overflow_recovery"
+              : task.auto
+                ? "proactive"
+                : "manual"
+            const result = yield* compaction
+              .process({
+                messages: msgs,
+                parentID: lastUser.id,
+                sessionID,
+                auto: task.auto,
+                overflow: task.overflow,
+              })
+              .pipe(
+                Effect.onExit((exit) =>
+                  relay.compactionAttemptCompleted({
+                    runtime: "v1",
+                    trigger,
+                    outcome: Exit.isSuccess(exit)
+                      ? exit.value === "continue"
+                        ? "success"
+                        : "failed"
+                      : Cause.hasInterruptsOnly(exit.cause)
+                        ? "cancelled"
+                        : "failed",
+                    durationMs: performance.now() - started,
+                  }),
+                ),
+              )
             if (result === "stop") break
             continue
           }
@@ -1287,7 +1313,9 @@ const layer = Layer.effect(
             }
 
             if (step === 1)
-              yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
+              yield* summary
+                .summarize({ sessionID, messageID: lastUser.id })
+                .pipe(relay.detached, Effect.ignore, Effect.forkIn(scope))
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
@@ -1372,7 +1400,7 @@ const layer = Layer.effect(
           continue
         }
 
-        yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
+        yield* compaction.prune({ sessionID }).pipe(relay.detached, Effect.ignore, Effect.forkIn(scope))
         return yield* lastAssistant(sessionID)
       },
     )
@@ -1380,7 +1408,13 @@ const layer = Layer.effect(
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      return yield* state.ensureRunning(
+        input.sessionID,
+        lastAssistant(input.sessionID),
+        relay.observeRun({ runtime: "v1" }, runLoop(input.sessionID), (exit) =>
+          Exit.isSuccess(exit) && exit.value.info.role === "assistant" && exit.value.info.error ? "failed" : undefined,
+        ),
+      )
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
