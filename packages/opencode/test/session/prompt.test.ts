@@ -267,6 +267,32 @@ const observedSubtask = testEffect(
     [NemoRelay.node, subtaskRelay],
   ]),
 )
+const v1CompactionAttemptObservations: NemoRelay.CompactionAttemptCompleted[] = []
+const v1CompactionRelay = Layer.succeed(
+  NemoRelay.Service,
+  NemoRelay.Service.of(
+    NemoRelay.makeForTesting(
+      {
+        MetricKind: { Counter: "counter", Histogram: "histogram" },
+        MetricValueType: { U64: "u64", F64: "f64" },
+        metric() {},
+        flushSubscribers: async () => {},
+      },
+      {
+        compactionAttemptCompleted: (input) => Effect.sync(() => v1CompactionAttemptObservations.push(input)),
+      },
+    ),
+  ),
+)
+const observedCompaction = testEffect(
+  LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
+    [SessionSummary.node, summary],
+    [LSP.node, lsp],
+    [MCP.node, makeMcp()],
+    [RuntimeFlags.node, runtimeFlags],
+    [NemoRelay.node, v1CompactionRelay],
+  ]),
+)
 const withMcpInstructions = testEffect(
   makeHttp({
     mcpInstructions: [
@@ -726,6 +752,32 @@ it.instance("loop stops provider overflow instead of auto-compacting when disabl
       expect(result.info.finish).toBe("error")
     }
     expect(messages.some((message) => message.parts.some((part) => part.type === "compaction"))).toBe(false)
+  }),
+)
+
+observedCompaction.instance("reports successful manual compaction to Relay", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const compaction = yield* SessionCompaction.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    v1CompactionAttemptObservations.length = 0
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "Keep this context" }],
+    })
+    yield* compaction.create({ sessionID: chat.id, agent: "build", model: ref, auto: false })
+    yield* llm.text("## Objective\n- Preserve the task")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    expect(v1CompactionAttemptObservations).toEqual([
+      expect.objectContaining({ runtime: "v1", trigger: "manual", outcome: "success" }),
+    ])
   }),
 )
 

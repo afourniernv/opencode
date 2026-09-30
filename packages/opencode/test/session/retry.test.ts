@@ -94,6 +94,30 @@ describe("session.retry.delay", () => {
     expect(SessionRetry.delay(1, error)).toBe(SessionRetry.RETRY_MAX_DELAY)
   })
 
+  test("classifies retry-after hints separately from local backoff", () => {
+    expect(SessionRetry.delaySource(apiError({ "retry-after-ms": "1500" }))).toBe("retry_after")
+    expect(SessionRetry.delaySource(apiError({ "retry-after": "not-a-date" }))).toBe("backoff")
+    expect(SessionRetry.delaySource(apiError())).toBe("backoff")
+  })
+
+  test("classifies retry failures into bounded operational families", () => {
+    const error = (input: ConstructorParameters<typeof SessionV1.APIError>[0]) =>
+      Schema.decodeUnknownSync(SessionV1.APIError.Schema)(new SessionV1.APIError(input).toObject())
+    expect(SessionRetry.errorKind(error({ message: "Too many requests", statusCode: 429, isRetryable: true }))).toBe(
+      "rate_limit",
+    )
+    expect(
+      SessionRetry.errorKind(
+        error({ message: "Usage limit reached", responseBody: "GoUsageLimitError", isRetryable: true }),
+      ),
+    ).toBe("quota_exceeded")
+    expect(
+      SessionRetry.errorKind(error({ message: "Internal server error", statusCode: 503, isRetryable: true })),
+    ).toBe("provider_internal")
+    expect(SessionRetry.errorKind(error({ message: "socket hang up", isRetryable: true }))).toBe("transport")
+    expect(SessionRetry.errorKind(error({ message: "retry later", isRetryable: true }))).toBe("unknown")
+  })
+
   it.instance("policy updates retry status and increments attempts", () =>
     Effect.gen(function* () {
       const sessionID = SessionID.make("session-retry-test")
