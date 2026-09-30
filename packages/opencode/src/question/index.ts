@@ -5,6 +5,7 @@ import { SessionID } from "@/session/schema"
 import { QuestionID } from "./schema"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { QuestionV1 } from "@opencode-ai/schema/question-v1"
+import * as NemoRelay from "@opencode-ai/core/observability/nemo-relay"
 
 export const Option = QuestionV1.Option
 export type Option = typeof Option.Type
@@ -37,6 +38,7 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Que
 interface PendingEntry {
   info: Request
   deferred: Deferred.Deferred<ReadonlyArray<Answer>, RejectedError>
+  resolution?: NemoRelay.QuestionResolution
 }
 
 interface State {
@@ -65,6 +67,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
+    const relay = yield* NemoRelay.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Question.state")(function* () {
         const state = {
@@ -74,6 +77,7 @@ const layer = Layer.effect(
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
             for (const item of state.pending.values()) {
+              item.resolution = "cancelled"
               yield* Deferred.fail(item.deferred, new RejectedError())
             }
             state.pending.clear()
@@ -100,14 +104,19 @@ const layer = Layer.effect(
         questions: input.questions,
         tool: input.tool,
       }
-      pending.set(id, { info, deferred })
+      const entry: PendingEntry = { info, deferred }
+      pending.set(id, entry)
       yield* events.publish(Event.Asked, info)
 
-      return yield* Effect.ensuring(
-        Deferred.await(deferred),
-        Effect.sync(() => {
-          pending.delete(id)
-        }),
+      return yield* relay.observeQuestionWait(
+        { runtime: "v1" },
+        Effect.ensuring(
+          Deferred.await(deferred),
+          Effect.sync(() => {
+            pending.delete(id)
+          }),
+        ),
+        () => entry.resolution,
       )
     })
 
@@ -128,6 +137,7 @@ const layer = Layer.effect(
         requestID: existing.info.id,
         answers: input.answers.map((a) => [...a]),
       })
+      existing.resolution = "answered"
       yield* Deferred.succeed(existing.deferred, input.answers)
     })
 
@@ -144,6 +154,7 @@ const layer = Layer.effect(
         sessionID: existing.info.sessionID,
         requestID: existing.info.id,
       })
+      existing.resolution = "rejected"
       yield* Deferred.fail(existing.deferred, new RejectedError())
     })
 
@@ -156,6 +167,6 @@ const layer = Layer.effect(
   }),
 )
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node] })
+export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node, NemoRelay.node] })
 
 export * as Question from "."
