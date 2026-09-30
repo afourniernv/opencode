@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Cause, Deferred, Effect, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -9,6 +9,7 @@ import { Location } from "@opencode-ai/core/location"
 import { PermissionV2 } from "@opencode-ai/core/permission"
 import { PermissionTable } from "@opencode-ai/core/permission/sql"
 import { PermissionSaved } from "@opencode-ai/core/permission/saved"
+import * as NemoRelay from "@opencode-ai/core/observability/nemo-relay"
 import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { AbsolutePath } from "@opencode-ai/core/schema"
@@ -23,6 +24,21 @@ const current = Layer.succeed(
   Location.Service,
   Location.Service.of(location({ directory: AbsolutePath.make("/project") })),
 )
+const observedPermissionWaits: NemoRelay.PermissionWaitCompleted[] = []
+const relay = Layer.succeed(
+  NemoRelay.Service,
+  NemoRelay.Service.of(
+    NemoRelay.makeForTesting(
+      {
+        MetricKind: { Counter: "counter", Histogram: "histogram" },
+        MetricValueType: { U64: "u64", F64: "f64" },
+        metric() {},
+        flushSubscribers: async () => {},
+      },
+      { permissionWaitCompleted: (input) => Effect.sync(() => observedPermissionWaits.push(input)) },
+    ),
+  ),
+)
 const it = testEffect(
   AppNodeBuilder.build(
     LayerNode.group([
@@ -33,7 +49,10 @@ const it = testEffect(
       AgentV2.node,
       PermissionV2.node,
     ]),
-    [[Location.node, current]],
+    [
+      [Location.node, current],
+      [NemoRelay.node, relay],
+    ],
   ),
 )
 
@@ -85,18 +104,19 @@ function assertion(input: Partial<PermissionV2.AssertInput> = {}) {
   } satisfies PermissionV2.AssertInput
 }
 
-function waitForRequest() {
+function waitForRequest(input: Partial<PermissionV2.AssertInput> = {}) {
   return Effect.gen(function* () {
     const service = yield* PermissionV2.Service
     const events = yield* EventV2.Service
+    const requestInput = assertion(input)
     const asked = yield* Deferred.make<PermissionV2.Request>()
-    const unsubscribe = yield* events.listen((event) =>
-      event.type === PermissionV2.Event.Asked.type
-        ? Deferred.succeed(asked, event.data as PermissionV2.Request).pipe(Effect.asVoid)
-        : Effect.void,
-    )
+    const unsubscribe = yield* events.listen((event) => {
+      if (event.type !== PermissionV2.Event.Asked.type) return Effect.void
+      const request = event.data as PermissionV2.Request
+      return request.id === requestInput.id ? Deferred.succeed(asked, request).pipe(Effect.asVoid) : Effect.void
+    })
     yield* Effect.addFinalizer(() => unsubscribe)
-    const fiber = yield* service.assert(assertion()).pipe(Effect.forkScoped)
+    const fiber = yield* service.assert(requestInput).pipe(Effect.forkScoped)
     const request = yield* Deferred.await(asked)
     return { service, fiber, request }
   })
@@ -262,6 +282,262 @@ describe("PermissionV2", () => {
       yield* Fiber.join(fiber)
       expect(yield* service.list()).toEqual([])
       expect(yield* service.get(request.id)).toBeUndefined()
+    }),
+  )
+
+  it.effect("allows only one concurrent responder to claim a request", () =>
+    Effect.gen(function* () {
+      yield* setup()
+      const { service, fiber, request } = yield* waitForRequest()
+      const events = yield* EventV2.Service
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const replies: PermissionV2.Reply[] = []
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== PermissionV2.Event.Replied.type) return Effect.void
+        const data = event.data as { requestID: PermissionV2.ID; reply: PermissionV2.Reply }
+        if (data.requestID !== request.id) return Effect.void
+        replies.push(data.reply)
+        return data.reply === "once"
+          ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+          : Effect.void
+      })
+      yield* Effect.addFinalizer(() =>
+        Deferred.succeed(release, undefined).pipe(Effect.andThen(unsubscribe), Effect.asVoid),
+      )
+
+      const winner = yield* service.reply({ requestID: request.id, reply: "once" }).pipe(Effect.exit, Effect.forkScoped)
+      yield* Deferred.await(entered)
+      expect(yield* service.reply({ requestID: request.id, reply: "reject" }).pipe(Effect.flip)).toEqual(
+        new PermissionV2.NotFoundError({ requestID: request.id }),
+      )
+      yield* Deferred.succeed(release, undefined)
+
+      expect(yield* Fiber.join(winner)).toMatchObject({ _tag: "Success" })
+      yield* Fiber.join(fiber)
+      expect(replies).toEqual(["once"])
+      expect(yield* service.list()).toEqual([])
+    }),
+  )
+
+  it.effect("commits a claimed permission when reply notification fails", () =>
+    Effect.gen(function* () {
+      yield* setup()
+      const { service, fiber, request } = yield* waitForRequest()
+      const events = yield* EventV2.Service
+      let failReply = true
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== PermissionV2.Event.Replied.type || !failReply) return Effect.void
+        const data = event.data as { requestID: PermissionV2.ID }
+        if (data.requestID !== request.id) return Effect.void
+        failReply = false
+        return Effect.die("injected permission reply listener failure")
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      yield* service.reply({ requestID: request.id, reply: "once" })
+      yield* Fiber.join(fiber)
+      expect(yield* service.list()).toEqual([])
+      expect(yield* service.reply({ requestID: request.id, reply: "once" }).pipe(Effect.flip)).toEqual(
+        new PermissionV2.NotFoundError({ requestID: request.id }),
+      )
+    }),
+  )
+
+  it.effect("restores a claimed permission when saving an always reply fails", () =>
+    Effect.gen(function* () {
+      yield* setup()
+      const { db } = yield* Database.Service
+      const { service, fiber, request } = yield* waitForRequest({ save: ["src/*"] })
+      const events = yield* EventV2.Service
+      const replies: PermissionV2.Reply[] = []
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== PermissionV2.Event.Replied.type) return Effect.void
+        const data = event.data as { requestID: PermissionV2.ID; reply: PermissionV2.Reply }
+        if (data.requestID === request.id) replies.push(data.reply)
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      yield* db.run("ALTER TABLE permission RENAME TO permission_reply_failure")
+      const first = yield* service
+        .reply({ requestID: request.id, reply: "always" })
+        .pipe(
+          Effect.exit,
+          Effect.ensuring(db.run("ALTER TABLE permission_reply_failure RENAME TO permission").pipe(Effect.ignore)),
+        )
+      expect(Exit.isFailure(first)).toBe(true)
+      expect(yield* service.list()).toEqual([request])
+      expect(replies).toEqual([])
+
+      yield* service.reply({ requestID: request.id, reply: "always" })
+      yield* Fiber.join(fiber)
+      expect(replies).toEqual(["always"])
+      expect(yield* service.list()).toEqual([])
+    }),
+  )
+
+  it.effect("commits a saved always reply when notification fails", () =>
+    Effect.gen(function* () {
+      yield* setup()
+      const { service, fiber, request } = yield* waitForRequest({ save: ["src/*"] })
+      const events = yield* EventV2.Service
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== PermissionV2.Event.Replied.type) return Effect.void
+        const data = event.data as { requestID: PermissionV2.ID }
+        return data.requestID === request.id ? Effect.die("injected always reply listener failure") : Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      yield* service.reply({ requestID: request.id, reply: "always" })
+      yield* Fiber.join(fiber)
+
+      expect(yield* service.list()).toEqual([])
+      expect(
+        yield* service.ask(
+          assertion({ id: PermissionV2.ID.create("per_saved_after_notification"), resources: ["src/next.ts"] }),
+        ),
+      ).toMatchObject({ effect: "allow" })
+    }),
+  )
+
+  it.effect("reports cancellation when a wait is interrupted during reply publication", () =>
+    Effect.gen(function* () {
+      observedPermissionWaits.length = 0
+      yield* setup()
+      const { service, fiber, request } = yield* waitForRequest()
+      const events = yield* EventV2.Service
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== PermissionV2.Event.Replied.type) return Effect.void
+        const data = event.data as { requestID: PermissionV2.ID }
+        if (data.requestID !== request.id) return Effect.void
+        return Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+      })
+      yield* Effect.addFinalizer(() =>
+        Deferred.succeed(release, undefined).pipe(Effect.andThen(unsubscribe), Effect.asVoid),
+      )
+
+      const reply = yield* service.reply({ requestID: request.id, reply: "once" }).pipe(Effect.exit, Effect.forkScoped)
+      yield* Deferred.await(entered)
+      yield* Fiber.interrupt(fiber)
+
+      expect(observedPermissionWaits.map(({ resolution }) => resolution)).toEqual(["cancelled"])
+      yield* Deferred.succeed(release, undefined)
+      expect(yield* Fiber.join(reply)).toMatchObject({ _tag: "Success" })
+      expect(yield* service.list()).toEqual([])
+    }),
+  )
+
+  it.effect("reject fan-out skips a sibling claimed by another responder", () =>
+    Effect.gen(function* () {
+      yield* setup()
+      const first = yield* waitForRequest({ id: PermissionV2.ID.create("per_reject_primary") })
+      const second = yield* waitForRequest({ id: PermissionV2.ID.create("per_reject_claimed") })
+      const events = yield* EventV2.Service
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const secondReplies: PermissionV2.Reply[] = []
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== PermissionV2.Event.Replied.type) return Effect.void
+        const data = event.data as { requestID: PermissionV2.ID; reply: PermissionV2.Reply }
+        if (data.requestID !== second.request.id) return Effect.void
+        secondReplies.push(data.reply)
+        return data.reply === "once"
+          ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+          : Effect.void
+      })
+      yield* Effect.addFinalizer(() =>
+        Deferred.succeed(release, undefined).pipe(Effect.andThen(unsubscribe), Effect.asVoid),
+      )
+
+      const secondReply = yield* second.service
+        .reply({ requestID: second.request.id, reply: "once" })
+        .pipe(Effect.exit, Effect.forkScoped)
+      yield* Deferred.await(entered)
+      yield* first.service.reply({ requestID: first.request.id, reply: "reject" })
+      yield* Deferred.succeed(release, undefined)
+
+      expect(yield* Fiber.await(first.fiber)).toMatchObject({ _tag: "Failure" })
+      expect(yield* Fiber.join(secondReply)).toMatchObject({ _tag: "Success" })
+      yield* Fiber.join(second.fiber)
+      expect(secondReplies).toEqual(["once"])
+      expect(yield* first.service.list()).toEqual([])
+    }),
+  )
+
+  it.effect("always fan-out skips an eligible sibling claimed by another responder", () =>
+    Effect.gen(function* () {
+      yield* setup()
+      const first = yield* waitForRequest({
+        id: PermissionV2.ID.create("per_always_primary"),
+        resources: ["src/a.ts"],
+        save: ["src/*"],
+      })
+      const second = yield* waitForRequest({
+        id: PermissionV2.ID.create("per_always_claimed"),
+        resources: ["src/b.ts"],
+      })
+      const events = yield* EventV2.Service
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const secondReplies: PermissionV2.Reply[] = []
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== PermissionV2.Event.Replied.type) return Effect.void
+        const data = event.data as { requestID: PermissionV2.ID; reply: PermissionV2.Reply }
+        if (data.requestID !== second.request.id) return Effect.void
+        secondReplies.push(data.reply)
+        return data.reply === "once"
+          ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+          : Effect.void
+      })
+      yield* Effect.addFinalizer(() =>
+        Deferred.succeed(release, undefined).pipe(Effect.andThen(unsubscribe), Effect.asVoid),
+      )
+
+      const secondReply = yield* second.service
+        .reply({ requestID: second.request.id, reply: "once" })
+        .pipe(Effect.exit, Effect.forkScoped)
+      yield* Deferred.await(entered)
+      yield* first.service.reply({ requestID: first.request.id, reply: "always" })
+      yield* Deferred.succeed(release, undefined)
+
+      yield* Fiber.join(first.fiber)
+      expect(yield* Fiber.join(secondReply)).toMatchObject({ _tag: "Success" })
+      yield* Fiber.join(second.fiber)
+      expect(secondReplies).toEqual(["once"])
+      expect(yield* first.service.list()).toEqual([])
+    }),
+  )
+
+  it.effect("commits synthesized fan-out when reply notification fails", () =>
+    Effect.gen(function* () {
+      yield* setup()
+      const first = yield* waitForRequest({
+        id: PermissionV2.ID.create("per_fanout_primary"),
+        resources: ["src/a.ts"],
+        save: ["src/*"],
+      })
+      const second = yield* waitForRequest({
+        id: PermissionV2.ID.create("per_fanout_retry"),
+        resources: ["src/b.ts"],
+      })
+      const events = yield* EventV2.Service
+      let failFanout = true
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== PermissionV2.Event.Replied.type || !failFanout) return Effect.void
+        const data = event.data as { requestID: PermissionV2.ID; reply: PermissionV2.Reply }
+        if (data.requestID !== second.request.id || data.reply !== "always") return Effect.void
+        failFanout = false
+        return Effect.die("injected permission fan-out listener failure")
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      yield* first.service.reply({ requestID: first.request.id, reply: "always" })
+      yield* Fiber.join(first.fiber)
+      yield* Fiber.join(second.fiber)
+      expect(yield* first.service.list()).toEqual([])
     }),
   )
 
