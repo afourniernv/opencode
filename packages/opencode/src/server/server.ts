@@ -54,15 +54,30 @@ class ListenerServerService extends Context.Service<ListenerServerService, Liste
 ) {}
 
 export const Default = lazy(() => {
-  const handler = HttpApiApp.webHandler().handler
+  const web = HttpApiApp.webHandler()
+  const handler = web.handler
   const app: ServerApp = {
     fetch: (request: Request) => handler(request, HttpApiApp.context),
     request(input, init) {
       return app.fetch(input instanceof Request ? input : new Request(new URL(input, "http://localhost"), init))
     },
   }
-  return { app }
+  return { app, dispose: web.dispose }
 })
+
+/** Close the lazily-created in-process HTTP service graph, if it was used. */
+export async function disposeDefault() {
+  if (!Default.loaded()) return
+  const current = Default()
+  try {
+    await current.dispose()
+  } finally {
+    // A later in-process use must build a fresh handler rather than reusing a
+    // service graph whose scope has already been closed.
+    HttpApiApp.webHandler.reset()
+    Default.reset()
+  }
+}
 
 export async function openapi() {
   return OpenApi.fromApi(PublicApi)
