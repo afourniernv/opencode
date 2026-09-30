@@ -2,7 +2,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Image } from "@/image/image"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Cause, Deferred, Effect, Exit, Layer, Context, Scope, Schema } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Context, Option, Scope, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { Agent } from "@/agent/agent"
 import { Config } from "@/config/config"
@@ -75,10 +75,17 @@ type ToolCall = {
   sessionID: SessionV1.ToolPart["sessionID"]
   done: Deferred.Deferred<void>
   relay?: NemoRelay.ToolObservation
+  callbackClaimed: boolean
+}
+
+type ToolRuntime = {
+  readonly bridge: EffectBridge.Shape
+  readonly fibers: Set<Fiber.Fiber<any, any>>
+  accepting: boolean
 }
 
 interface ProcessorContext extends Input {
-  toolcalls: Record<string, ToolCall>
+  toolcalls: Map<string, ToolCall>
   shouldBreak: boolean
   snapshot: string | undefined
   blocked: boolean
@@ -125,7 +132,7 @@ const layer = Layer.effect(
         assistantMessage: input.assistantMessage,
         sessionID: input.sessionID,
         model: input.model,
-        toolcalls: {},
+        toolcalls: new Map(),
         shouldBreak: false,
         snapshot: initialSnapshot,
         blocked: false,
@@ -137,14 +144,7 @@ const layer = Layer.effect(
       const toolCallLocks = KeyedMutex.makeUnsafe<string>()
       let aborted = false
       let activeToolCategories = new Map<string, NemoRelay.ToolCategory>()
-      let activeToolBridge: EffectBridge.Shape | undefined
-      const claimedTerminalCallIDs = new Set<string>()
-
-      const claimTerminal = (toolCallID: string) => {
-        if (claimedTerminalCallIDs.has(toolCallID)) return false
-        claimedTerminalCallIDs.add(toolCallID)
-        return true
-      }
+      let activeToolRuntime: ToolRuntime | undefined
 
       const parse = (e: unknown) =>
         MessageV2.fromError(e, {
@@ -164,14 +164,19 @@ const layer = Layer.effect(
       const stopsToolLoop = (error: unknown) =>
         error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError
 
-      const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
-        const done = ctx.toolcalls[toolCallID]?.done
-        delete ctx.toolcalls[toolCallID]
-        if (done) yield* Deferred.succeed(done, undefined).pipe(Effect.ignore)
+      const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (
+        toolCallID: string,
+        call: ToolCall,
+      ) {
+        if (ctx.toolcalls.get(toolCallID) === call) ctx.toolcalls.delete(toolCallID)
+        yield* Deferred.succeed(call.done, undefined).pipe(Effect.ignore)
       })
 
+      // Every caller holds toolCallLocks for toolCallID. Keeping the durable
+      // part and its Relay observation behind the same lock prevents a stale
+      // metadata write or cleanup path from stealing terminal ownership.
       const readToolCall = Effect.fn("SessionProcessor.readToolCall")(function* (toolCallID: string) {
-        const call = ctx.toolcalls[toolCallID]
+        const call = ctx.toolcalls.get(toolCallID)
         if (!call) return undefined
         const part = yield* session.getPart({
           partID: call.partID,
@@ -179,31 +184,35 @@ const layer = Layer.effect(
           sessionID: call.sessionID,
         })
         if (!part || part.type !== "tool") {
-          if (claimTerminal(toolCallID)) {
-            yield* Effect.uninterruptible(
-              (call.relay?.complete("failed") ?? Effect.void).pipe(Effect.ensuring(settleToolCall(toolCallID))),
-            )
-          }
+          yield* (call.relay?.complete("failed") ?? Effect.void).pipe(
+            Effect.catchCause(() => Effect.void),
+            Effect.ensuring(settleToolCall(toolCallID, call)),
+          )
           return undefined
         }
         return { call, part }
       })
 
-      const updateToolCall = Effect.fn("SessionProcessor.updateToolCall")(function* (
+      const updateToolCallUnlocked = Effect.fn("SessionProcessor.updateToolCallUnlocked")(function* (
         toolCallID: string,
         update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
       ) {
         const match = yield* readToolCall(toolCallID)
         if (!match) return undefined
         const part = yield* session.updatePart(update(match.part))
-        ctx.toolcalls[toolCallID] = {
-          ...match.call,
-          partID: part.id,
-          messageID: part.messageID,
-          sessionID: part.sessionID,
-        }
+        match.call.partID = part.id
+        match.call.messageID = part.messageID
+        match.call.sessionID = part.sessionID
         return part
       })
+
+      const admitToolCall = <A, E, R>(toolCallID: string, effect: Effect.Effect<A, E, R>) =>
+        toolCallLocks.withLock(toolCallID)(effect)
+
+      const updateToolCall = Effect.fn("SessionProcessor.updateToolCall")(
+        (toolCallID: string, update: (part: SessionV1.ToolPart) => SessionV1.ToolPart) =>
+          admitToolCall(toolCallID, updateToolCallUnlocked(toolCallID, update)),
+      )
 
       const completeToolCall = Effect.fn("SessionProcessor.completeToolCall")(function* (
         toolCallID: string,
@@ -214,84 +223,86 @@ const layer = Layer.effect(
           attachments?: SessionV1.FilePart[]
         },
       ) {
-        const match = yield* readToolCall(toolCallID)
-        if (!match) return
-        const state = match.part.state
-        if (state.status !== "running") return
-        if (!claimTerminal(toolCallID)) return
-        const end = Date.now()
-        yield* Effect.uninterruptible(
-          Effect.gen(function* () {
-            const updated = yield* session
-              .updatePart({
-                ...match.part,
-                state: {
-                  status: "completed",
-                  input: state.input,
-                  output: output.output,
-                  metadata: output.metadata,
-                  title: output.title,
-                  time: { start: state.time.start, end },
-                  attachments: output.attachments,
-                },
-              })
-              .pipe(Effect.exit)
-            if (Exit.isFailure(updated)) {
-              claimedTerminalCallIDs.delete(toolCallID)
-              yield* Effect.failCause(updated.cause)
-            }
-            const terminalResult =
-              match.part.metadata?.providerExecuted !== true && NemoRelay.toolCategory(match.part.tool) === "terminal"
-                ? NemoRelay.terminalResultFamily(output.metadata)
-                : undefined
-            const relayCompletion = match.call.relay?.complete(
-              "success",
-              terminalResult === undefined ? undefined : { terminalResult },
-            )
-            if (relayCompletion) yield* relayCompletion
-            yield* settleToolCall(toolCallID)
-          }),
+        yield* admitToolCall(
+          toolCallID,
+          Effect.uninterruptible(
+            Effect.gen(function* () {
+              const match = yield* readToolCall(toolCallID)
+              if (!match) return
+              const state = match.part.state
+              if (state.status !== "running") return
+              const end = Date.now()
+              const updated = yield* session
+                .updatePart({
+                  ...match.part,
+                  state: {
+                    status: "completed",
+                    input: state.input,
+                    output: output.output,
+                    metadata: output.metadata,
+                    title: output.title,
+                    time: { start: state.time.start, end },
+                    attachments: output.attachments,
+                  },
+                })
+                .pipe(Effect.exit)
+              if (Exit.isFailure(updated)) yield* Effect.failCause(updated.cause)
+              const terminalResult =
+                match.part.metadata?.providerExecuted !== true && NemoRelay.toolCategory(match.part.tool) === "terminal"
+                  ? NemoRelay.terminalResultFamily(output.metadata)
+                  : undefined
+              const relayCompletion = match.call.relay?.complete(
+                "success",
+                terminalResult === undefined ? undefined : { terminalResult },
+              )
+              if (relayCompletion) yield* relayCompletion.pipe(Effect.catchCause(() => Effect.void))
+              yield* settleToolCall(toolCallID, match.call)
+            }),
+          ),
         )
       })
 
       const failToolCall = Effect.fn("SessionProcessor.failToolCall")(function* (toolCallID: string, error: unknown) {
-        const match = yield* readToolCall(toolCallID)
-        if (!match) return false
-        const state = match.part.state
-        if (state.status !== "running") return false
-        if (!claimTerminal(toolCallID)) return false
-        const end = Date.now()
-        const blocked = blockedError(error)
-        const cancelled =
-          !blocked && typeof error === "object" && error !== null && "name" in error && error.name === "AbortError"
-        const outcome: NemoRelay.ToolOutcome = blocked ? "blocked" : cancelled ? "cancelled" : "failed"
-        return yield* Effect.uninterruptible(
-          Effect.gen(function* () {
-            const updated = yield* session
-              .updatePart({
-                ...match.part,
-                state: {
-                  status: "error",
-                  input: state.input,
-                  error: errorMessage(error),
-                  // Keep metadata streamed while running so failures retain progress detail (e.g. execute's child calls).
-                  metadata: state.metadata,
-                  time: { start: state.time.start, end },
-                },
-              })
-              .pipe(Effect.exit)
-            if (Exit.isFailure(updated)) {
-              claimedTerminalCallIDs.delete(toolCallID)
-              return yield* Effect.failCause(updated.cause)
-            }
-            const relayCompletion = match.call.relay?.complete(outcome)
-            if (relayCompletion) yield* relayCompletion
-            yield* settleToolCall(toolCallID)
-            if (stopsToolLoop(error)) {
-              ctx.blocked = ctx.shouldBreak
-            }
-            return true
-          }),
+        return yield* admitToolCall(
+          toolCallID,
+          Effect.uninterruptible(
+            Effect.gen(function* () {
+              const match = yield* readToolCall(toolCallID)
+              if (!match) return false
+              const state = match.part.state
+              if (state.status !== "running") return false
+              const end = Date.now()
+              const blocked = blockedError(error)
+              const cancelled =
+                !blocked &&
+                typeof error === "object" &&
+                error !== null &&
+                "name" in error &&
+                error.name === "AbortError"
+              const outcome: NemoRelay.ToolOutcome = blocked ? "blocked" : cancelled ? "cancelled" : "failed"
+              const updated = yield* session
+                .updatePart({
+                  ...match.part,
+                  state: {
+                    status: "error",
+                    input: state.input,
+                    error: errorMessage(error),
+                    // Keep metadata streamed while running so failures retain progress detail (e.g. execute's child calls).
+                    metadata: state.metadata,
+                    time: { start: state.time.start, end },
+                  },
+                })
+                .pipe(Effect.exit)
+              if (Exit.isFailure(updated)) return yield* Effect.failCause(updated.cause)
+              const relayCompletion = match.call.relay?.complete(outcome)
+              if (relayCompletion) yield* relayCompletion.pipe(Effect.catchCause(() => Effect.void))
+              yield* settleToolCall(toolCallID, match.call)
+              if (stopsToolLoop(error)) {
+                ctx.blocked = ctx.shouldBreak
+              }
+              return true
+            }),
+          ),
         )
       })
 
@@ -307,12 +318,14 @@ const layer = Layer.effect(
       const settleOutstandingToolCalls = Effect.fn("SessionProcessor.settleOutstandingToolCalls")(function* (
         unsettledOutcome: NemoRelay.ToolOutcome,
       ) {
-        const calls = Object.entries(ctx.toolcalls)
+        const calls = [...ctx.toolcalls.entries()]
         const failures = yield* Effect.forEach(calls, ([toolCallID, call]) =>
-          Effect.gen(function* () {
-            let outcome: NemoRelay.ToolOutcome = "failed"
-            let durableFailure: Cause.Cause<never> | undefined
-            if (claimTerminal(toolCallID)) {
+          admitToolCall(
+            toolCallID,
+            Effect.gen(function* () {
+              if (ctx.toolcalls.get(toolCallID) !== call) return undefined
+              let outcome: NemoRelay.ToolOutcome = "failed"
+              let durableFailure: Cause.Cause<never> | undefined
               const loaded = yield* session
                 .getPart({
                   partID: call.partID,
@@ -343,21 +356,17 @@ const layer = Layer.effect(
                 if (Exit.isFailure(updated)) durableFailure = updated.cause
                 else outcome = unsettledOutcome
               }
-            }
 
-            // Completion is idempotent. Calling it even when another terminal
-            // path already owns the claim closes observations whose durable
-            // settlement stalled, while preserving the first terminal outcome.
-            const completion = call.relay?.complete(outcome)
-            if (completion) {
-              // Relay is observation-only. A failed completion for one call
-              // must not prevent siblings or durable cleanup from settling.
-              yield* completion.pipe(Effect.catchCause(() => Effect.void))
-            }
-            return durableFailure
-          }).pipe(Effect.ensuring(settleToolCall(toolCallID))),
+              const completion = call.relay?.complete(outcome)
+              if (completion) {
+                // Relay is observation-only. A failed completion for one call
+                // must not prevent siblings or durable cleanup from settling.
+                yield* completion.pipe(Effect.catchCause(() => Effect.void))
+              }
+              return durableFailure
+            }).pipe(Effect.ensuring(settleToolCall(toolCallID, call))),
+          ),
         )
-        ctx.toolcalls = {}
         const failure = failures.find((cause) => cause !== undefined)
         if (failure) yield* Effect.failCause(failure)
       })
@@ -374,18 +383,11 @@ const layer = Layer.effect(
             ...existing.part,
             metadata: { ...existing.part.metadata, providerExecuted: true },
           })
-          ctx.toolcalls[input.id] = {
-            ...existing.call,
-            partID: part.id,
-            messageID: part.messageID,
-            sessionID: part.sessionID,
-          }
-          return { call: ctx.toolcalls[input.id], part }
+          existing.call.partID = part.id
+          existing.call.messageID = part.messageID
+          existing.call.sessionID = part.sessionID
+          return { call: existing.call, part }
         }
-        // Provider retries may legitimately reuse a call id after the prior
-        // generation settled. Terminal ownership is per admitted generation,
-        // not forever per string id.
-        claimedTerminalCallIDs.delete(input.id)
         const part = yield* session.updatePart({
           id: PartID.ascending(),
           messageID: ctx.assistantMessage.id,
@@ -396,17 +398,16 @@ const layer = Layer.effect(
           state: { status: "pending", input: {}, raw: "" },
           metadata: input.providerExecuted ? { providerExecuted: true } : undefined,
         } satisfies SessionV1.ToolPart)
-        ctx.toolcalls[input.id] = {
+        const call: ToolCall = {
           done: yield* Deferred.make<void>(),
           partID: part.id,
           messageID: part.messageID,
           sessionID: part.sessionID,
+          callbackClaimed: false,
         }
-        return { call: ctx.toolcalls[input.id], part }
+        ctx.toolcalls.set(input.id, call)
+        return { call, part }
       })
-
-      const admitToolCall = <A, E, R>(toolCallID: string, effect: Effect.Effect<A, E, R>) =>
-        toolCallLocks.withLock(toolCallID)(effect)
 
       const startToolCall = Effect.fn("SessionProcessor.startToolCall")(function* (input: {
         id: string
@@ -414,56 +415,118 @@ const layer = Layer.effect(
         value: Record<string, unknown>
         providerExecuted?: boolean
         providerMetadata?: SessionV1.ToolPart["metadata"]
+        claimCallback?: boolean
       }) {
         return yield* admitToolCall(
           input.id,
           Effect.gen(function* () {
-            yield* ensureToolCall({ id: input.id, name: input.name, providerExecuted: input.providerExecuted })
-            const running = yield* updateToolCall(input.id, (match) => ({
-              ...match,
-              tool: input.name,
-              state:
-                match.state.status === "running"
-                  ? { ...match.state, input: input.value }
-                  : {
-                      status: "running",
-                      input: input.value,
-                      time: { start: Date.now() },
-                    },
-              metadata: input.providerExecuted
-                ? { ...input.providerMetadata, providerExecuted: true }
-                : (input.providerMetadata ?? match.metadata),
-            }))
-            const observed = ctx.toolcalls[input.id]
-            if (running?.state.status === "running" && observed && !observed.relay) {
-              observed.relay = yield* relay.beginTool({
-                name: input.name,
-                category: activeToolCategories.get(input.name),
-                execution: running.metadata?.providerExecuted === true ? "provider" : "local",
-              })
+            const admitted = yield* ensureToolCall({
+              id: input.id,
+              name: input.name,
+              providerExecuted: input.providerExecuted,
+            })
+            if (input.claimCallback) {
+              if (admitted.call.callbackClaimed) throw new Error("Duplicate concurrent tool callback")
+              admitted.call.callbackClaimed = true
             }
-            return observed?.relay
+            return yield* Effect.gen(function* () {
+              const running = yield* updateToolCallUnlocked(input.id, (match) => ({
+                ...match,
+                tool: input.name,
+                state:
+                  match.state.status === "running"
+                    ? { ...match.state, input: input.value }
+                    : {
+                        status: "running",
+                        input: input.value,
+                        time: { start: Date.now() },
+                      },
+                metadata: input.providerExecuted
+                  ? { ...input.providerMetadata, providerExecuted: true }
+                  : (input.providerMetadata ?? match.metadata),
+              }))
+              const observed = ctx.toolcalls.get(input.id)
+              if (running?.state.status === "running" && observed === admitted.call && !observed.relay) {
+                observed.relay = yield* relay.beginTool({
+                  name: input.name,
+                  category: activeToolCategories.get(input.name),
+                  execution: running.metadata?.providerExecuted === true ? "provider" : "local",
+                })
+              }
+              return observed?.relay
+            }).pipe(
+              Effect.onExit((exit) =>
+                input.claimCallback && Exit.isFailure(exit)
+                  ? Effect.sync(() => {
+                      if (ctx.toolcalls.get(input.id) === admitted.call) admitted.call.callbackClaimed = false
+                    })
+                  : Effect.void,
+              ),
+            )
           }),
         )
       })
 
       const executeTool: Handle["executeTool"] = (input, effect) => {
-        const bridge = activeToolBridge
-        // Tool callbacks are expected to run while process() owns an observed
-        // Turn. Preserve host behavior if a provider invokes one outside that
-        // lifetime, but do not invent a Tool parent under a stale Run context.
-        if (!bridge) return fallbackBridge.promise(effect)
-        return bridge.promise(
-          Effect.gen(function* () {
-            const observation = yield* startToolCall({
-              id: input.toolCallID,
-              name: input.name,
-              value: input.input,
-            })
-            return yield* (observation ? observation.run(effect) : effect)
-          }),
-        )
+        const runtime = activeToolRuntime
+        // A callback outside the owning Turn still executes for host parity,
+        // but Relay context is stripped so it cannot attach work to a closed
+        // Run or Turn captured when the processor handle was created.
+        if (!runtime?.accepting) return fallbackBridge.promise(relay.detached(effect))
+        const category = activeToolCategories.get(input.name) ?? NemoRelay.toolCategory(input.name)
+        const task = Effect.gen(function* () {
+          const observation = yield* startToolCall({
+            id: input.toolCallID,
+            name: input.name,
+            value: input.input,
+            claimCallback: true,
+          })
+          const observed = observation ? observation.run(effect) : effect
+          return yield* observed.pipe(
+            Effect.onExit((exit) => {
+              if (!observation) return Effect.void
+              const outcome: NemoRelay.ToolOutcome = Exit.isSuccess(exit)
+                ? "success"
+                : Cause.hasInterruptsOnly(exit.cause)
+                  ? "cancelled"
+                  : blockedError(Cause.squash(exit.cause))
+                    ? "blocked"
+                    : "failed"
+              const terminalResult =
+                Exit.isSuccess(exit) && category === "terminal" && isRecord(exit.value)
+                  ? NemoRelay.terminalResultFamily(exit.value.metadata)
+                  : undefined
+              return observation
+                .complete(outcome, terminalResult === undefined ? undefined : { terminalResult })
+                .pipe(Effect.catchCause(() => Effect.void))
+            }),
+          )
+        })
+        const fiber = runtime.bridge.fork(task)
+        runtime.fibers.add(fiber)
+        return runtime.bridge.promise(Fiber.join(fiber)).finally(() => runtime.fibers.delete(fiber))
       }
+
+      const closeToolRuntime = Effect.fn("SessionProcessor.closeToolRuntime")(function* (runtime: ToolRuntime) {
+        runtime.accepting = false
+        if (activeToolRuntime === runtime) activeToolRuntime = undefined
+
+        // Admission is closed before this stable snapshot. Give callbacks a
+        // short grace period, then interrupt the owned fibers and wait for
+        // their Tool finalizers before the Turn and its remaining calls close.
+        const fibers = [...runtime.fibers]
+        if (fibers.length === 0) return
+        const drained = yield* Effect.forEach(fibers, Fiber.await, { concurrency: "unbounded" }).pipe(
+          Effect.timeoutOption("250 millis"),
+        )
+        if (Option.isSome(drained)) return
+        for (const fiber of fibers) fiber.interruptUnsafe()
+        const interrupted = yield* Effect.forEach(fibers, Fiber.await, { concurrency: "unbounded" }).pipe(
+          Effect.timeoutOption("250 millis"),
+        )
+        if (Option.isNone(interrupted))
+          yield* Effect.logWarning("tool callbacks did not stop before Turn cleanup", { count: fibers.length })
+      })
 
       const isFilePart = (value: unknown): value is SessionV1.FilePart => Schema.is(SessionV1.FilePart)(value)
 
@@ -587,8 +650,6 @@ const layer = Layer.effect(
           }
 
           case "tool-result": {
-            const toolCall = yield* readToolCall(value.id)
-            if (!toolCall && value.result.type === "error") return
             if (value.result.type === "error") {
               yield* failToolCall(value.id, value.result.value)
               return
@@ -799,7 +860,7 @@ const layer = Layer.effect(
           ctx.reasoningMap = {}
 
           yield* Effect.forEach(
-            Object.values(ctx.toolcalls),
+            [...ctx.toolcalls.values()],
             (call) => Deferred.await(call.done).pipe(Effect.timeout("250 millis"), Effect.ignore),
             { concurrency: "unbounded" },
           )
@@ -858,7 +919,8 @@ const layer = Layer.effect(
 
         const turn = Effect.gen(function* () {
           const bridge = yield* EffectBridge.make()
-          activeToolBridge = bridge
+          const runtime: ToolRuntime = { bridge, fibers: new Set(), accepting: true }
+          activeToolRuntime = runtime
           yield* Effect.gen(function* () {
             ctx.currentText = undefined
             ctx.reasoningMap = {}
@@ -915,11 +977,10 @@ const layer = Layer.effect(
               }),
             ),
             Effect.catch(halt),
-            Effect.ensuring(Effect.suspend(() => cleanup(unsettledOutcome))),
             Effect.ensuring(
-              Effect.sync(() => {
-                if (activeToolBridge === bridge) activeToolBridge = undefined
-              }),
+              Effect.suspend(() =>
+                closeToolRuntime(runtime).pipe(Effect.ensuring(Effect.suspend(() => cleanup(unsettledOutcome)))),
+              ),
             ),
           )
 
