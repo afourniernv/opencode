@@ -3,7 +3,7 @@ import { Effect, Fiber, Layer, Random, Ref } from "effect"
 import * as TestClock from "effect/testing/TestClock"
 import { Headers, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { LLM, LLMError } from "../src"
-import { LLMClient, RequestExecutor } from "../src/route"
+import { LLMClient, RequestExecutor, type AttemptEvent } from "../src/route"
 import * as OpenAIChat from "../src/protocols/openai-chat"
 import { dynamicResponse } from "./lib/http"
 import { deltaChunk } from "./lib/openai-chunks"
@@ -265,6 +265,130 @@ describe("RequestExecutor", () => {
     ),
   )
 
+  it.effect("observes each physical request attempt and scheduled retry with bounded attributes", () =>
+    Effect.gen(function* () {
+      const events: AttemptEvent[] = []
+      const executor = yield* RequestExecutor.Service
+      const response = yield* executor.execute(request).pipe(
+        Effect.provideService(RequestExecutor.CurrentAttemptObserver, (event) =>
+          Effect.sync(() => {
+            events.push(event)
+          }),
+        ),
+      )
+
+      expect(response.status).toBe(200)
+      expect(events).toEqual([
+        { type: "started", attempt: "first" },
+        {
+          type: "completed",
+          attempt: "first",
+          outcome: "failed",
+          durationMs: 0,
+          statusFamily: "5xx",
+          errorKind: "provider_internal",
+          retryable: true,
+          willRetry: true,
+        },
+        {
+          type: "retry-scheduled",
+          attempt: "first",
+          nextAttempt: "second",
+          delayMs: 0,
+          delaySource: "retry_after",
+        },
+        { type: "started", attempt: "second" },
+        {
+          type: "completed",
+          attempt: "second",
+          outcome: "failed",
+          durationMs: 0,
+          statusFamily: "4xx",
+          errorKind: "rate_limit",
+          retryable: true,
+          willRetry: true,
+        },
+        {
+          type: "retry-scheduled",
+          attempt: "second",
+          nextAttempt: "third_or_later",
+          delayMs: 0,
+          delaySource: "retry_after",
+        },
+        { type: "started", attempt: "third_or_later" },
+        {
+          type: "completed",
+          attempt: "third_or_later",
+          outcome: "success",
+          durationMs: 0,
+          statusFamily: "2xx",
+          willRetry: false,
+        },
+      ])
+    }).pipe(
+      Effect.provide(
+        responsesLayer([
+          new Response("busy", { status: 503, headers: { "retry-after-ms": "0" } }),
+          new Response("limited", { status: 429, headers: { "retry-after-ms": "0" } }),
+          new Response("ok", { status: 200 }),
+        ]),
+      ),
+    ),
+  )
+
+  it.effect("keeps attempt observation fail-open", () =>
+    Effect.gen(function* () {
+      const executor = yield* RequestExecutor.Service
+      const response = yield* executor
+        .execute(request)
+        .pipe(Effect.provideService(RequestExecutor.CurrentAttemptObserver, () => Effect.die("observer failed")))
+
+      expect(response.status).toBe(200)
+      expect(yield* response.text).toBe("ok")
+    }).pipe(Effect.provide(responsesLayer([new Response("ok", { status: 200 })]))),
+  )
+
+  it.effect("observes cancellation without converting it to a provider failure", () =>
+    Effect.gen(function* () {
+      const events: AttemptEvent[] = []
+      const executor = yield* RequestExecutor.Service
+      const fiber = yield* executor.execute(request).pipe(
+        Effect.provideService(RequestExecutor.CurrentAttemptObserver, (event) =>
+          Effect.sync(() => {
+            events.push(event)
+          }),
+        ),
+        Effect.forkChild,
+      )
+
+      yield* Effect.yieldNow
+      yield* Fiber.interrupt(fiber)
+
+      expect(events).toEqual([
+        { type: "started", attempt: "first" },
+        {
+          type: "completed",
+          attempt: "first",
+          outcome: "cancelled",
+          durationMs: 0,
+          statusFamily: "none",
+          willRetry: false,
+        },
+      ])
+    }).pipe(
+      Effect.provide(
+        RequestExecutor.layer.pipe(
+          Layer.provide(
+            Layer.succeed(
+              HttpClient.HttpClient,
+              HttpClient.make(() => Effect.never),
+            ),
+          ),
+        ),
+      ),
+    ),
+  )
+
   it.effect("marks 504 and 529 status responses retryable", () =>
     Effect.gen(function* () {
       const failWith = (status: number) =>
@@ -388,9 +512,18 @@ describe("RequestExecutor", () => {
   it.effect("uses exponential jittered delay when retry-after is absent", () =>
     Effect.gen(function* () {
       const attempts = yield* Ref.make(0)
+      const events: AttemptEvent[] = []
       return yield* Effect.gen(function* () {
         const executor = yield* RequestExecutor.Service
-        const fiber = yield* executor.execute(request).pipe(Effect.flip, Effect.forkChild)
+        const fiber = yield* executor.execute(request).pipe(
+          Effect.flip,
+          Effect.provideService(RequestExecutor.CurrentAttemptObserver, (event) =>
+            Effect.sync(() => {
+              events.push(event)
+            }),
+          ),
+          Effect.forkChild,
+        )
 
         yield* Effect.yieldNow
         expect(yield* Ref.get(attempts)).toBe(1)
@@ -413,6 +546,22 @@ describe("RequestExecutor", () => {
         expectLLMError(error)
         expect(error.reason).toMatchObject({ _tag: "ProviderInternal" })
         expect(yield* Ref.get(attempts)).toBe(3)
+        expect(events.filter((event) => event.type === "retry-scheduled")).toEqual([
+          {
+            type: "retry-scheduled",
+            attempt: "first",
+            nextAttempt: "second",
+            delayMs: 500,
+            delaySource: "backoff",
+          },
+          {
+            type: "retry-scheduled",
+            attempt: "second",
+            nextAttempt: "third_or_later",
+            delayMs: 1_000,
+            delaySource: "backoff",
+          },
+        ])
       }).pipe(
         Effect.provide(
           countedResponsesLayer(attempts, [
