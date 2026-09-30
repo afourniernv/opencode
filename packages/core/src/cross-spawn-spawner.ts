@@ -94,6 +94,16 @@ const toPlatformError = (
   })
 }
 
+/**
+ * True only for the bounded error shape used when a child exits by signal.
+ * The exact signal remains intentionally private.
+ */
+export const isSignalExitError = (value: unknown): value is PlatformError.PlatformError =>
+  value instanceof PlatformError.PlatformError &&
+  value.reason instanceof PlatformError.SystemError &&
+  value.reason.module === "ChildProcess" &&
+  value.reason.method === "exitCode"
+
 type ExitSignal = Deferred.Deferred<readonly [code: number | null, signal: NodeJS.Signals | null]>
 
 export const make = Effect.gen(function* () {

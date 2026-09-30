@@ -3,6 +3,7 @@ import { realpathSync } from "node:fs"
 import path from "path"
 import { describe, expect, test } from "bun:test"
 import { Effect, Layer } from "effect"
+import * as PlatformError from "effect/PlatformError"
 import { ChildProcess } from "effect/unstable/process"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Config } from "@opencode-ai/core/config"
@@ -409,6 +410,40 @@ describe("BashTool", () => {
                 timeout: true,
                 truncated: false,
               })
+            }),
+          ),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("returns a privacy-bounded signal settlement", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        runFailure = new AppProcess.AppProcessError({
+          command: "signal",
+          cause: PlatformError.systemError({
+            _tag: "Unknown",
+            module: "ChildProcess",
+            method: "exitCode",
+            cause: new Error("PRIVATE_SIGNAL_DETAIL"),
+          }),
+        })
+        return withTool(tmp.path, (registry) => settleTool(registry, call({ command: "signal" }))).pipe(
+          Effect.andThen((settled) =>
+            Effect.sync(() => {
+              expect(settled.output?.structured).toMatchObject({
+                signal: true,
+                truncated: false,
+              })
+              expect(settled.output?.content[1]).toMatchObject({
+                type: "text",
+                text: expect.stringContaining("terminated after receiving a process signal"),
+              })
+              expect(JSON.stringify(settled.output)).not.toContain("PRIVATE_SIGNAL_DETAIL")
             }),
           ),
         )
