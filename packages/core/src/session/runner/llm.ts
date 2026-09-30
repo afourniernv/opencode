@@ -385,7 +385,15 @@ const layer = Layer.effect(
           }
         }),
       )
-      return yield* turn
+      return yield* turn.pipe(
+        Effect.onExit((exit) =>
+          withPublication(
+            publisher.closeUnsettledRelay(
+              Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause) ? "cancelled" : "failed",
+            ),
+          ),
+        ),
+      )
     }, Effect.scoped)
     type RunTurn = (
       sessionID: SessionSchema.ID,

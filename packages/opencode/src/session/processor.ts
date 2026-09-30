@@ -136,6 +136,12 @@ const layer = Layer.effect(
         error instanceof PermissionV1.CorrectedError ||
         error instanceof Question.RejectedError
 
+      // Preserve the host's pre-observability control flow. Configured denials
+      // and correction feedback are model-facing tool errors; only an explicit
+      // user rejection or dismissed question stops the loop.
+      const stopsToolLoop = (error: unknown) =>
+        error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError
+
       const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
         const done = ctx.toolcalls[toolCallID]?.done
         delete ctx.toolcalls[toolCallID]
@@ -252,7 +258,7 @@ const layer = Layer.effect(
             const relayCompletion = match.call.relay?.complete(outcome)
             if (relayCompletion) yield* relayCompletion
             yield* settleToolCall(toolCallID)
-            if (blocked) {
+            if (stopsToolLoop(error)) {
               ctx.blocked = ctx.shouldBreak
             }
             return true
@@ -267,6 +273,64 @@ const layer = Layer.effect(
         ctx.reasoningMap[reasoningID].time = { ...ctx.reasoningMap[reasoningID].time, end: Date.now() }
         yield* session.updatePart(ctx.reasoningMap[reasoningID])
         delete ctx.reasoningMap[reasoningID]
+      })
+
+      const settleOutstandingToolCalls = Effect.fn("SessionProcessor.settleOutstandingToolCalls")(function* (
+        unsettledOutcome: NemoRelay.ToolOutcome,
+      ) {
+        const calls = Object.entries(ctx.toolcalls)
+        const failures = yield* Effect.forEach(calls, ([toolCallID, call]) =>
+          Effect.gen(function* () {
+            let outcome: NemoRelay.ToolOutcome = "failed"
+            let durableFailure: Cause.Cause<never> | undefined
+            if (claimTerminal(toolCallID)) {
+              const loaded = yield* session
+                .getPart({
+                  partID: call.partID,
+                  messageID: call.messageID,
+                  sessionID: call.sessionID,
+                })
+                .pipe(Effect.exit)
+              if (Exit.isFailure(loaded)) durableFailure = loaded.cause
+              else if (
+                loaded.value?.type === "tool" &&
+                (loaded.value.state.status === "pending" || loaded.value.state.status === "running")
+              ) {
+                const part = loaded.value
+                const end = Date.now()
+                const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
+                const updated = yield* session
+                  .updatePart({
+                    ...part,
+                    state: {
+                      ...part.state,
+                      status: "error",
+                      error: "Tool execution aborted",
+                      metadata: { ...metadata, interrupted: true },
+                      time: { start: "time" in part.state ? part.state.time.start : end, end },
+                    },
+                  })
+                  .pipe(Effect.exit)
+                if (Exit.isFailure(updated)) durableFailure = updated.cause
+                else outcome = unsettledOutcome
+              }
+            }
+
+            // Completion is idempotent. Calling it even when another terminal
+            // path already owns the claim closes observations whose durable
+            // settlement stalled, while preserving the first terminal outcome.
+            const completion = call.relay?.complete(outcome)
+            if (completion) {
+              // Relay is observation-only. A failed completion for one call
+              // must not prevent siblings or durable cleanup from settling.
+              yield* completion.pipe(Effect.catchCause(() => Effect.void))
+            }
+            return durableFailure
+          }).pipe(Effect.ensuring(settleToolCall(toolCallID))),
+        )
+        ctx.toolcalls = {}
+        const failure = failures.find((cause) => cause !== undefined)
+        if (failure) yield* Effect.failCause(failure)
       })
 
       const ensureToolCall = Effect.fn("SessionProcessor.ensureToolCall")(function* (input: {
@@ -621,71 +685,48 @@ const layer = Layer.effect(
       })
 
       const cleanup = Effect.fn("SessionProcessor.cleanup")(function* (unsettledOutcome: NemoRelay.ToolOutcome) {
-        if (ctx.snapshot) {
-          const patch = yield* snapshot.patch(ctx.snapshot)
-          if (patch.files.length) {
+        yield* Effect.gen(function* () {
+          if (ctx.snapshot) {
+            const patch = yield* snapshot.patch(ctx.snapshot)
+            if (patch.files.length) {
+              yield* session.updatePart({
+                id: PartID.ascending(),
+                messageID: ctx.assistantMessage.id,
+                sessionID: ctx.sessionID,
+                type: "patch",
+                hash: patch.hash,
+                files: patch.files,
+              })
+            }
+            ctx.snapshot = undefined
+          }
+
+          if (ctx.currentText) {
+            const end = Date.now()
+            ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
+            yield* session.updatePart(ctx.currentText)
+            ctx.currentText = undefined
+          }
+
+          for (const part of Object.values(ctx.reasoningMap)) {
+            const end = Date.now()
             yield* session.updatePart({
-              id: PartID.ascending(),
-              messageID: ctx.assistantMessage.id,
-              sessionID: ctx.sessionID,
-              type: "patch",
-              hash: patch.hash,
-              files: patch.files,
+              ...part,
+              time: { start: part.time.start ?? end, end },
             })
           }
-          ctx.snapshot = undefined
-        }
+          ctx.reasoningMap = {}
 
-        if (ctx.currentText) {
-          const end = Date.now()
-          ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
-          yield* session.updatePart(ctx.currentText)
-          ctx.currentText = undefined
-        }
+          yield* Effect.forEach(
+            Object.values(ctx.toolcalls),
+            (call) => Deferred.await(call.done).pipe(Effect.timeout("250 millis"), Effect.ignore),
+            { concurrency: "unbounded" },
+          )
+        }).pipe(Effect.ensuring(settleOutstandingToolCalls(unsettledOutcome)))
 
-        for (const part of Object.values(ctx.reasoningMap)) {
-          const end = Date.now()
-          yield* session.updatePart({
-            ...part,
-            time: { start: part.time.start ?? end, end },
-          })
-        }
-        ctx.reasoningMap = {}
-
-        yield* Effect.forEach(
-          Object.values(ctx.toolcalls),
-          (call) => Deferred.await(call.done).pipe(Effect.timeout("250 millis"), Effect.ignore),
-          { concurrency: "unbounded" },
-        )
-
-        for (const toolCallID of Object.keys(ctx.toolcalls)) {
-          const match = yield* readToolCall(toolCallID)
-          if (!match) continue
-          if (!claimTerminal(toolCallID)) continue
-          const part = match.part
-          const end = Date.now()
-          const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
-          yield* session
-            .updatePart({
-              ...part,
-              state: {
-                ...part.state,
-                status: "error",
-                error: "Tool execution aborted",
-                metadata: { ...metadata, interrupted: true },
-                time: { start: "time" in part.state ? part.state.time.start : end, end },
-              },
-            })
-            .pipe(
-              // Pending calls were observed but never executed. Only an
-              // admitted running observation owns a terminal tool metric.
-              Effect.onExit(
-                (exit) => match.call.relay?.complete(Exit.isSuccess(exit) ? unsettledOutcome : "failed") ?? Effect.void,
-              ),
-              Effect.ensuring(settleToolCall(toolCallID)),
-            )
-        }
-        ctx.toolcalls = {}
+        // Settle admitted tool observations before the final message write so a
+        // failed updateMessage cannot strand them. Earlier cleanup failures are
+        // covered by the ensuring finalizer above.
         ctx.assistantMessage.time.completed = Date.now()
         yield* session.updateMessage(ctx.assistantMessage)
       })

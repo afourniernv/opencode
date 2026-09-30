@@ -18,11 +18,14 @@ await Bun.build({
   outdir: "./dist/node",
   format: "esm",
   sourcemap: "linked",
-  external: ["jsonc-parser", "@lydell/node-pty"],
+  // Electron owns the Relay runtime package and its host-native addon. Keep it
+  // outside both this intermediate bundle and the final ASAR JavaScript bundle.
+  external: ["jsonc-parser", "@lydell/node-pty", "nemo-relay-node"],
   define: {
     OPENCODE_MODELS_DEV: generated.modelsData,
     OPENCODE_VERSION: `'${Script.version}'`,
     OPENCODE_CHANNEL: `'${Script.channel}'`,
+    OPENCODE_NEMO_RELAY_BUNDLED_MODULE: JSON.stringify("nemo-relay-node"),
   },
   files: {
     "opencode-web-ui.gen.ts": "",

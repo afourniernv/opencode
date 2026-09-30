@@ -27,6 +27,7 @@ const arch = archMap[os.arch()] ?? os.arch()
 const base = `opencode-${platform}-${arch}`
 const sourceBinary = platform === "windows" ? "opencode.exe" : "opencode"
 const targetBinary = path.join(__dirname, "bin", "opencode.exe")
+const targetRelayLicense = path.join(__dirname, "LICENSE.nemo-relay")
 
 function supportsAvx2() {
   if (arch !== "x64") return false
@@ -116,11 +117,16 @@ function packageNames() {
   return [base]
 }
 
-function resolveBinary(name) {
+function resolvePackage(name) {
   const packageJsonPath = require.resolve(`${name}/package.json`)
-  const binaryPath = path.join(path.dirname(packageJsonPath), "bin", sourceBinary)
+  return path.dirname(packageJsonPath)
+}
+
+function copyPackage(packageDir) {
+  const binaryPath = path.join(packageDir, "bin", sourceBinary)
   if (!fs.existsSync(binaryPath)) throw new Error(`Binary not found at ${binaryPath}`)
-  return binaryPath
+  copyBinary(binaryPath, targetBinary)
+  copyRelayLicense(path.join(packageDir, "bin", "LICENSE.nemo-relay"))
 }
 
 function installPackage(name) {
@@ -135,12 +141,20 @@ function installPackage(name) {
       { stdio: "inherit", windowsHide: true },
     )
     if (result.status !== 0) return
-    const packageDir = path.join(temp, "node_modules", name)
-    copyBinary(path.join(packageDir, "bin", sourceBinary), targetBinary)
+    copyPackage(path.join(temp, "node_modules", name))
     return true
   } finally {
     fs.rmSync(temp, { recursive: true, force: true })
   }
+}
+
+function copyRelayLicense(source) {
+  if (!fs.existsSync(source)) {
+    if (fs.existsSync(targetRelayLicense)) fs.unlinkSync(targetRelayLicense)
+    return
+  }
+  fs.copyFileSync(source, targetRelayLicense)
+  fs.chmodSync(targetRelayLicense, 0o644)
 }
 
 function copyBinary(source, target) {
@@ -167,7 +181,7 @@ function verifyBinary() {
 function main() {
   for (const name of packageNames()) {
     try {
-      copyBinary(resolveBinary(name), targetBinary)
+      copyPackage(resolvePackage(name))
       if (verifyBinary()) return
     } catch {
       if (installPackage(name) && verifyBinary()) return

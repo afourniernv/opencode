@@ -8,11 +8,18 @@ RUN apk add libgcc libstdc++ ripgrep
 
 FROM base AS build-amd64
 COPY dist/opencode-linux-x64-baseline-musl/bin/opencode /usr/local/bin/opencode
+COPY dist/opencode-linux-x64-baseline-musl/bin/LICENSE /usr/share/licenses/opencode/LICENSE
+COPY dist/opencode-linux-x64-baseline-musl/bin/LICENSE.nemo-relay /usr/share/licenses/opencode/LICENSE.nemo-relay
 
 FROM base AS build-arm64
 COPY dist/opencode-linux-arm64-musl/bin/opencode /usr/local/bin/opencode
+COPY dist/opencode-linux-arm64-musl/bin/LICENSE /usr/share/licenses/opencode/LICENSE
+COPY dist/opencode-linux-arm64-musl/bin/LICENSE.nemo-relay /usr/share/licenses/opencode/LICENSE.nemo-relay
 
 ARG TARGETARCH
 FROM build-${TARGETARCH}
 RUN opencode --version
+RUN XDG_CONFIG_HOME=/tmp/opencode-relay-config \
+    OPENCODE_NEMO_RELAY=1 \
+    opencode debug nemo-relay | grep -q '"state": "active"'
 ENTRYPOINT ["opencode"]
