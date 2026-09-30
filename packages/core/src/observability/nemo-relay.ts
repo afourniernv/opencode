@@ -1662,7 +1662,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
     try {
       const stack = branchStack(parent)
       if (!stack) return undefined
-      const category = input.execution === "provider" ? "provider" : (input.category ?? toolCategory(input.name))
+      const category = input.category ?? toolCategory(input.name)
       const metadata = {
         "opencode.trace.schema_version": SCHEMA_VERSION,
         "opencode.tool_category": category,
@@ -1691,8 +1691,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
       if (!trace || !scope) return
       try {
         const category = input.category ?? toolCategory(input.name)
-        const terminalResult =
-          input.execution === "local" && category === "terminal" ? input.terminalResult : undefined
+        const terminalResult = input.execution === "local" && category === "terminal" ? input.terminalResult : undefined
         trace.withScopeStack(scope.stack, () =>
           trace.toolCallEnd(
             scope.handle,
@@ -1794,7 +1793,11 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
             "opencode.trace.schema_version": SCHEMA_VERSION,
             "opencode.permission_resolution": input.resolution,
             "opencode.duration_bucket": toolDurationBucket(input.durationMs),
-            "otel.status_code": ["reject", "corrected"].includes(input.resolution) ? "ERROR" : "OK",
+            "otel.status_code": ["reject", "corrected"].includes(input.resolution)
+              ? "ERROR"
+              : ["once", "always"].includes(input.resolution)
+                ? "OK"
+                : "UNSET",
             ...(["reject", "corrected"].includes(input.resolution)
               ? { "error.type": `opencode.permission.${input.resolution}` }
               : {}),
