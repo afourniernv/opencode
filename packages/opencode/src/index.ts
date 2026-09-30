@@ -31,6 +31,7 @@ import { PluginCommand } from "./cli/cmd/plug"
 import { Heap } from "./cli/heap"
 import { shutdown as shutdownNemoRelay } from "@opencode-ai/core/observability/nemo-relay"
 import { ExitRequested, requestExit } from "./cli/exit"
+import { shutdownProcess } from "./cli/process-shutdown"
 
 const args = hideBin(process.argv)
 
@@ -141,9 +142,26 @@ try {
   }
 } finally {
   try {
-    const result = await shutdownNemoRelay()
-    if (!result.drained || !result.flushed || !result.closed)
-      process.stderr.write("NeMo Relay shutdown was incomplete; telemetry may have been abandoned." + EOL)
+    const result = await shutdownProcess({
+      // The in-process HTTP handler owns a scoped service graph separate from
+      // AppRuntime. Close it first so detached request work (including title
+      // generation) cannot keep Relay observations open during final drain.
+      stopServer: async () => {
+        const { Server } = await import("./server/server")
+        await Server.disposeDefault()
+      },
+      // Direct commands dispose their InstanceContext in effectCmd. Closing the
+      // managed runtime then releases the remaining process-global services.
+      disposeRuntime: async () => {
+        const { AppRuntime } = await import("./effect/app-runtime")
+        await AppRuntime.dispose()
+      },
+      shutdownRelay: shutdownNemoRelay,
+    })
+    if (!result.ok)
+      process.stderr.write(
+        `NeMo Relay shutdown was incomplete (${result.failures.join(", ")}); telemetry may have been abandoned.` + EOL,
+      )
   } catch {
     process.stderr.write("NeMo Relay shutdown failed; telemetry may have been abandoned." + EOL)
   } finally {
