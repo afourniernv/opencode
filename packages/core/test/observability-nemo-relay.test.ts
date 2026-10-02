@@ -14,6 +14,7 @@ import {
   toolCategory,
   toolDurationBucket,
   type LlmStreamCompleted,
+  type LlmStreamStarted,
   type LlmUnaryCompleted,
   type PermissionResolution,
   type ToolCompleted,
@@ -289,6 +290,17 @@ function enabledLifecycle(
   })
 }
 
+function llmInput(input: Partial<LlmStreamStarted> = {}): LlmStreamStarted {
+  return {
+    role: "primary",
+    agentRuntime: "v2",
+    runtime: "native",
+    provider: "openai",
+    model: "gpt",
+    ...input,
+  }
+}
+
 describe("NeMo Relay observability", () => {
   test("maps arbitrary identifiers into closed families and categories", () => {
     expect(providerFamily("openrouter-team-secret")).toBe("openrouter")
@@ -336,11 +348,12 @@ describe("NeMo Relay observability", () => {
 
     await Effect.runPromise(
       relay.llmStreamCompleted({
-        role: "primary",
-        agentRuntime: "v1",
-        runtime: "ai_sdk",
-        provider: "customer-provider-with-private-name",
-        model: "tenant/private-model-name",
+        ...llmInput({
+          agentRuntime: "v1",
+          runtime: "ai_sdk",
+          provider: "customer-provider-with-private-name",
+          model: "tenant/private-model-name",
+        }),
         contextLimit: 20,
         outcome: "success",
         finish: "stop",
@@ -408,11 +421,7 @@ describe("NeMo Relay observability", () => {
 
     await Effect.runPromise(
       relay.llmUnaryCompleted({
-        role: "compaction",
-        agentRuntime: "v2",
-        runtime: "native",
-        provider: "openai",
-        model: "gpt-5",
+        ...llmInput({ role: "compaction", model: "gpt-5" }),
         contextLimit: 20,
         outcome: "success",
         durationMs: 100,
@@ -551,30 +560,13 @@ describe("NeMo Relay observability", () => {
     ]
     await Effect.runPromise(
       relay
-        .observeLlmStream(
-          {
-            role: "primary",
-            agentRuntime: "v1",
-            runtime: "native",
-            provider: "openai",
-            model: "gpt",
-            contextLimit: 10,
-          },
-          Stream.fromIterable(events),
-        )
+        .observeLlmStream(llmInput({ agentRuntime: "v1", contextLimit: 10 }), Stream.fromIterable(events))
         .pipe(Stream.runDrain),
     )
     await Effect.runPromise(
       relay
         .observeLlmStream(
-          {
-            role: "primary",
-            agentRuntime: "v1",
-            runtime: "native",
-            provider: "openai",
-            model: "gpt",
-            contextLimit: 10,
-          },
+          llmInput({ agentRuntime: "v1", contextLimit: 10 }),
           Stream.fromIterable([
             { type: "step-finish", reason: "tool-calls", usage: { inputTokens: 2 } },
             { type: "step-finish", reason: "stop", usage: { inputTokens: 5 } },
@@ -585,14 +577,7 @@ describe("NeMo Relay observability", () => {
     await Effect.runPromise(
       relay
         .observeLlmStream(
-          {
-            role: "primary",
-            agentRuntime: "v1",
-            runtime: "native",
-            provider: "openai",
-            model: "gpt",
-            contextLimit: 10,
-          },
+          llmInput({ agentRuntime: "v1", contextLimit: 10 }),
           Stream.fromIterable([
             { type: "step-finish", reason: "stop", usage: { inputTokens: 13 } },
             { type: "finish", reason: "stop", usage: {} },
@@ -603,14 +588,7 @@ describe("NeMo Relay observability", () => {
     await Effect.runPromise(
       relay
         .observeLlmStream(
-          {
-            role: "primary",
-            agentRuntime: "v1",
-            runtime: "native",
-            provider: "openai",
-            model: "gpt",
-            contextLimit: 10,
-          },
+          llmInput({ agentRuntime: "v1", contextLimit: 10 }),
           Stream.fromIterable([
             {
               type: "step-finish",
@@ -662,14 +640,7 @@ describe("NeMo Relay observability", () => {
     await Effect.runPromise(
       relay
         .observeLlmStream(
-          {
-            role: "primary",
-            agentRuntime: "v1",
-            runtime: "ai_sdk",
-            provider: "openai",
-            model: "gpt",
-            contextLimit: 10,
-          },
+          llmInput({ agentRuntime: "v1", runtime: "ai_sdk", contextLimit: 10 }),
           Stream.make({ type: "finish", reason: "stop", usage: { inputTokens: 11 } }),
         )
         .pipe(Stream.runDrain),
@@ -690,14 +661,7 @@ describe("NeMo Relay observability", () => {
       Stream.concat(Stream.fromEffect(Effect.interrupt)),
     )
 
-    const exit = await Effect.runPromiseExit(
-      relay
-        .observeLlmStream(
-          { role: "primary", agentRuntime: "v2", runtime: "native", provider: "openai", model: "gpt" },
-          source,
-        )
-        .pipe(Stream.runDrain),
-    )
+    const exit = await Effect.runPromiseExit(relay.observeLlmStream(llmInput(), source).pipe(Stream.runDrain))
 
     expect(Exit.isFailure(exit)).toBe(true)
     expect(completed).toEqual([expect.objectContaining({ outcome: "provider_error" })])
@@ -721,14 +685,7 @@ describe("NeMo Relay observability", () => {
     await Effect.runPromise(
       relay
         .observeLlmStream(
-          {
-            role: "primary",
-            agentRuntime: "v2",
-            runtime: "native",
-            provider: "openai",
-            model: "gpt-5",
-            protocol: "openai-responses",
-          },
+          llmInput({ model: "gpt-5", protocol: "openai-responses" }),
           Stream.fromIterable([
             { type: "text-start" },
             { type: "text-delta", text: "" },
@@ -741,14 +698,7 @@ describe("NeMo Relay observability", () => {
     await Effect.runPromise(
       relay
         .observeLlmStream(
-          {
-            role: "primary",
-            agentRuntime: "v2",
-            runtime: "native",
-            provider: "openai",
-            model: "gpt-5",
-            protocol: "openai-responses",
-          },
+          llmInput({ model: "gpt-5", protocol: "openai-responses" }),
           Stream.make({ type: "finish", reason: "content-filter" }),
         )
         .pipe(Stream.runDrain),
@@ -783,13 +733,7 @@ describe("NeMo Relay observability", () => {
     const relay = makeForTesting(driver(), {
       llmUnaryCompleted: (input) => Effect.sync(() => completed.push(input)),
     })
-    const input = {
-      role: "agent_generation" as const,
-      agentRuntime: "v1" as const,
-      runtime: "ai_sdk" as const,
-      provider: "openai",
-      model: "gpt-5",
-    }
+    const input = llmInput({ role: "agent_generation", agentRuntime: "v1", runtime: "ai_sdk", model: "gpt-5" })
     const value = { object: { name: "generated" }, finish: "stop", input: 7, output: 3 }
 
     await expect(
@@ -871,7 +815,7 @@ describe("NeMo Relay observability", () => {
       llmStreamCompleted: (input) => Effect.sync(() => completed.push(input)),
     })
     const observed = relay.observeLlmStream(
-      { role: "primary", agentRuntime: "v1", runtime: "native", provider: "openai", model: "gpt" },
+      llmInput({ agentRuntime: "v1" }),
       Stream.fromIterable([{ type: "text-delta" }, { type: "finish", reason: "stop", usage: { inputTokens: 1 } }]),
     )
 
@@ -1091,14 +1035,7 @@ describe("NeMo Relay observability", () => {
         { runtime: "v2" },
         relay
           .observeLlmStream(
-            {
-              role: "primary",
-              agentRuntime: "v2",
-              runtime: "native",
-              provider: "nvidia",
-              model: "openai/gpt-oss-20b",
-              protocol: "openai-chat",
-            },
+            llmInput({ provider: "nvidia", model: "openai/gpt-oss-20b", protocol: "openai-chat" }),
             source,
           )
           .pipe(Stream.runDrain),
@@ -1193,14 +1130,7 @@ describe("NeMo Relay observability", () => {
     await Effect.runPromise(
       relay
         .observeLlmStream(
-          {
-            role: "primary",
-            agentRuntime: "v2",
-            runtime: "native",
-            provider: "nvidia",
-            model: "openai/gpt-oss-20b",
-            protocol: "openai-chat",
-          },
+          llmInput({ provider: "nvidia", model: "openai/gpt-oss-20b", protocol: "openai-chat" }),
           source,
         )
         .pipe(Stream.runDrain),
@@ -1294,14 +1224,7 @@ describe("NeMo Relay observability", () => {
                 Effect.gen(function* () {
                   yield* relay
                     .observeLlmStream(
-                      {
-                        role: "primary",
-                        agentRuntime: "v2",
-                        runtime: "native",
-                        provider: "openai",
-                        model: "gpt-5",
-                        protocol: "openai-responses",
-                      },
+                      llmInput({ model: "gpt-5", protocol: "openai-responses" }),
                       Stream.make({ type: "finish", reason: "stop" }),
                     )
                     .pipe(Stream.runDrain)
@@ -1421,13 +1344,7 @@ describe("NeMo Relay observability", () => {
     const stream = (model: string, blocked = false) =>
       relay
         .observeLlmStream(
-          {
-            role: "primary",
-            agentRuntime: "v2",
-            runtime: "native",
-            provider: "private-provider-name",
-            model,
-          },
+          llmInput({ provider: "private-provider-name", model }),
           blocked
             ? Stream.unwrap(
                 Effect.sync(firstStarted.resolve).pipe(
@@ -1753,10 +1670,7 @@ describe("NeMo Relay process lifecycle", () => {
     const runtime = fakeRuntime()
     const lifecycle = enabledLifecycle(runtime)
     const relay = await lifecycle.acquire()
-    relay.observeLlmStream(
-      { role: "primary", agentRuntime: "v1", runtime: "native", provider: "openai", model: "gpt" },
-      Stream.never,
-    )
+    relay.observeLlmStream(llmInput({ agentRuntime: "v1" }), Stream.never)
     relay.observeTurn({ role: "primary", runtime: "v1" }, Effect.never)
 
     expect(await lifecycle.shutdown(100)).toEqual({ drained: true, flushed: true, closed: true })

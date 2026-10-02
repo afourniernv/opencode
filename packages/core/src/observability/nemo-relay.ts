@@ -1,6 +1,6 @@
 import { Cause, Context, Effect, Exit, Layer, Stream } from "effect"
 import { RequestExecutor, type AttemptEvent, type AttemptOrdinal } from "@opencode-ai/llm/route"
-import type { LlmHandle, PropagationContext, ScopeHandle, ScopeStack, ToolHandle } from "nemo-relay-node"
+import type { LlmHandle, ScopeHandle, ScopeStack, ToolHandle } from "nemo-relay-node"
 import { makeGlobalNode } from "../effect/app-node"
 
 const ENABLE_ENV = "OPENCODE_NEMO_RELAY"
@@ -15,6 +15,14 @@ const LATENCY_MS_BUCKETS = [10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 10_0
 const RETRY_DELAY_MS_BUCKETS = [...LATENCY_MS_BUCKETS, 120_000, 600_000]
 const OPERATION_COUNT_BUCKETS = [0, 1, 2, 3, 5, 10, 20, 50, 100]
 const CONTEXT_UTILIZATION_BUCKETS = [0.25, 0.5, 0.75, 0.85, 0.9, 0.95, 1, 1.1]
+const TOKEN_FIELDS = [
+  ["input_total", "inputTotal"],
+  ["input_non_cached", "inputNonCached"],
+  ["input_cache_read", "inputCacheRead"],
+  ["input_cache_write", "inputCacheWrite"],
+  ["output_total", "outputTotal"],
+  ["output_reasoning", "outputReasoning"],
+] as const
 
 // Bun replaces this identifier with a literal platform package while
 // compiling standalone OpenCode binaries. In source/Node execution it remains
@@ -48,76 +56,38 @@ type RelayMetrics = {
 }
 
 type RelayHandle = ScopeHandle | LlmHandle | ToolHandle
+type RelayScopeType = Parameters<typeof import("nemo-relay-node").pushScope>[1]
 
 type RelayScopeContext<Handle extends RelayHandle = RelayHandle> = {
   readonly stack: ScopeStack
   readonly handle: Handle
 }
 
-type RelayTracing = {
+type RelayTracing = Omit<
+  Pick<
+    typeof import("nemo-relay-node"),
+    | "createScopeStack"
+    | "capturePropagationContext"
+    | "createScopeStackFromPropagation"
+    | "withScopeStack"
+    | "pushScope"
+    | "popScope"
+    | "llmCall"
+    | "llmCallEnd"
+    | "toolCall"
+    | "toolCallEnd"
+    | "event"
+  >,
+  "withScopeStack"
+> & {
   readonly ScopeType: {
-    readonly Agent: unknown
-    readonly Function?: unknown
-    readonly Llm: unknown
-    readonly Tool: unknown
-    readonly Guardrail?: unknown
+    readonly Agent: RelayScopeType
+    readonly Function?: RelayScopeType
+    readonly Llm: RelayScopeType
+    readonly Tool: RelayScopeType
+    readonly Guardrail?: RelayScopeType
   }
-  readonly createScopeStack: () => ScopeStack
-  readonly capturePropagationContext: () => PropagationContext
-  readonly createScopeStackFromPropagation: (context: PropagationContext) => ScopeStack
   readonly withScopeStack: <A>(stack: ScopeStack, callback: () => A) => A
-  readonly pushScope: (
-    name: string,
-    scopeType: unknown,
-    handle?: ScopeHandle | null,
-    attributes?: number | null,
-    data?: unknown,
-    metadata?: unknown,
-    input?: unknown,
-    timestamp?: number | null,
-  ) => ScopeHandle
-  readonly popScope: (handle: ScopeHandle, output?: unknown, timestamp?: number | null, metadata?: unknown) => void
-  readonly llmCall: (
-    name: string,
-    request: unknown,
-    handle?: ScopeHandle | null,
-    attributes?: number | null,
-    data?: unknown,
-    metadata?: unknown,
-    modelName?: string | null,
-    timestamp?: number | null,
-  ) => LlmHandle
-  readonly llmCallEnd: (
-    handle: LlmHandle,
-    response: unknown,
-    data?: unknown,
-    metadata?: unknown,
-    timestamp?: number | null,
-  ) => void
-  readonly toolCall: (
-    name: string,
-    args: unknown,
-    handle?: ScopeHandle | null,
-    attributes?: number | null,
-    data?: unknown,
-    metadata?: unknown,
-    toolCallId?: string | null,
-    timestamp?: number | null,
-  ) => ToolHandle
-  readonly toolCallEnd: (
-    handle: ToolHandle,
-    result: { readonly result: unknown },
-    data?: unknown,
-    metadata?: unknown,
-    timestamp?: number | null,
-  ) => void
-  readonly event: (
-    name: string,
-    handle?: ScopeHandle | null,
-    data?: unknown,
-    metadata?: unknown,
-    timestamp?: number | null,
-  ) => void
 }
 
 type RelayRuntime = RelayMetrics & Partial<RelayTracing>
@@ -1357,6 +1327,24 @@ function retryable(value: boolean | undefined) {
   return value === undefined ? "unknown" : value ? "true" : "false"
 }
 
+function llmRoute(input: Pick<LlmStreamStarted, "provider" | "model" | "protocol">) {
+  return {
+    provider_family: providerFamily(input.provider),
+    model_family: modelFamily(input.model),
+    operation: llmOperation(input.protocol),
+  }
+}
+
+function llmAttributes(input: LlmStreamStarted, mode: LlmMode) {
+  return {
+    call_role: input.role,
+    agent_runtime: input.agentRuntime,
+    llm_runtime: input.runtime,
+    llm_mode: mode,
+    ...llmRoute(input),
+  }
+}
+
 function usage(value: UsageLike | undefined): TokenUsage | undefined {
   if (!value) return undefined
   const result = {
@@ -1401,25 +1389,10 @@ function classifyExit<A, E>(
   return Cause.hasInterruptsOnly(exit.cause) ? "cancelled" : "failed"
 }
 
-function classifyPermissionWait<A, E>(
+function classifyWait<A, E, Resolution extends PermissionResolution | QuestionResolution>(
   exit: Exit.Exit<A, E>,
-  classify?: (exit: Exit.Exit<A, E>) => PermissionResolution | undefined,
-): PermissionResolution {
-  if (classify) {
-    try {
-      const resolution = classify(exit)
-      if (resolution) return resolution
-    } catch {
-      // A telemetry classifier must never change host execution.
-    }
-  }
-  return Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause) ? "cancelled" : "unknown"
-}
-
-function classifyQuestionWait<A, E>(
-  exit: Exit.Exit<A, E>,
-  classify?: (exit: Exit.Exit<A, E>) => QuestionResolution | undefined,
-): QuestionResolution {
+  classify?: (exit: Exit.Exit<A, E>) => Resolution | undefined,
+): Resolution | "cancelled" | "unknown" {
   if (classify) {
     try {
       const resolution = classify(exit)
@@ -1475,112 +1448,110 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
     return trace.createScopeStackFromPropagation({ ...propagation, parentUuid: parent.handle.uuid })
   }
 
-  const beginRunTrace = (input: RunStarted, parent: RelayScopeContext | undefined) => {
+  const traceMetadata = (metadata: MetricAttributes = {}) => ({
+    "opencode.trace.schema_version": SCHEMA_VERSION,
+    ...metadata,
+  })
+
+  const traceValue = <A>(observe: (active: RelayTracing) => A) => {
     if (!trace) return undefined
     try {
-      const stack = branchStack(parent)
-      if (!stack) return undefined
-      const metadata = {
-        "opencode.trace.schema_version": SCHEMA_VERSION,
-        "opencode.runtime": input.runtime,
-      }
-      const handle = trace.withScopeStack(stack, () =>
-        trace.pushScope(
-          "opencode.agent.run",
-          trace.ScopeType.Agent,
-          null,
-          null,
-          null,
-          metadata,
-          { runtime: input.runtime },
-          wallMicros(),
-        ),
-      )
-      return { stack, handle } satisfies RelayScopeContext<ScopeHandle>
+      return observe(trace)
     } catch {
       return undefined
     }
   }
 
-  const endRunTrace = (scope: RelayScopeContext<ScopeHandle> | undefined, input: RunCompleted) =>
+  const traceEffect = (observe: (active: RelayTracing) => void) =>
     Effect.sync(() => {
-      if (!trace || !scope) return
+      if (!trace) return
       try {
-        trace.withScopeStack(scope.stack, () =>
-          trace.popScope(scope.handle, { outcome: input.outcome, operations: input.operations }, wallMicros(), {
-            "opencode.trace.schema_version": SCHEMA_VERSION,
-            "opencode.outcome": input.outcome,
-            "opencode.duration_bucket": durationBucket(input.durationMs),
-            "otel.status_code": otelStatus(input.outcome),
-            ...(traceErrorType(input.outcome) ? { "error.type": traceErrorType(input.outcome) } : {}),
-          }),
-        )
+        observe(trace)
       } catch {
         // Tracing is observation-only and must never alter host execution.
       }
     })
 
-  const beginTurnTrace = (input: TurnStarted, parent: RelayScopeContext | undefined) => {
-    if (!trace) return undefined
-    try {
+  const beginScopeTrace = (
+    name: string,
+    scopeType: RelayScopeType | undefined,
+    parent: RelayScopeContext | undefined,
+    metadata: MetricAttributes,
+    input: MetricAttributes,
+  ) =>
+    traceValue((active) => {
+      if (scopeType === undefined) return undefined
       const stack = branchStack(parent)
       if (!stack) return undefined
-      const metadata = {
-        "opencode.trace.schema_version": SCHEMA_VERSION,
-        "opencode.runtime": input.runtime,
-        "opencode.call_role": input.role,
-      }
-      const handle = trace.withScopeStack(stack, () =>
-        trace.pushScope(
-          "opencode.agent.turn",
-          trace.ScopeType.Agent,
-          null,
-          null,
-          null,
-          metadata,
-          { runtime: input.runtime, call_role: input.role },
-          wallMicros(),
-        ),
+      const handle = active.withScopeStack(stack, () =>
+        active.pushScope(name, scopeType, null, null, null, traceMetadata(metadata), input, wallMicros()),
       )
       return { stack, handle } satisfies RelayScopeContext<ScopeHandle>
-    } catch {
-      return undefined
-    }
-  }
+    })
+
+  const endScopeTrace = (
+    scope: RelayScopeContext<ScopeHandle> | undefined,
+    output: unknown,
+    metadata: MetricAttributes,
+  ) =>
+    traceEffect((active) => {
+      if (!scope) return
+      active.withScopeStack(scope.stack, () =>
+        active.popScope(scope.handle, output, wallMicros(), traceMetadata(metadata)),
+      )
+    })
+
+  const beginRunTrace = (input: RunStarted, parent: RelayScopeContext | undefined) =>
+    beginScopeTrace(
+      "opencode.agent.run",
+      trace?.ScopeType.Agent,
+      parent,
+      { "opencode.runtime": input.runtime },
+      { runtime: input.runtime },
+    )
+
+  const endRunTrace = (scope: RelayScopeContext<ScopeHandle> | undefined, input: RunCompleted) =>
+    endScopeTrace(
+      scope,
+      { outcome: input.outcome, operations: input.operations },
+      {
+        "opencode.outcome": input.outcome,
+        "opencode.duration_bucket": durationBucket(input.durationMs),
+        "otel.status_code": otelStatus(input.outcome),
+        ...(traceErrorType(input.outcome) ? { "error.type": traceErrorType(input.outcome) } : {}),
+      },
+    )
+
+  const beginTurnTrace = (input: TurnStarted, parent: RelayScopeContext | undefined) =>
+    beginScopeTrace(
+      "opencode.agent.turn",
+      trace?.ScopeType.Agent,
+      parent,
+      { "opencode.runtime": input.runtime, "opencode.call_role": input.role },
+      { runtime: input.runtime, call_role: input.role },
+    )
 
   const endTurnTrace = (
     scope: RelayScopeContext<ScopeHandle> | undefined,
     input: TurnStarted & { readonly outcome: TurnOutcome; readonly durationMs: number },
   ) =>
-    Effect.sync(() => {
-      if (!trace || !scope) return
-      try {
-        trace.withScopeStack(scope.stack, () =>
-          trace.popScope(scope.handle, { outcome: input.outcome }, wallMicros(), {
-            "opencode.trace.schema_version": SCHEMA_VERSION,
-            "opencode.outcome": input.outcome,
-            "opencode.duration_bucket": durationBucket(input.durationMs),
-            "otel.status_code": otelStatus(input.outcome),
-            ...(traceErrorType(input.outcome) ? { "error.type": traceErrorType(input.outcome) } : {}),
-          }),
-        )
-      } catch {
-        // Tracing is observation-only and must never alter host execution.
-      }
-    })
+    endScopeTrace(
+      scope,
+      { outcome: input.outcome },
+      {
+        "opencode.outcome": input.outcome,
+        "opencode.duration_bucket": durationBucket(input.durationMs),
+        "otel.status_code": otelStatus(input.outcome),
+        ...(traceErrorType(input.outcome) ? { "error.type": traceErrorType(input.outcome) } : {}),
+      },
+    )
 
-  const beginLlmTrace = (input: LlmStreamStarted, parent: RelayScopeContext | undefined, mode: LlmMode) => {
-    if (!trace) return undefined
-    try {
+  const beginLlmTrace = (input: LlmStreamStarted, parent: RelayScopeContext | undefined, mode: LlmMode) =>
+    traceValue((active) => {
       const stack = branchStack(parent)
       if (!stack) return undefined
-      const route = {
-        provider_family: providerFamily(input.provider),
-        model_family: modelFamily(input.model),
-        operation: llmOperation(input.protocol),
-      }
-      const metadata = {
-        "opencode.trace.schema_version": SCHEMA_VERSION,
+      const route = llmRoute(input)
+      const metadata = traceMetadata({
         "opencode.call_role": input.role,
         "opencode.agent_runtime": input.agentRuntime,
         "opencode.llm_runtime": input.runtime,
@@ -1588,9 +1559,9 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
         "opencode.provider_family": route.provider_family,
         "opencode.model_family": route.model_family,
         "opencode.llm_operation": route.operation,
-      }
-      const handle = trace.withScopeStack(stack, () =>
-        trace.llmCall(
+      })
+      const handle = active.withScopeStack(stack, () =>
+        active.llmCall(
           "opencode.llm",
           {
             headers: {},
@@ -1611,91 +1582,81 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
         ),
       )
       return { stack, handle } satisfies RelayScopeContext<LlmHandle>
-    } catch {
-      return undefined
-    }
-  }
+    })
 
   const endLlmTrace = (
     scope: RelayScopeContext<LlmHandle> | undefined,
     input: LlmStreamCompleted | LlmUnaryCompleted,
     mode: LlmMode,
   ) =>
-    Effect.sync(() => {
-      if (!trace || !scope) return
-      try {
-        const inputTokens = integer(input.tokens?.inputTotal)
-        const outputTokens = integer(input.tokens?.outputTotal)
-        const totalTokens =
-          inputTokens === undefined && outputTokens === undefined ? undefined : (inputTokens ?? 0) + (outputTokens ?? 0)
-        const traceUsage = {
-          ...(inputTokens === undefined ? {} : { input_tokens: inputTokens }),
-          ...(outputTokens === undefined ? {} : { output_tokens: outputTokens }),
-          ...(totalTokens === undefined ? {} : { total_tokens: totalTokens }),
-          ...(integer(input.tokens?.inputCacheRead) === undefined
-            ? {}
-            : { cached_tokens: integer(input.tokens?.inputCacheRead) }),
-          ...(integer(input.tokens?.inputCacheWrite) === undefined
-            ? {}
-            : { cache_write_tokens: integer(input.tokens?.inputCacheWrite) }),
-          ...(integer(input.tokens?.inputNonCached) === undefined
-            ? {}
-            : { uncached_input_tokens: integer(input.tokens?.inputNonCached) }),
-        }
-        trace.withScopeStack(scope.stack, () =>
-          trace.llmCallEnd(
-            scope.handle,
-            {
-              outcome: input.outcome,
-              finish_reason: finishReason(input.finish),
-              model: modelFamily(input.model),
-              usage: traceUsage,
-            },
-            null,
-            {
-              "opencode.trace.schema_version": SCHEMA_VERSION,
-              "opencode.llm_mode": mode,
-              "opencode.outcome": input.outcome,
-              "opencode.finish_reason": finishReason(input.finish),
-              "opencode.duration_bucket": durationBucket(input.durationMs),
-              "otel.status_code": otelStatus(input.outcome),
-              ...(traceErrorType(input.outcome) ? { "error.type": traceErrorType(input.outcome) } : {}),
-              ...("firstOutput" in input && input.firstOutput
-                ? {
-                    "opencode.first_output_kind": input.firstOutput.kind,
-                    "opencode.first_output_latency_bucket": toolDurationBucket(input.firstOutput.latencyMs),
-                  }
-                : {}),
-              ...("providerError" in input && input.providerError
-                ? {
-                    "opencode.provider_error_classification": providerErrorClassification(
-                      input.providerError.classification,
-                    ),
-                    "opencode.provider_error_retryable": retryable(input.providerError.retryable),
-                  }
-                : {}),
-            },
-            wallMicros(),
-          ),
-        )
-      } catch {
-        // Tracing is observation-only and must never alter host execution.
+    traceEffect((active) => {
+      if (!scope) return
+      const inputTokens = integer(input.tokens?.inputTotal)
+      const outputTokens = integer(input.tokens?.outputTotal)
+      const totalTokens =
+        inputTokens === undefined && outputTokens === undefined ? undefined : (inputTokens ?? 0) + (outputTokens ?? 0)
+      const traceUsage = {
+        ...(inputTokens === undefined ? {} : { input_tokens: inputTokens }),
+        ...(outputTokens === undefined ? {} : { output_tokens: outputTokens }),
+        ...(totalTokens === undefined ? {} : { total_tokens: totalTokens }),
+        ...(integer(input.tokens?.inputCacheRead) === undefined
+          ? {}
+          : { cached_tokens: integer(input.tokens?.inputCacheRead) }),
+        ...(integer(input.tokens?.inputCacheWrite) === undefined
+          ? {}
+          : { cache_write_tokens: integer(input.tokens?.inputCacheWrite) }),
+        ...(integer(input.tokens?.inputNonCached) === undefined
+          ? {}
+          : { uncached_input_tokens: integer(input.tokens?.inputNonCached) }),
       }
+      active.withScopeStack(scope.stack, () =>
+        active.llmCallEnd(
+          scope.handle,
+          {
+            outcome: input.outcome,
+            finish_reason: finishReason(input.finish),
+            model: modelFamily(input.model),
+            usage: traceUsage,
+          },
+          null,
+          traceMetadata({
+            "opencode.llm_mode": mode,
+            "opencode.outcome": input.outcome,
+            "opencode.finish_reason": finishReason(input.finish),
+            "opencode.duration_bucket": durationBucket(input.durationMs),
+            "otel.status_code": otelStatus(input.outcome),
+            ...(traceErrorType(input.outcome) ? { "error.type": traceErrorType(input.outcome) } : {}),
+            ...("firstOutput" in input && input.firstOutput
+              ? {
+                  "opencode.first_output_kind": input.firstOutput.kind,
+                  "opencode.first_output_latency_bucket": toolDurationBucket(input.firstOutput.latencyMs),
+                }
+              : {}),
+            ...("providerError" in input && input.providerError
+              ? {
+                  "opencode.provider_error_classification": providerErrorClassification(
+                    input.providerError.classification,
+                  ),
+                  "opencode.provider_error_retryable": retryable(input.providerError.retryable),
+                }
+              : {}),
+          }),
+          wallMicros(),
+        ),
+      )
     })
 
-  const beginToolTrace = (input: ToolStarted, parent: RelayScopeContext | undefined) => {
-    if (!trace) return undefined
-    try {
+  const beginToolTrace = (input: ToolStarted, parent: RelayScopeContext | undefined) =>
+    traceValue((active) => {
       const stack = branchStack(parent)
       if (!stack) return undefined
       const category = input.category ?? toolCategory(input.name)
-      const metadata = {
-        "opencode.trace.schema_version": SCHEMA_VERSION,
+      const metadata = traceMetadata({
         "opencode.tool_category": category,
         "opencode.tool_execution": input.execution,
-      }
-      const handle = trace.withScopeStack(stack, () =>
-        trace.toolCall(
+      })
+      const handle = active.withScopeStack(stack, () =>
+        active.toolCall(
           "opencode.tool",
           { category, execution: input.execution },
           null,
@@ -1707,176 +1668,119 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
         ),
       )
       return { stack, handle } satisfies RelayScopeContext<ToolHandle>
-    } catch {
-      return undefined
-    }
-  }
+    })
 
   const endToolTrace = (scope: RelayScopeContext<ToolHandle> | undefined, input: ToolCompleted) =>
-    Effect.sync(() => {
-      if (!trace || !scope) return
-      try {
-        const category = input.category ?? toolCategory(input.name)
-        const terminalResult = input.execution === "local" && category === "terminal" ? input.terminalResult : undefined
-        trace.withScopeStack(scope.stack, () =>
-          trace.toolCallEnd(
-            scope.handle,
-            {
-              result: {
-                outcome: input.outcome,
-                ...(terminalResult === undefined ? {} : { terminal_result_family: terminalResult }),
-              },
+    traceEffect((active) => {
+      if (!scope) return
+      const category = input.category ?? toolCategory(input.name)
+      const terminalResult = input.execution === "local" && category === "terminal" ? input.terminalResult : undefined
+      active.withScopeStack(scope.stack, () =>
+        active.toolCallEnd(
+          scope.handle,
+          {
+            result: {
+              outcome: input.outcome,
+              ...(terminalResult === undefined ? {} : { terminal_result_family: terminalResult }),
             },
-            null,
-            {
-              "opencode.trace.schema_version": SCHEMA_VERSION,
-              "opencode.outcome": input.outcome,
-              ...(terminalResult === undefined ? {} : { "opencode.terminal_result_family": terminalResult }),
-              "otel.status_code": otelStatus(input.outcome),
-              ...(traceErrorType(input.outcome) ? { "error.type": traceErrorType(input.outcome) } : {}),
-              ...(input.durationMs === undefined
-                ? {}
-                : { "opencode.duration_bucket": toolDurationBucket(input.durationMs) }),
-            },
-            wallMicros(),
-          ),
-        )
-      } catch {
-        // Tracing is observation-only and must never alter host execution.
-      }
+          },
+          null,
+          traceMetadata({
+            "opencode.outcome": input.outcome,
+            ...(terminalResult === undefined ? {} : { "opencode.terminal_result_family": terminalResult }),
+            "otel.status_code": otelStatus(input.outcome),
+            ...(traceErrorType(input.outcome) ? { "error.type": traceErrorType(input.outcome) } : {}),
+            ...(input.durationMs === undefined
+              ? {}
+              : { "opencode.duration_bucket": toolDurationBucket(input.durationMs) }),
+          }),
+          wallMicros(),
+        ),
+      )
     })
 
   const permissionEvaluationTrace = (parent: RelayScopeContext | undefined, input: PermissionEvaluation) =>
-    Effect.sync(() => {
-      if (!trace || !parent || trace.ScopeType.Guardrail === undefined) return
-      try {
-        const stack = branchStack(parent)
-        if (!stack) return
-        const started = wallMicros()
-        const handle = trace.withScopeStack(stack, () =>
-          trace.pushScope(
-            "opencode.permission.evaluated",
-            trace.ScopeType.Guardrail,
-            null,
-            null,
-            null,
-            {
-              "opencode.trace.schema_version": SCHEMA_VERSION,
-              "opencode.runtime": input.runtime,
-              "opencode.permission_family": input.family,
-            },
-            { runtime: input.runtime, permission_family: input.family },
-            started,
-          ),
-        )
-        trace.withScopeStack(stack, () =>
-          trace.popScope(handle, { effect: input.effect }, wallMicros(), {
-            "opencode.trace.schema_version": SCHEMA_VERSION,
+    traceEffect((active) => {
+      const scopeType = active.ScopeType.Guardrail
+      if (!parent || scopeType === undefined) return
+      const stack = branchStack(parent)
+      if (!stack) return
+      const started = wallMicros()
+      const handle = active.withScopeStack(stack, () =>
+        active.pushScope(
+          "opencode.permission.evaluated",
+          scopeType,
+          null,
+          null,
+          null,
+          traceMetadata({
+            "opencode.runtime": input.runtime,
+            "opencode.permission_family": input.family,
+          }),
+          { runtime: input.runtime, permission_family: input.family },
+          started,
+        ),
+      )
+      active.withScopeStack(stack, () =>
+        active.popScope(
+          handle,
+          { effect: input.effect },
+          wallMicros(),
+          traceMetadata({
             "opencode.permission_effect": input.effect,
             "otel.status_code": input.effect === "allow" ? "OK" : input.effect === "deny" ? "ERROR" : "UNSET",
             ...(input.effect === "deny" ? { "error.type": "opencode.permission.denied" } : {}),
           }),
-        )
-      } catch {
-        // Tracing is observation-only and must never alter host execution.
-      }
-    })
-
-  const beginPermissionWaitTrace = (input: PermissionWaitStarted, parent: RelayScopeContext | undefined) => {
-    if (!trace || trace.ScopeType.Guardrail === undefined) return undefined
-    try {
-      const stack = branchStack(parent)
-      if (!stack) return undefined
-      const metadata = {
-        "opencode.trace.schema_version": SCHEMA_VERSION,
-        "opencode.runtime": input.runtime,
-        "opencode.permission_family": input.family,
-      }
-      const handle = trace.withScopeStack(stack, () =>
-        trace.pushScope(
-          "opencode.permission.wait",
-          trace.ScopeType.Guardrail,
-          null,
-          null,
-          null,
-          metadata,
-          { runtime: input.runtime, permission_family: input.family },
-          wallMicros(),
         ),
       )
-      return { stack, handle } satisfies RelayScopeContext<ScopeHandle>
-    } catch {
-      return undefined
-    }
-  }
+    })
+
+  const beginPermissionWaitTrace = (input: PermissionWaitStarted, parent: RelayScopeContext | undefined) =>
+    beginScopeTrace(
+      "opencode.permission.wait",
+      trace?.ScopeType.Guardrail,
+      parent,
+      { "opencode.runtime": input.runtime, "opencode.permission_family": input.family },
+      { runtime: input.runtime, permission_family: input.family },
+    )
 
   const endPermissionWaitTrace = (scope: RelayScopeContext<ScopeHandle> | undefined, input: PermissionWaitCompleted) =>
-    Effect.sync(() => {
-      if (!trace || !scope) return
-      try {
-        trace.withScopeStack(scope.stack, () =>
-          trace.popScope(scope.handle, { resolution: input.resolution }, wallMicros(), {
-            "opencode.trace.schema_version": SCHEMA_VERSION,
-            "opencode.permission_resolution": input.resolution,
-            "opencode.duration_bucket": toolDurationBucket(input.durationMs),
-            "otel.status_code": ["reject", "corrected"].includes(input.resolution)
-              ? "ERROR"
-              : ["once", "always"].includes(input.resolution)
-                ? "OK"
-                : "UNSET",
-            ...(["reject", "corrected"].includes(input.resolution)
-              ? { "error.type": `opencode.permission.${input.resolution}` }
-              : {}),
-          }),
-        )
-      } catch {
-        // Tracing is observation-only and must never alter host execution.
-      }
-    })
+    endScopeTrace(
+      scope,
+      { resolution: input.resolution },
+      {
+        "opencode.permission_resolution": input.resolution,
+        "opencode.duration_bucket": toolDurationBucket(input.durationMs),
+        "otel.status_code": ["reject", "corrected"].includes(input.resolution)
+          ? "ERROR"
+          : ["once", "always"].includes(input.resolution)
+            ? "OK"
+            : "UNSET",
+        ...(["reject", "corrected"].includes(input.resolution)
+          ? { "error.type": `opencode.permission.${input.resolution}` }
+          : {}),
+      },
+    )
 
-  const beginQuestionWaitTrace = (input: QuestionWaitStarted, parent: RelayScopeContext | undefined) => {
-    if (!trace || trace.ScopeType.Function === undefined) return undefined
-    try {
-      const stack = branchStack(parent)
-      if (!stack) return undefined
-      const metadata = {
-        "opencode.trace.schema_version": SCHEMA_VERSION,
-        "opencode.runtime": input.runtime,
-      }
-      const handle = trace.withScopeStack(stack, () =>
-        trace.pushScope(
-          "opencode.question.wait",
-          trace.ScopeType.Function,
-          null,
-          null,
-          null,
-          metadata,
-          { runtime: input.runtime },
-          wallMicros(),
-        ),
-      )
-      return { stack, handle } satisfies RelayScopeContext<ScopeHandle>
-    } catch {
-      return undefined
-    }
-  }
+  const beginQuestionWaitTrace = (input: QuestionWaitStarted, parent: RelayScopeContext | undefined) =>
+    beginScopeTrace(
+      "opencode.question.wait",
+      trace?.ScopeType.Function,
+      parent,
+      { "opencode.runtime": input.runtime },
+      { runtime: input.runtime },
+    )
 
   const endQuestionWaitTrace = (scope: RelayScopeContext<ScopeHandle> | undefined, input: QuestionWaitCompleted) =>
-    Effect.sync(() => {
-      if (!trace || !scope) return
-      try {
-        trace.withScopeStack(scope.stack, () =>
-          trace.popScope(scope.handle, { resolution: input.resolution }, wallMicros(), {
-            "opencode.trace.schema_version": SCHEMA_VERSION,
-            "opencode.question_resolution": input.resolution,
-            "opencode.duration_bucket": toolDurationBucket(input.durationMs),
-            "otel.status_code": input.resolution === "answered" ? "OK" : "UNSET",
-          }),
-        )
-      } catch {
-        // Tracing is observation-only and must never alter host execution.
-      }
-    })
+    endScopeTrace(
+      scope,
+      { resolution: input.resolution },
+      {
+        "opencode.question_resolution": input.resolution,
+        "opencode.duration_bucket": toolDurationBucket(input.durationMs),
+        "otel.status_code": input.resolution === "answered" ? "OK" : "UNSET",
+      },
+    )
 
   const retryTrace = (
     scope: RelayScopeContext | undefined,
@@ -1888,29 +1792,25 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
       readonly errorKind?: HostRetryErrorKind
     },
   ) =>
-    Effect.sync(() => {
-      if (!trace || !scope) return
+    traceEffect((active) => {
+      if (!scope) return
       const handle = scope.handle
       if (!isScopeEventParent(handle)) return
-      try {
-        trace.withScopeStack(scope.stack, () =>
-          trace.event(
-            "opencode.llm.host_retry.scheduled",
-            handle,
-            {
-              runtime: input.runtime,
-              attempt: input.attempt <= 1 ? "first" : input.attempt === 2 ? "second" : "third_or_later",
-              delay_source: input.delaySource ?? "unknown",
-              error_kind: input.errorKind ?? "unknown",
-              ...(input.delayMs === undefined ? {} : { delay_bucket: toolDurationBucket(input.delayMs) }),
-            },
-            { "opencode.trace.schema_version": SCHEMA_VERSION },
-            wallMicros(),
-          ),
-        )
-      } catch {
-        // Tracing is observation-only and must never alter host execution.
-      }
+      active.withScopeStack(scope.stack, () =>
+        active.event(
+          "opencode.llm.host_retry.scheduled",
+          handle,
+          {
+            runtime: input.runtime,
+            attempt: input.attempt <= 1 ? "first" : input.attempt === 2 ? "second" : "third_or_later",
+            delay_source: input.delaySource ?? "unknown",
+            error_kind: input.errorKind ?? "unknown",
+            ...(input.delayMs === undefined ? {} : { delay_bucket: toolDurationBucket(input.delayMs) }),
+          },
+          traceMetadata(),
+          wallMicros(),
+        ),
+      )
     })
 
   type ProviderAttemptTraceEntry = {
@@ -1924,31 +1824,26 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
 
   type ProviderAttemptTraceState = Map<AttemptOrdinal, ProviderAttemptTraceEntry>
 
-  const beginProviderAttemptTrace = (parent: RelayScopeContext | undefined, attempt: AttemptOrdinal) => {
-    if (!trace || !parent || trace.ScopeType.Function === undefined) return undefined
-    try {
+  const beginProviderAttemptTrace = (parent: RelayScopeContext | undefined, attempt: AttemptOrdinal) =>
+    traceValue((active) => {
+      const scopeType = active.ScopeType.Function
+      if (!parent || scopeType === undefined) return undefined
       const stack = branchStack(parent)
       if (!stack) return undefined
-      const handle = trace.withScopeStack(stack, () =>
-        trace.pushScope(
+      const handle = active.withScopeStack(stack, () =>
+        active.pushScope(
           "opencode.llm.provider_attempt",
-          trace.ScopeType.Function,
+          scopeType,
           null,
           null,
           null,
-          {
-            "opencode.trace.schema_version": SCHEMA_VERSION,
-            "opencode.provider_attempt": attempt,
-          },
+          traceMetadata({ "opencode.provider_attempt": attempt }),
           { attempt },
           wallMicros(),
         ),
       )
       return { stack, handle } satisfies RelayScopeContext<ScopeHandle>
-    } catch {
-      return undefined
-    }
-  }
+    })
 
   const endProviderAttemptTrace = (
     scope: RelayScopeContext<ScopeHandle>,
@@ -1969,8 +1864,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
           will_retry: event.willRetry ? "true" : "false",
         },
         timestamp,
-        {
-          "opencode.trace.schema_version": SCHEMA_VERSION,
+        traceMetadata({
           "opencode.outcome": event.outcome,
           "opencode.status_family": event.statusFamily,
           "opencode.error_kind": errorKind,
@@ -1979,7 +1873,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
           "opencode.duration_bucket": toolDurationBucket(event.durationMs),
           "otel.status_code": event.outcome === "failed" ? "ERROR" : event.outcome === "success" ? "OK" : "UNSET",
           ...(event.outcome === "failed" ? { "error.type": `opencode.provider_attempt.${errorKind}` } : {}),
-        },
+        }),
       ),
     )
   }
@@ -2044,7 +1938,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
                 delay_source: event.delaySource,
                 delay_bucket: toolDurationBucket(event.delayMs),
               },
-              { "opencode.trace.schema_version": SCHEMA_VERSION },
+              traceMetadata(),
               timestamp,
             ),
           )
@@ -2142,6 +2036,12 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
     attributes: attributes(input),
   })
 
+  const tokenMeasurements = (tokens: TokenUsage | undefined, base: MetricAttributes) =>
+    TOKEN_FIELDS.flatMap(([kind, field]) => {
+      const count = integer(tokens?.[field])
+      return count === undefined ? [] : [counter("opencode.llm.tokens", count, { ...base, kind })]
+    })
+
   const runStarted = (input: RunStarted) =>
     hooks?.runStarted
       ? hooks.runStarted(input)
@@ -2178,18 +2078,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
 
   const llmStreamCompleted = (input: LlmStreamCompleted) => {
     if (hooks?.llmStreamCompleted) return hooks.llmStreamCompleted(input)
-    const route = {
-      provider_family: providerFamily(input.provider),
-      model_family: modelFamily(input.model),
-      operation: llmOperation(input.protocol),
-    }
-    const base = {
-      call_role: input.role,
-      agent_runtime: input.agentRuntime,
-      llm_runtime: input.runtime,
-      llm_mode: "stream",
-      ...route,
-    }
+    const base = llmAttributes(input, "stream")
     const measurements = [
       counter("opencode.llm.host_stream.count", 1, { ...base, outcome: input.outcome }),
       histogram("opencode.llm.host_stream.duration", input.durationMs, DURATION_MS_BUCKETS, {
@@ -2221,19 +2110,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
           retryable: retryable(input.providerError.retryable),
         }),
       )
-    const tokens = [
-      ["input_total", input.tokens?.inputTotal],
-      ["input_non_cached", input.tokens?.inputNonCached],
-      ["input_cache_read", input.tokens?.inputCacheRead],
-      ["input_cache_write", input.tokens?.inputCacheWrite],
-      ["output_total", input.tokens?.outputTotal],
-      ["output_reasoning", input.tokens?.outputReasoning],
-    ] as const
-    for (const [kind, value] of tokens) {
-      const count = integer(value)
-      if (count === undefined) continue
-      measurements.push(counter("opencode.llm.tokens", count, { ...base, kind }))
-    }
+    measurements.push(...tokenMeasurements(input.tokens, base))
     for (const utilization of input.inputContextUtilizations ?? []) {
       if (!Number.isFinite(utilization) || utilization <= 0) continue
       measurements.push(
@@ -2251,15 +2128,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
 
   const llmUnaryCompleted = (input: LlmUnaryCompleted) => {
     if (hooks?.llmUnaryCompleted) return hooks.llmUnaryCompleted(input)
-    const base = {
-      call_role: input.role,
-      agent_runtime: input.agentRuntime,
-      llm_runtime: input.runtime,
-      llm_mode: "unary",
-      provider_family: providerFamily(input.provider),
-      model_family: modelFamily(input.model),
-      operation: llmOperation(input.protocol),
-    }
+    const base = llmAttributes(input, "unary")
     const measurements = [
       counter("opencode.llm.unary.count", 1, { ...base, outcome: input.outcome }),
       histogram("opencode.llm.unary.duration", input.durationMs, DURATION_MS_BUCKETS, {
@@ -2275,19 +2144,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
           finish_reason: finishReason(input.finish),
         }),
       )
-    const tokens = [
-      ["input_total", input.tokens?.inputTotal],
-      ["input_non_cached", input.tokens?.inputNonCached],
-      ["input_cache_read", input.tokens?.inputCacheRead],
-      ["input_cache_write", input.tokens?.inputCacheWrite],
-      ["output_total", input.tokens?.outputTotal],
-      ["output_reasoning", input.tokens?.outputReasoning],
-    ] as const
-    for (const [kind, value] of tokens) {
-      const count = integer(value)
-      if (count === undefined) continue
-      measurements.push(counter("opencode.llm.tokens", count, { ...base, kind }))
-    }
+    measurements.push(...tokenMeasurements(input.tokens, base))
     const utilization = inputContextUtilization(input.tokens?.inputTotal, input.contextLimit)
     if (utilization !== undefined)
       measurements.push(
@@ -2440,15 +2297,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
   ) =>
     Effect.gen(function* () {
       const run = yield* CurrentRelayRun
-      const route = {
-        call_role: input.role,
-        agent_runtime: input.agentRuntime,
-        llm_runtime: input.runtime,
-        llm_mode: "stream",
-        provider_family: providerFamily(input.provider),
-        model_family: modelFamily(input.model),
-        operation: llmOperation(input.protocol),
-      }
+      const route = llmAttributes(input, "stream")
       let publication: Effect.Effect<void>
       if (event.type === "started") {
         if (run) run.providerAttempts++
@@ -2676,7 +2525,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
           Effect.onExit((exit) => {
             const completedInput = {
               ...input,
-              resolution: classifyPermissionWait(exit, classify),
+              resolution: classifyWait(exit, classify),
               durationMs: performance.now() - started,
             }
             return permissionWaitCompleted(completedInput).pipe(
@@ -2700,7 +2549,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
           Effect.onExit((exit) => {
             const completedInput = {
               ...input,
-              resolution: classifyQuestionWait(exit, classify),
+              resolution: classifyWait(exit, classify),
               durationMs: performance.now() - started,
             }
             return questionWaitCompleted(completedInput).pipe(
