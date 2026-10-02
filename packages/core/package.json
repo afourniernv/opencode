@@ -118,6 +118,7 @@
     "jsonc-parser": "3.3.1",
     "mime-types": "3.0.2",
     "minimatch": "10.2.5",
+    "nemo-relay-node": "0.9.3",
     "npm-package-arg": "13.0.2",
     "open": "11.0.4",
     "semver": "^7.6.3",
