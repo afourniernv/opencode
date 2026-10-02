@@ -10,6 +10,8 @@ import { Heap } from "@/cli/heap"
 import { AppRuntime } from "@/effect/app-runtime"
 import { Effect } from "effect"
 import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
+import { shutdown as shutdownNemoRelay } from "@opencode-ai/core/observability/nemo-relay"
+import { withTimeout } from "@/util/timeout"
 
 Heap.start()
 
@@ -70,10 +72,31 @@ export const rpc = {
     )
   },
   async shutdown() {
-    await InstanceRuntime.disposeAllInstances()
-    if (server) await server.stop(true)
-    process.off("unhandledRejection", onUnhandledRejection)
-    process.off("uncaughtException", onUncaughtException)
+    const failures: string[] = []
+    const deadline = Date.now() + 7_000
+    const attempt = async (name: string, maximum: number, action: () => Promise<unknown>) => {
+      const budget = Math.max(1, Math.min(maximum, deadline - Date.now()))
+      try {
+        await withTimeout(action(), budget, `${name} timed out`)
+      } catch {
+        failures.push(name)
+      }
+    }
+    try {
+      // Stop external admission before disposing the state requests can reach.
+      if (server) await attempt("server", 1_000, () => server!.stop(true))
+      await attempt("instances", 1_500, () => InstanceRuntime.disposeAllInstances())
+      // Dispose producer scopes before asking Relay to verify/retry teardown.
+      await attempt("runtime", 2_500, () => AppRuntime.dispose())
+      await attempt("relay", 2_000, async () => {
+        const result = await shutdownNemoRelay(Math.max(1, Math.min(2_000, deadline - Date.now())))
+        if (!result.drained || !result.flushed || !result.closed) throw new Error("Relay teardown incomplete")
+      })
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection)
+      process.off("uncaughtException", onUncaughtException)
+    }
+    return { ok: failures.length === 0, failures }
   },
 }
 

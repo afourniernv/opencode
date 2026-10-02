@@ -5,7 +5,7 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Provider } from "@/provider/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
-import { Cause, Context, Effect, Exit, Layer } from "effect"
+import { Context, Effect, Layer } from "effect"
 import * as Stream from "effect/Stream"
 import { streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
 import type { LLMEvent } from "@opencode-ai/llm"
@@ -90,57 +90,6 @@ const live: Layer.Layer<
       if (input.agent.name === "title") return "title"
       if (input.agent.name === "summary") return "summary"
       return "primary"
-    }
-
-    const observe = (
-      input: StreamInput,
-      runtime: NemoRelay.Runtime,
-      source: Stream.Stream<LLMEvent, unknown>,
-    ): Stream.Stream<LLMEvent, unknown> => {
-      if (relay.status.state !== "active") return source
-      return Stream.unwrap(
-        Effect.sync(() => {
-          const started = Date.now()
-          let outcome: NemoRelay.LlmOutcome = "unknown"
-          let finish: string | undefined
-          let usage: NemoRelay.TokenUsage | undefined
-          return source.pipe(
-            Stream.tap((event) =>
-              Effect.sync(() => {
-                if (event.type === "provider-error") outcome = "provider_error"
-                if (event.type !== "step-finish") return
-                outcome = "success"
-                finish = event.reason
-                usage = {
-                  inputTotal: event.usage?.inputTokens,
-                  inputNonCached: event.usage?.nonCachedInputTokens,
-                  inputCacheRead: event.usage?.cacheReadInputTokens,
-                  inputCacheWrite: event.usage?.cacheWriteInputTokens,
-                  outputTotal: event.usage?.outputTokens,
-                  outputReasoning: event.usage?.reasoningTokens,
-                }
-              }),
-            ),
-            Stream.onExit((exit) => {
-              if (Exit.isFailure(exit)) {
-                const cause = exit.cause
-                if (Cause.hasInterrupts(cause)) outcome = "cancelled"
-                else if (outcome !== "provider_error") outcome = "failed"
-              }
-              return relay.llmCompleted({
-                role: callRole(input),
-                runtime,
-                provider: input.model.providerID,
-                model: input.model.id,
-                outcome,
-                finish,
-                durationMs: Date.now() - started,
-                tokens: usage,
-              })
-            }),
-          )
-        }),
-      )
     }
 
     const run = Effect.fn("LLM.run")(function* (input: StreamRequest) {
@@ -427,7 +376,17 @@ const live: Layer.Layer<
 
             const result = yield* run({ ...input, abort: ctrl.signal })
 
-            if (result.type === "native") return observe(input, "native", result.stream)
+            if (result.type === "native")
+              return relay.observeLlmStream(
+                {
+                  role: callRole(input),
+                  agentRuntime: "v1",
+                  runtime: "native",
+                  provider: input.model.providerID,
+                  model: input.model.id,
+                },
+                result.stream,
+              )
 
             // Adapter seam: both runtimes expose the same LLMEvent stream. Native
             // already returns one; AI SDK streams are converted here.
@@ -438,7 +397,16 @@ const live: Layer.Layer<
               Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
               Stream.flatMap((events) => Stream.fromIterable(events)),
             )
-            return observe(input, result.runtime, source)
+            return relay.observeLlmStream(
+              {
+                role: callRole(input),
+                agentRuntime: "v1",
+                runtime: result.runtime,
+                provider: input.model.providerID,
+                model: input.model.id,
+              },
+              source,
+            )
           }),
         ),
       )

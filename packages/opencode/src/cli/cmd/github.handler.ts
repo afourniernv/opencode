@@ -33,6 +33,7 @@ import { setTimeout as sleep } from "node:timers/promises"
 import { Process } from "@/util/process"
 import { parseGitHubRemote } from "@/util/repository"
 import { Effect } from "effect"
+import { requestExit } from "../exit"
 import { extractResponseText, formatPromptTooLargeError } from "./github.shared"
 
 type GitHubAuthor = {
@@ -391,7 +392,7 @@ export const githubRun = Effect.fn("Cli.github.run")(function* (args: { event?: 
     const context = isMock ? (JSON.parse(args.event!) as Context) : github.context
     if (!SUPPORTED_EVENTS.includes(context.eventName as (typeof SUPPORTED_EVENTS)[number])) {
       core.setFailed(`Unsupported event type: ${context.eventName}`)
-      process.exit(1)
+      requestExit(1)
     }
 
     // Determine event category for routing
@@ -658,7 +659,7 @@ export const githubRun = Effect.fn("Cli.github.run")(function* (args: { event?: 
         await revokeAppToken()
       }
     }
-    process.exit(exitCode)
+    requestExit(exitCode)
 
     function normalizeModel() {
       const value = process.env["MODEL"]

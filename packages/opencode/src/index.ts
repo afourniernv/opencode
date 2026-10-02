@@ -30,6 +30,7 @@ import { errorMessage } from "./util/error"
 import { PluginCommand } from "./cli/cmd/plug"
 import { Heap } from "./cli/heap"
 import { shutdown as shutdownNemoRelay } from "@opencode-ai/core/observability/nemo-relay"
+import { ExitRequested, requestExit } from "./cli/exit"
 
 const args = hideBin(process.argv)
 
@@ -112,7 +113,7 @@ const cli = yargs(args)
       cli.showHelp(show)
     }
     if (err) throw err
-    process.exit(1)
+    requestExit(1)
   })
   .strict()
 
@@ -127,18 +128,29 @@ try {
     await cli.parse()
   }
 } catch (e) {
-  const formatted = FormatError(e)
-  if (formatted) UI.error(formatted)
-  if (formatted === undefined) {
-    UI.error("Unexpected error" + EOL)
-    process.stderr.write(errorMessage(e) + EOL)
+  if (e instanceof ExitRequested) {
+    process.exitCode = e.code
+  } else {
+    const formatted = FormatError(e)
+    if (formatted) UI.error(formatted)
+    if (formatted === undefined) {
+      UI.error("Unexpected error" + EOL)
+      process.stderr.write(errorMessage(e) + EOL)
+    }
+    process.exitCode = 1
   }
-  process.exitCode = 1
 } finally {
-  await shutdownNemoRelay()
-  // Some subprocesses don't react properly to SIGTERM and similar signals.
-  // Most notably, some docker-container-based MCP servers don't handle such signals unless
-  // run using `docker run --init`.
-  // Explicitly exit to avoid any hanging subprocesses.
-  process.exit()
+  try {
+    const result = await shutdownNemoRelay()
+    if (!result.drained || !result.flushed || !result.closed)
+      process.stderr.write("NeMo Relay shutdown was incomplete; telemetry may have been abandoned." + EOL)
+  } catch {
+    process.stderr.write("NeMo Relay shutdown failed; telemetry may have been abandoned." + EOL)
+  } finally {
+    // Some subprocesses don't react properly to SIGTERM and similar signals.
+    // Most notably, some docker-container-based MCP servers don't handle such signals unless
+    // run using `docker run --init`.
+    // Explicitly exit to avoid any hanging subprocesses.
+    process.exit()
+  }
 }

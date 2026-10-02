@@ -33,6 +33,7 @@ import { NamedError } from "@opencode-ai/core/util/error"
 import { SessionProcessor } from "./processor"
 import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
+import { Question } from "@/question"
 import { SessionStatus } from "./status"
 import { LLM } from "./llm"
 import { Shell } from "@opencode-ai/core/shell"
@@ -56,6 +57,7 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import * as NemoRelay from "@opencode-ai/core/observability/nemo-relay"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -140,6 +142,7 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const relay = yield* NemoRelay.Service
     const { db } = database
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
@@ -298,154 +301,188 @@ const layer = Layer.effect(
           time: { start: Date.now() },
         },
       })
-      const taskArgs = {
-        prompt: task.prompt,
-        description: task.description,
-        subagent_type: task.agent,
-        command: task.command,
-      }
-      yield* plugin.trigger(
-        "tool.execute.before",
-        { tool: TaskTool.id, sessionID, callID: part.id },
-        { args: taskArgs },
-      )
-
-      const taskAgent = yield* agents.get(task.agent)
-      if (!taskAgent) {
-        const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
-        const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
-        const error = new NamedError.Unknown({ message: `Agent not found: "${task.agent}".${hint}` })
-        yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
-        throw error
-      }
-
-      let error: Error | undefined
-      const taskAbort = new AbortController()
-      const result = yield* taskTool
-        .execute(taskArgs, {
-          agent: task.agent,
-          messageID: assistantMessage.id,
-          sessionID,
-          abort: taskAbort.signal,
-          callID: part.callID,
-          extra: { bypassAgentCheck: true, promptOps },
-          messages: msgs,
-          metadata: (val: { title?: string; metadata?: Record<string, any> }) =>
-            Effect.gen(function* () {
-              part = yield* sessions.updatePart({
-                ...part,
-                type: "tool",
-                state: { ...part.state, ...val },
-              } satisfies SessionV1.ToolPart)
-            }),
-          ask: (req: any) =>
-            permission
-              .ask({
-                ...req,
-                sessionID,
-                ruleset: Permission.merge(taskAgent.permission, session.permission ?? []),
-              })
-              .pipe(Effect.orDie),
-        })
-        .pipe(
-          Effect.catchCause((cause) => {
-            const defect = Cause.squash(cause)
-            error = defect instanceof Error ? defect : new Error(String(defect))
-            return Effect.logError("subtask execution failed", {
-              error,
-              agent: task.agent,
-              description: task.description,
+      return yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const relayTool = yield* relay.beginTool({ name: TaskTool.id, category: "delegation", execution: "local" })
+          let toolOutcome: NemoRelay.ToolOutcome = "success"
+          const outcomeFromCause = (cause: Cause.Cause<unknown>): NemoRelay.ToolOutcome => {
+            const blocked = cause.reasons.some((reason) => {
+              const value = Cause.isDieReason(reason)
+                ? reason.defect
+                : Cause.isFailReason(reason)
+                  ? reason.error
+                  : undefined
+              return (
+                value instanceof PermissionV1.DeniedError ||
+                value instanceof PermissionV1.RejectedError ||
+                value instanceof PermissionV1.CorrectedError ||
+                value instanceof Question.RejectedError
+              )
             })
-          }),
-          Effect.onInterrupt(() =>
+            return blocked ? "blocked" : Cause.hasInterruptsOnly(cause) ? "cancelled" : "failed"
+          }
+
+          return yield* restore(
             Effect.gen(function* () {
-              taskAbort.abort()
+              const taskArgs = {
+                prompt: task.prompt,
+                description: task.description,
+                subagent_type: task.agent,
+                command: task.command,
+              }
+              yield* plugin.trigger(
+                "tool.execute.before",
+                { tool: TaskTool.id, sessionID, callID: part.id },
+                { args: taskArgs },
+              )
+
+              const taskAgent = yield* agents.get(task.agent)
+              if (!taskAgent) {
+                const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
+                const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
+                const error = new NamedError.Unknown({ message: `Agent not found: "${task.agent}".${hint}` })
+                yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
+                throw error
+              }
+
+              let error: Error | undefined
+              const taskAbort = new AbortController()
+              const result = yield* taskTool
+                .execute(taskArgs, {
+                  agent: task.agent,
+                  messageID: assistantMessage.id,
+                  sessionID,
+                  abort: taskAbort.signal,
+                  callID: part.callID,
+                  extra: { bypassAgentCheck: true, promptOps },
+                  messages: msgs,
+                  metadata: (val: { title?: string; metadata?: Record<string, any> }) =>
+                    Effect.gen(function* () {
+                      part = yield* sessions.updatePart({
+                        ...part,
+                        type: "tool",
+                        state: { ...part.state, ...val },
+                      } satisfies SessionV1.ToolPart)
+                    }),
+                  ask: (req: any) =>
+                    permission
+                      .ask({
+                        ...req,
+                        sessionID,
+                        ruleset: Permission.merge(taskAgent.permission, session.permission ?? []),
+                      })
+                      .pipe(Effect.orDie),
+                })
+                .pipe(
+                  Effect.catchCause((cause) => {
+                    toolOutcome = outcomeFromCause(cause)
+                    const defect = Cause.squash(cause)
+                    error = defect instanceof Error ? defect : new Error(String(defect))
+                    return Effect.logError("subtask execution failed", {
+                      error,
+                      agent: task.agent,
+                      description: task.description,
+                    })
+                  }),
+                  Effect.onInterrupt(() =>
+                    Effect.gen(function* () {
+                      taskAbort.abort()
+                      assistantMessage.finish = "tool-calls"
+                      assistantMessage.time.completed = Date.now()
+                      yield* sessions.updateMessage(assistantMessage)
+                      if (part.state.status === "running") {
+                        yield* sessions.updatePart({
+                          ...part,
+                          state: {
+                            status: "error",
+                            error: "Cancelled",
+                            time: { start: part.state.time.start, end: Date.now() },
+                            metadata: part.state.metadata,
+                            input: part.state.input,
+                          },
+                        } satisfies SessionV1.ToolPart)
+                      }
+                    }),
+                  ),
+                )
+
+              const attachments = result?.attachments?.map((attachment) => ({
+                ...attachment,
+                id: PartID.ascending(),
+                sessionID,
+                messageID: assistantMessage.id,
+              }))
+
+              yield* plugin.trigger(
+                "tool.execute.after",
+                { tool: TaskTool.id, sessionID, callID: part.id, args: taskArgs },
+                result,
+              )
+
               assistantMessage.finish = "tool-calls"
               assistantMessage.time.completed = Date.now()
               yield* sessions.updateMessage(assistantMessage)
-              if (part.state.status === "running") {
+
+              if (result && part.state.status === "running") {
+                yield* sessions.updatePart({
+                  ...part,
+                  state: {
+                    status: "completed",
+                    input: part.state.input,
+                    title: result.title,
+                    metadata: result.metadata,
+                    output: result.output,
+                    attachments,
+                    time: { ...part.state.time, end: Date.now() },
+                  },
+                } satisfies SessionV1.ToolPart)
+              }
+
+              if (!result) {
                 yield* sessions.updatePart({
                   ...part,
                   state: {
                     status: "error",
-                    error: "Cancelled",
-                    time: { start: part.state.time.start, end: Date.now() },
-                    metadata: part.state.metadata,
+                    error: error ? `Tool execution failed: ${error.message}` : "Tool execution failed",
+                    time: {
+                      start: part.state.status === "running" ? part.state.time.start : Date.now(),
+                      end: Date.now(),
+                    },
+                    metadata: part.state.status === "pending" ? undefined : part.state.metadata,
                     input: part.state.input,
                   },
                 } satisfies SessionV1.ToolPart)
               }
+
+              if (!task.command) return
+
+              const summaryUserMsg: SessionV1.User = {
+                id: MessageID.ascending(),
+                sessionID,
+                role: "user",
+                time: { created: Date.now() },
+                agent: lastUser.agent,
+                model: lastUser.model,
+              }
+              yield* sessions.updateMessage(summaryUserMsg)
+              yield* sessions.updatePart({
+                id: PartID.ascending(),
+                messageID: summaryUserMsg.id,
+                sessionID,
+                type: "text",
+                text: "Summarize the task tool output above and continue with your task.",
+                synthetic: true,
+              } satisfies SessionV1.TextPart)
             }),
-          ),
-        )
-
-      const attachments = result?.attachments?.map((attachment) => ({
-        ...attachment,
-        id: PartID.ascending(),
-        sessionID,
-        messageID: assistantMessage.id,
-      }))
-
-      yield* plugin.trigger(
-        "tool.execute.after",
-        { tool: TaskTool.id, sessionID, callID: part.id, args: taskArgs },
-        result,
+          ).pipe(
+            Effect.onExit((exit) =>
+              relayTool
+                .complete(Exit.isSuccess(exit) ? toolOutcome : outcomeFromCause(exit.cause))
+                .pipe(Effect.catchCause(() => Effect.void)),
+            ),
+          )
+        }),
       )
-
-      assistantMessage.finish = "tool-calls"
-      assistantMessage.time.completed = Date.now()
-      yield* sessions.updateMessage(assistantMessage)
-
-      if (result && part.state.status === "running") {
-        yield* sessions.updatePart({
-          ...part,
-          state: {
-            status: "completed",
-            input: part.state.input,
-            title: result.title,
-            metadata: result.metadata,
-            output: result.output,
-            attachments,
-            time: { ...part.state.time, end: Date.now() },
-          },
-        } satisfies SessionV1.ToolPart)
-      }
-
-      if (!result) {
-        yield* sessions.updatePart({
-          ...part,
-          state: {
-            status: "error",
-            error: error ? `Tool execution failed: ${error.message}` : "Tool execution failed",
-            time: {
-              start: part.state.status === "running" ? part.state.time.start : Date.now(),
-              end: Date.now(),
-            },
-            metadata: part.state.status === "pending" ? undefined : part.state.metadata,
-            input: part.state.input,
-          },
-        } satisfies SessionV1.ToolPart)
-      }
-
-      if (!task.command) return
-
-      const summaryUserMsg: SessionV1.User = {
-        id: MessageID.ascending(),
-        sessionID,
-        role: "user",
-        time: { created: Date.now() },
-        agent: lastUser.agent,
-        model: lastUser.model,
-      }
-      yield* sessions.updateMessage(summaryUserMsg)
-      yield* sessions.updatePart({
-        id: PartID.ascending(),
-        messageID: summaryUserMsg.id,
-        sessionID,
-        type: "text",
-        text: "Summarize the task tool output above and continue with your task.",
-        synthetic: true,
-      } satisfies SessionV1.TextPart)
     })
 
     const shellImpl = Effect.fn("SessionPrompt.shellImpl")(function* (input: ShellInput, ready?: Latch.Latch) {
@@ -1625,6 +1662,7 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     RuntimeFlags.node,
     Database.node,
+    NemoRelay.node,
   ],
 })
 
