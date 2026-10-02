@@ -1,16 +1,18 @@
 import { ToolOutput, type LLMEvent, type ProviderMetadata, type ToolResultValue, type Usage } from "@opencode-ai/llm"
-import { DateTime, Effect } from "effect"
+import { Cause, DateTime, Effect, Exit } from "effect"
 import { EventV2 } from "../../event"
 import { ModelV2 } from "../../model"
 import { SessionEvent } from "../event"
 import { SessionMessage } from "../message"
 import { SessionSchema } from "../schema"
+import type { Interface as NemoRelayInterface, ToolObservation, ToolOutcome } from "../../observability/nemo-relay"
 
 type Input = {
   readonly sessionID: SessionSchema.ID
   readonly agent: string
   readonly model: ModelV2.Ref
   readonly snapshot?: string
+  readonly relay: NemoRelayInterface
 }
 
 const safe = (value: number | undefined) => Math.max(0, Number.isFinite(value) ? (value ?? 0) : 0)
@@ -62,6 +64,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
       settled: boolean
       providerExecuted: boolean
       providerMetadata?: ProviderMetadata
+      relay?: ToolObservation
     }
   >()
   const timestamp = DateTime.now
@@ -213,21 +216,40 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
   const failUnsettledTools = Effect.fn("SessionRunner.failUnsettledTools")(function* (
     message: string,
     hostedOnly = false,
+    outcome: ToolOutcome = "failed",
   ) {
+    const closeRemainingRelay = Effect.fnUntraced(function* () {
+      for (const tool of tools.values()) {
+        if (tool.settled || (hostedOnly && !tool.providerExecuted)) continue
+        yield* (tool.relay?.complete(outcome) ?? Effect.void).pipe(Effect.exit)
+      }
+    })
     for (const [callID, tool] of tools) {
       if (tool.settled || (hostedOnly && !tool.providerExecuted)) continue
       tool.settled = true
-      yield* events.publish(SessionEvent.Tool.Failed, {
-        sessionID: input.sessionID,
-        timestamp: yield* timestamp,
-        assistantMessageID: tool.assistantMessageID,
-        callID,
-        error: { type: "unknown", message },
-        provider: {
-          executed: tool.providerExecuted,
-          ...(tool.providerMetadata === undefined ? {} : { metadata: tool.providerMetadata }),
-        },
-      })
+      yield* events
+        .publish(SessionEvent.Tool.Failed, {
+          sessionID: input.sessionID,
+          timestamp: yield* timestamp,
+          assistantMessageID: tool.assistantMessageID,
+          callID,
+          error: { type: "unknown", message },
+          provider: {
+            executed: tool.providerExecuted,
+            ...(tool.providerMetadata === undefined ? {} : { metadata: tool.providerMetadata }),
+          },
+        })
+        .pipe(Effect.ensuring(tool.relay?.complete(outcome) ?? Effect.void))
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.gen(function* () {
+              // Preserve the host's fail-fast durable event semantics while
+              // still releasing every Relay operation admitted for this pass.
+              yield* closeRemainingRelay()
+              return yield* Effect.failCause(cause)
+            }),
+          ),
+        )
     }
   })
 
@@ -320,18 +342,32 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
         tool.called = true
         tool.providerExecuted = event.providerExecuted === true
         tool.providerMetadata = event.providerMetadata
-        yield* events.publish(SessionEvent.Tool.Called, {
-          sessionID: input.sessionID,
-          timestamp: yield* timestamp,
-          assistantMessageID: tool.assistantMessageID,
-          callID: event.id,
-          tool: event.name,
-          input: record(event.input),
-          provider: {
-            executed: tool.providerExecuted,
-            ...(event.providerMetadata === undefined ? {} : { metadata: event.providerMetadata }),
-          },
-        })
+        if (tool.providerExecuted)
+          yield* Effect.uninterruptible(
+            input.relay
+              .beginTool({ name: event.name, execution: "provider" })
+              .pipe(Effect.tap((observation) => Effect.sync(() => (tool.relay = observation)))),
+          )
+        yield* events
+          .publish(SessionEvent.Tool.Called, {
+            sessionID: input.sessionID,
+            timestamp: yield* timestamp,
+            assistantMessageID: tool.assistantMessageID,
+            callID: event.id,
+            tool: event.name,
+            input: record(event.input),
+            provider: {
+              executed: tool.providerExecuted,
+              ...(event.providerMetadata === undefined ? {} : { metadata: event.providerMetadata }),
+            },
+          })
+          .pipe(
+            Effect.onExit((exit) =>
+              Exit.isFailure(exit)
+                ? (tool.relay?.complete(Cause.hasInterruptsOnly(exit.cause) ? "cancelled" : "failed") ?? Effect.void)
+                : Effect.void,
+            ),
+          )
         return
       }
       case "tool-result": {
@@ -349,28 +385,45 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
           executed: event.providerExecuted === true || tool.providerExecuted,
           ...(event.providerMetadata === undefined ? {} : { metadata: event.providerMetadata }),
         }
+        if (provider.executed && !tool.relay)
+          yield* Effect.uninterruptible(
+            input.relay
+              .beginTool({ name: event.name, execution: "provider" })
+              .pipe(Effect.tap((observation) => Effect.sync(() => (tool.relay = observation)))),
+          )
         if ("error" in result) {
-          yield* events.publish(SessionEvent.Tool.Failed, {
+          yield* events
+            .publish(SessionEvent.Tool.Failed, {
+              sessionID: input.sessionID,
+              timestamp: yield* timestamp,
+              assistantMessageID: tool.assistantMessageID,
+              callID: event.id,
+              error: result.error,
+              result: event.result,
+              provider,
+            })
+            .pipe(Effect.ensuring(tool.relay?.complete("failed") ?? Effect.void))
+          return
+        }
+        yield* events
+          .publish(SessionEvent.Tool.Success, {
             sessionID: input.sessionID,
             timestamp: yield* timestamp,
             assistantMessageID: tool.assistantMessageID,
             callID: event.id,
-            error: result.error,
-            result: event.result,
+            ...result,
+            outputPaths,
+            ...(provider.executed ? { result: event.result } : {}),
             provider,
           })
-          return
-        }
-        yield* events.publish(SessionEvent.Tool.Success, {
-          sessionID: input.sessionID,
-          timestamp: yield* timestamp,
-          assistantMessageID: tool.assistantMessageID,
-          callID: event.id,
-          ...result,
-          outputPaths,
-          ...(provider.executed ? { result: event.result } : {}),
-          provider,
-        })
+          .pipe(
+            Effect.onExit(
+              (exit) =>
+                tool.relay?.complete(
+                  Exit.isSuccess(exit) ? "success" : Cause.hasInterruptsOnly(exit.cause) ? "cancelled" : "failed",
+                ) ?? Effect.void,
+            ),
+          )
         return
       }
       case "tool-error": {
@@ -380,17 +433,19 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
           return yield* Effect.die(`Tool error name changed for ${event.id}: ${tool.name} -> ${event.name}`)
         if (tool.settled) return yield* Effect.die(`Duplicate tool error: ${event.id}`)
         tool.settled = true
-        yield* events.publish(SessionEvent.Tool.Failed, {
-          sessionID: input.sessionID,
-          timestamp: yield* timestamp,
-          assistantMessageID: tool.assistantMessageID,
-          callID: event.id,
-          error: { type: "unknown", message: event.message },
-          provider: {
-            executed: tool.providerExecuted,
-            ...(event.providerMetadata === undefined ? {} : { metadata: event.providerMetadata }),
-          },
-        })
+        yield* events
+          .publish(SessionEvent.Tool.Failed, {
+            sessionID: input.sessionID,
+            timestamp: yield* timestamp,
+            assistantMessageID: tool.assistantMessageID,
+            callID: event.id,
+            error: { type: "unknown", message: event.message },
+            provider: {
+              executed: tool.providerExecuted,
+              ...(event.providerMetadata === undefined ? {} : { metadata: event.providerMetadata }),
+            },
+          })
+          .pipe(Effect.ensuring(tool.relay?.complete("failed") ?? Effect.void))
         return
       }
       case "step-finish":

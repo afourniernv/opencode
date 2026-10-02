@@ -100,7 +100,7 @@ const layer = Layer.effectDiscard(
                   error instanceof Image.SizeError
                     ? error.message
                     : `Unable to read ${input.path}`
-                return new ToolFailure({ message })
+                return new ToolFailure({ message, error })
               }),
             )
           },
