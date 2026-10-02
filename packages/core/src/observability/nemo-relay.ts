@@ -2544,11 +2544,11 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
 
   const beginTool: Interface["beginTool"] = (input) =>
     Effect.gen(function* () {
+      const run = yield* CurrentRelayRun
+      const parent = yield* CurrentRelayScope
       const lease = admit()
       if (!lease) return noopTool
-      const run = yield* CurrentRelayRun
       if (run) run.toolCalls++
-      const parent = yield* CurrentRelayScope
       const traceScope = beginToolTrace(input, parent)
       const started = performance.now()
       let completed = false
@@ -2571,9 +2571,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
             }
             return toolCompleted(completedInput).pipe(
               Effect.ensuring(endToolTrace(traceScope, completedInput)),
-              Effect.ensuring(
-                Effect.sync(() => lease.release()),
-              ),
+              Effect.ensuring(Effect.sync(() => lease.release())),
             )
           })
         },
@@ -2588,11 +2586,11 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
       Effect.gen(function* () {
         // Acquire at subscription time: an unconsumed lazy stream must not
         // hold shutdown open, and each subscription is a distinct attempt.
+        const run = yield* CurrentRelayRun
+        const parent = yield* CurrentRelayScope
         const lease = admit()
         if (!lease) return source
-        const run = yield* CurrentRelayRun
         if (run) run.llmOperations++
-        const parent = yield* CurrentRelayScope
         const traceScope = beginLlmTrace(input, parent, "stream")
         const providerAttemptTraceState: ProviderAttemptTraceState = new Map()
         const started = performance.now()
@@ -2670,9 +2668,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
               Effect.ensuring(endLlmTrace(traceScope, completedInput, "stream")),
             )
           }),
-          Stream.ensuring(
-            Effect.sync(() => lease.release()),
-          ),
+          Stream.ensuring(Effect.sync(() => lease.release())),
         )
       }),
     )

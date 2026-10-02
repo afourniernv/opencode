@@ -1404,28 +1404,41 @@ describe("NeMo Relay observability", () => {
   test("emits privacy-bounded turn, LLM, tool, and retry traces on isolated child stacks", async () => {
     const records: TraceRecord[] = []
     const relay = makeForTesting({ ...driver(), ...traceDriver(records) })
+    const firstStarted = deferred()
+    const releaseFirst = deferred()
+
+    const stream = (model: string, blocked = false) =>
+      relay
+        .observeLlmStream(
+          {
+            role: "primary",
+            agentRuntime: "v2",
+            runtime: "native",
+            provider: "private-provider-name",
+            model,
+          },
+          blocked
+            ? Stream.unwrap(
+                Effect.sync(firstStarted.resolve).pipe(
+                  Effect.andThen(Effect.promise(() => releaseFirst.promise)),
+                  Effect.as(
+                    Stream.make({ type: "finish", reason: "stop", usage: { inputTokens: 2, outputTokens: 1 } }),
+                  ),
+                ),
+              )
+            : Stream.make({ type: "finish", reason: "stop", usage: { inputTokens: 2, outputTokens: 1 } }),
+        )
+        .pipe(Stream.runDrain)
 
     await Effect.runPromise(
       relay.observeTurn(
         { role: "primary", runtime: "v2" },
         Effect.gen(function* () {
-          yield* Effect.all(
-            ["first-private-model", "second-private-model"].map((model) =>
-              relay
-                .observeLlmStream(
-                  {
-                    role: "primary",
-                    agentRuntime: "v2",
-                    runtime: "native",
-                    provider: "private-provider-name",
-                    model,
-                  },
-                  Stream.make({ type: "finish", reason: "stop", usage: { inputTokens: 2, outputTokens: 1 } }),
-                )
-                .pipe(Stream.runDrain),
-            ),
-            { concurrency: "unbounded", discard: true },
-          )
+          const first = yield* stream("first-private-model", true).pipe(Effect.forkChild)
+          yield* Effect.promise(() => firstStarted.promise)
+          yield* stream("second-private-model")
+          releaseFirst.resolve()
+          yield* Fiber.join(first)
           const tool = yield* relay.beginTool({ name: "private-tool-name", execution: "local" })
           yield* tool.complete("success")
           yield* relay.retryScheduled({ runtime: "v2", attempt: 2 })
@@ -1435,9 +1448,12 @@ describe("NeMo Relay observability", () => {
 
     const turn = records.find((item) => item.phase === "start" && item.kind === "scope")
     const children = records.filter((item) => item.phase === "start" && ["llm", "tool"].includes(item.kind))
+    const llmStarts = records.filter((item) => item.phase === "start" && item.kind === "llm")
+    const llmEnds = records.filter((item) => item.phase === "end" && item.kind === "llm")
     expect(turn?.name).toBe("opencode.agent.turn")
     expect(children).toHaveLength(3)
     expect(children.every((item) => item.parent === turn?.id)).toBe(true)
+    expect(llmEnds.map((item) => item.id)).toEqual([llmStarts[1]?.id, llmStarts[0]?.id])
     expect(records.find((item) => item.phase === "event")?.parent).toBe(turn?.id)
     expect(records.at(-1)).toMatchObject({ phase: "end", kind: "scope", id: turn?.id })
     expect(JSON.stringify(records)).not.toContain("private-provider-name")
