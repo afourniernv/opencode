@@ -342,6 +342,18 @@ download_and_install() {
 
     mv "$tmp_dir/opencode" "$INSTALL_DIR"
     chmod 755 "${INSTALL_DIR}/opencode"
+    if [ -f "$tmp_dir/LICENSE" ] || [ -f "$tmp_dir/LICENSE.nemo-relay" ]; then
+        local license_dir="$HOME/.opencode/share/licenses/opencode"
+        mkdir -p "$license_dir"
+        if [ -f "$tmp_dir/LICENSE" ]; then
+            mv "$tmp_dir/LICENSE" "$license_dir/LICENSE"
+            chmod 644 "$license_dir/LICENSE"
+        fi
+        if [ -f "$tmp_dir/LICENSE.nemo-relay" ]; then
+            mv "$tmp_dir/LICENSE.nemo-relay" "$license_dir/LICENSE.nemo-relay"
+            chmod 644 "$license_dir/LICENSE.nemo-relay"
+        fi
+    fi
     rm -rf "$tmp_dir"
 }
 

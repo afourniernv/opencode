@@ -2,6 +2,15 @@ import { expect, test } from "bun:test"
 import type { Configuration } from "electron-builder"
 
 const legacyDesktopEntry = "resources/linux/opencode-desktop.desktop"
+const relayNativePackages = [
+  "nemo-relay-node-linux-x64-gnu",
+  "nemo-relay-node-linux-arm64-gnu",
+  "nemo-relay-node-linux-x64-musl",
+  "nemo-relay-node-linux-arm64-musl",
+  "nemo-relay-node-darwin-arm64",
+  "nemo-relay-node-win32-x64-msvc",
+  "nemo-relay-node-win32-arm64-msvc",
+] as const
 
 const channels = [
   { channel: "dev", appId: "ai.opencode.desktop.dev" },
@@ -89,3 +98,81 @@ for (const channel of ["beta", "prod"] as const) {
     })
   })
 }
+
+const relayTargets = [
+  { target: "aarch64-apple-darwin", native: "nemo-relay-node-darwin-arm64" },
+  { target: "x86_64-apple-darwin", native: undefined },
+  { target: "aarch64-pc-windows-msvc", native: "nemo-relay-node-win32-arm64-msvc" },
+  { target: "x86_64-pc-windows-msvc", native: "nemo-relay-node-win32-x64-msvc" },
+  { target: "aarch64-unknown-linux-gnu", native: "nemo-relay-node-linux-arm64-gnu" },
+  { target: "x86_64-unknown-linux-gnu", native: "nemo-relay-node-linux-x64-gnu" },
+] as const
+
+for (const item of relayTargets) {
+  test(`packages only the selected Relay addon for ${item.target}`, async () => {
+    const previous = process.env.RUST_TARGET
+    process.env.RUST_TARGET = item.target
+
+    const module = await import(`./electron-builder.config.ts?relay-target=${item.target}`)
+    const config = module.default as Configuration
+
+    if (previous === undefined) delete process.env.RUST_TARGET
+    else process.env.RUST_TARGET = previous
+
+    const files = (config.files ?? []).filter((value): value is string => typeof value === "string")
+    for (const native of relayNativePackages) {
+      const exclusion = `!node_modules/${native}/**/*`
+      if (native === item.native) expect(files).not.toContain(exclusion)
+      else expect(files).toContain(exclusion)
+    }
+    expect(config.asarUnpack).toContain("node_modules/nemo-relay-node-*/**/*.node")
+  })
+}
+
+test("rejects an unrecognized Relay packaging target", async () => {
+  const previous = process.env.RUST_TARGET
+  process.env.RUST_TARGET = "riscv64-unknown-linux-gnu"
+
+  try {
+    await expect(import("./electron-builder.config.ts?relay-target=unsupported")).rejects.toThrow(
+      "Unsupported RUST_TARGET for Relay desktop packaging: riscv64-unknown-linux-gnu",
+    )
+  } finally {
+    if (previous === undefined) delete process.env.RUST_TARGET
+    else process.env.RUST_TARGET = previous
+  }
+})
+
+test("requires RUST_TARGET when electron-builder targets another platform", async () => {
+  const previousTarget = process.env.RUST_TARGET
+  const previousArgv = [...process.argv]
+  delete process.env.RUST_TARGET
+  process.argv.push(process.platform === "win32" ? "--linux" : "--win")
+
+  try {
+    await expect(import("./electron-builder.config.ts?relay-target=cross-platform")).rejects.toThrow(
+      "RUST_TARGET is required when packaging",
+    )
+  } finally {
+    process.argv.splice(0, process.argv.length, ...previousArgv)
+    if (previousTarget === undefined) delete process.env.RUST_TARGET
+    else process.env.RUST_TARGET = previousTarget
+  }
+})
+
+test("requires RUST_TARGET when electron-builder targets another architecture", async () => {
+  const previousTarget = process.env.RUST_TARGET
+  const previousArgv = [...process.argv]
+  delete process.env.RUST_TARGET
+  process.argv.push(process.arch === "arm64" ? "--x64" : "--arm64")
+
+  try {
+    await expect(import("./electron-builder.config.ts?relay-target=cross-arch")).rejects.toThrow(
+      "RUST_TARGET is required when packaging",
+    )
+  } finally {
+    process.argv.splice(0, process.argv.length, ...previousArgv)
+    if (previousTarget === undefined) delete process.env.RUST_TARGET
+    else process.env.RUST_TARGET = previousTarget
+  }
+})

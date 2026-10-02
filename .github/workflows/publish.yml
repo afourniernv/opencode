@@ -327,6 +327,7 @@ jobs:
           - host: "windows-2025"
             target: aarch64-pc-windows-msvc
             platform_flag: --win --arm64
+            bun_install_flags: --os=win32 --cpu=*
           - host: "blacksmith-4vcpu-windows-2025"
             target: x86_64-pc-windows-msvc
             platform_flag: --win
@@ -426,6 +427,7 @@ jobs:
           APPLE_API_KEY: ${{ runner.temp }}/apple-api-key.p8
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          RUST_TARGET: ${{ matrix.settings.target }}
 
       - name: Package (no publish)
         if: ${{ !needs.version.outputs.release }}
@@ -434,6 +436,7 @@ jobs:
         timeout-minutes: 60
         env:
           OPENCODE_CHANNEL: ${{ (github.ref_name == 'beta' && 'beta') || 'prod' }}
+          RUST_TARGET: ${{ matrix.settings.target }}
 
       - name: Create macOS .app.tar.gz
         if: runner.os == 'macOS' && needs.version.outputs.release

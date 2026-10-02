@@ -15,6 +15,58 @@ const signScript = path.join(rootDir, "script", "sign-windows.ps1")
 const legacyDesktopEntry = path.join(packageDir, "resources", "linux", "opencode-desktop.desktop")
 const legacyDesktopEntryFpm = `${legacyDesktopEntry}=/usr/share/applications/opencode-desktop.desktop`
 
+const relayNativePackages = [
+  "nemo-relay-node-linux-x64-gnu",
+  "nemo-relay-node-linux-arm64-gnu",
+  "nemo-relay-node-linux-x64-musl",
+  "nemo-relay-node-linux-arm64-musl",
+  "nemo-relay-node-darwin-arm64",
+  "nemo-relay-node-win32-x64-msvc",
+  "nemo-relay-node-win32-arm64-msvc",
+] as const
+
+const relayNativePackagesByTarget = new Map<string, (typeof relayNativePackages)[number] | undefined>([
+  ["aarch64-apple-darwin", "nemo-relay-node-darwin-arm64"],
+  ["x86_64-apple-darwin", undefined],
+  ["aarch64-pc-windows-msvc", "nemo-relay-node-win32-arm64-msvc"],
+  ["x86_64-pc-windows-msvc", "nemo-relay-node-win32-x64-msvc"],
+  ["aarch64-unknown-linux-gnu", "nemo-relay-node-linux-arm64-gnu"],
+  ["x86_64-unknown-linux-gnu", "nemo-relay-node-linux-x64-gnu"],
+])
+
+const relayNativePackage = (() => {
+  const target = process.env.RUST_TARGET
+  if (target !== undefined) {
+    if (relayNativePackagesByTarget.has(target)) return relayNativePackagesByTarget.get(target)
+    throw new Error(`Unsupported RUST_TARGET for Relay desktop packaging: ${target}`)
+  }
+
+  const requestedPlatform = process.argv.some((arg) => arg === "--mac" || arg === "-m")
+    ? "darwin"
+    : process.argv.some((arg) => arg === "--linux" || arg === "-l")
+      ? "linux"
+      : process.argv.some((arg) => arg === "--win" || arg === "-w")
+        ? "win32"
+        : process.platform
+  const requestedArch = process.argv.includes("--arm64")
+    ? "arm64"
+    : process.argv.includes("--x64")
+      ? "x64"
+      : process.arch
+  if (requestedPlatform !== process.platform || requestedArch !== process.arch) {
+    throw new Error(
+      `RUST_TARGET is required when packaging for ${requestedPlatform}-${requestedArch} from ${process.platform}-${process.arch}`,
+    )
+  }
+
+  if (process.platform === "darwin") return process.arch === "arm64" ? "nemo-relay-node-darwin-arm64" : undefined
+  if (process.platform === "linux" && (process.arch === "arm64" || process.arch === "x64"))
+    return `nemo-relay-node-linux-${process.arch}-gnu`
+  if (process.platform === "win32" && (process.arch === "arm64" || process.arch === "x64"))
+    return `nemo-relay-node-win32-${process.arch}-msvc`
+  throw new Error(`Unsupported host for Relay desktop packaging: ${process.platform}-${process.arch}`)
+})()
+
 const metainfoFpm = (appId: string) =>
   `${path.join(packageDir, "resources", `${appId}.metainfo.xml`)}=/usr/share/metainfo/${appId}.metainfo.xml`
 
@@ -55,7 +107,16 @@ const getBase = (appId: string): Configuration => ({
   extraMetadata: {
     desktopName: `${appId}.desktop`,
   },
-  files: ["out/**/*", "resources/**/*", "!resources/opencode-cli*"],
+  files: [
+    "out/**/*",
+    "resources/**/*",
+    "!resources/opencode-cli*",
+    ...relayNativePackages.filter((name) => name !== relayNativePackage).map((name) => `!node_modules/${name}/**/*`),
+  ],
+  // Relay is loaded inside Electron's Node utility process. Native addons
+  // cannot be dlopen'd from app.asar, so keep the selected platform package
+  // in app.asar.unpacked.
+  asarUnpack: ["node_modules/nemo-relay-node-*/**/*.node"],
   extraResources: [
     ...(channel === "dev"
       ? [
