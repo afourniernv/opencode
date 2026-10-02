@@ -10,6 +10,11 @@ const RUNTIME_MODULE = "nemo-relay-node"
 const SCHEMA_VERSION = "3"
 const DEFAULT_STARTUP_TIMEOUT_MS = 5_000
 const DEFAULT_TEARDOWN_TIMEOUT_MS = 5_000
+const DURATION_MS_BUCKETS = [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 120_000, 600_000]
+const LATENCY_MS_BUCKETS = [10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000]
+const RETRY_DELAY_MS_BUCKETS = [...LATENCY_MS_BUCKETS, 120_000, 600_000]
+const OPERATION_COUNT_BUCKETS = [0, 1, 2, 3, 5, 10, 20, 50, 100]
+const CONTEXT_UTILIZATION_BUCKETS = [0.25, 0.5, 0.75, 0.85, 0.9, 0.95, 1, 1.1]
 
 // Bun replaces this identifier with a literal platform package while
 // compiling standalone OpenCode binaries. In source/Node execution it remains
@@ -2147,12 +2152,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
     const base = { runtime: input.runtime, outcome: input.outcome }
     return emit("opencode.agent.run.completed", [
       counter("opencode.agent.run.completed.count", 1, base),
-      histogram(
-        "opencode.agent.run.duration",
-        input.durationMs,
-        [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 120_000, 600_000],
-        base,
-      ),
+      histogram("opencode.agent.run.duration", input.durationMs, DURATION_MS_BUCKETS, base),
       ...(
         [
           ["turn", input.operations.turns],
@@ -2168,7 +2168,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
         histogram(
           "opencode.agent.run.operation_count",
           value,
-          [0, 1, 2, 3, 5, 10, 20, 50, 100],
+          OPERATION_COUNT_BUCKETS,
           { ...base, kind },
           "{operation}",
         ),
@@ -2192,15 +2192,10 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
     }
     const measurements = [
       counter("opencode.llm.host_stream.count", 1, { ...base, outcome: input.outcome }),
-      histogram(
-        "opencode.llm.host_stream.duration",
-        input.durationMs,
-        [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 120_000, 600_000],
-        {
-          ...base,
-          outcome: input.outcome,
-        },
-      ),
+      histogram("opencode.llm.host_stream.duration", input.durationMs, DURATION_MS_BUCKETS, {
+        ...base,
+        outcome: input.outcome,
+      }),
       counter("opencode.model_route.count", 1, base),
     ]
     if (input.finish)
@@ -2212,12 +2207,11 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
       )
     if (input.firstOutput)
       measurements.push(
-        histogram(
-          "opencode.llm.time_to_first_output",
-          input.firstOutput.latencyMs,
-          [10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000],
-          { ...base, outcome: input.outcome, output_kind: input.firstOutput.kind },
-        ),
+        histogram("opencode.llm.time_to_first_output", input.firstOutput.latencyMs, LATENCY_MS_BUCKETS, {
+          ...base,
+          outcome: input.outcome,
+          output_kind: input.firstOutput.kind,
+        }),
       )
     if (input.providerError)
       measurements.push(
@@ -2246,7 +2240,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
         histogram(
           "opencode.llm.input_context_utilization",
           utilization,
-          [0.25, 0.5, 0.75, 0.85, 0.9, 0.95, 1, 1.1],
+          CONTEXT_UTILIZATION_BUCKETS,
           { ...base, scope: "provider_step" },
           "1",
         ),
@@ -2268,12 +2262,10 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
     }
     const measurements = [
       counter("opencode.llm.unary.count", 1, { ...base, outcome: input.outcome }),
-      histogram(
-        "opencode.llm.unary.duration",
-        input.durationMs,
-        [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 120_000, 600_000],
-        { ...base, outcome: input.outcome },
-      ),
+      histogram("opencode.llm.unary.duration", input.durationMs, DURATION_MS_BUCKETS, {
+        ...base,
+        outcome: input.outcome,
+      }),
       counter("opencode.model_route.count", 1, base),
     ]
     if (input.finish)
@@ -2302,7 +2294,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
         histogram(
           "opencode.llm.input_context_utilization",
           utilization,
-          [0.25, 0.5, 0.75, 0.85, 0.9, 0.95, 1, 1.1],
+          CONTEXT_UTILIZATION_BUCKETS,
           { ...base, scope: "unary_call" },
           "1",
         ),
@@ -2340,16 +2332,11 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
             call_role: input.role,
             outcome: input.outcome,
           }),
-          histogram(
-            "opencode.agent.turn.duration",
-            input.durationMs,
-            [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 120_000, 600_000],
-            {
-              runtime: input.runtime,
-              call_role: input.role,
-              outcome: input.outcome,
-            },
-          ),
+          histogram("opencode.agent.turn.duration", input.durationMs, DURATION_MS_BUCKETS, {
+            runtime: input.runtime,
+            call_role: input.role,
+            outcome: input.outcome,
+          }),
         ])
 
   const toolCompleted = (input: ToolCompleted) => {
@@ -2371,15 +2358,10 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
       )
     if (input.execution === "local" && input.durationMs !== undefined)
       measurements.push(
-        histogram(
-          "opencode.tool_call.duration",
-          input.durationMs,
-          [10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000],
-          {
-            category,
-            outcome: input.outcome,
-          },
-        ),
+        histogram("opencode.tool_call.duration", input.durationMs, LATENCY_MS_BUCKETS, {
+          category,
+          outcome: input.outcome,
+        }),
       )
     return emit("opencode.tool.completed", measurements)
   }
@@ -2405,12 +2387,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
     }
     return emit("opencode.permission.wait.completed", [
       counter("opencode.permission.wait.count", 1, base),
-      histogram(
-        "opencode.permission.wait.duration",
-        input.durationMs,
-        [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 120_000, 600_000],
-        base,
-      ),
+      histogram("opencode.permission.wait.duration", input.durationMs, DURATION_MS_BUCKETS, base),
     ])
   }
 
@@ -2422,12 +2399,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
     }
     return emit("opencode.question.wait.completed", [
       counter("opencode.question.wait.count", 1, attributes),
-      histogram(
-        "opencode.question.wait.duration",
-        input.durationMs,
-        [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 120_000, 600_000],
-        attributes,
-      ),
+      histogram("opencode.question.wait.duration", input.durationMs, DURATION_MS_BUCKETS, attributes),
     ])
   }
 
@@ -2456,12 +2428,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
     }
     return emit("opencode.compaction.attempt.completed", [
       counter("opencode.compaction.attempt.count", 1, attributes),
-      histogram(
-        "opencode.compaction.duration",
-        input.durationMs,
-        [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 120_000, 600_000],
-        attributes,
-      ),
+      histogram("opencode.compaction.duration", input.durationMs, DURATION_MS_BUCKETS, attributes),
     ])
   }
 
@@ -2501,12 +2468,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
         }
         publication = emit("opencode.llm.provider_retry.scheduled", [
           counter("opencode.llm.provider_retry.scheduled.count", 1, attributes),
-          histogram(
-            "opencode.llm.provider_retry.delay",
-            event.delayMs,
-            [10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000],
-            attributes,
-          ),
+          histogram("opencode.llm.provider_retry.delay", event.delayMs, LATENCY_MS_BUCKETS, attributes),
         ])
       } else {
         const attributes = {
@@ -2520,12 +2482,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
         }
         publication = emit("opencode.llm.provider_attempt.completed", [
           counter("opencode.llm.provider_attempt.completed.count", 1, attributes),
-          histogram(
-            "opencode.llm.provider_attempt.time_to_headers",
-            event.durationMs,
-            [10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000],
-            attributes,
-          ),
+          histogram("opencode.llm.provider_attempt.time_to_headers", event.durationMs, LATENCY_MS_BUCKETS, attributes),
         ])
       }
       yield* publication.pipe(Effect.ensuring(providerAttemptTrace(traceState, scope, event)))
@@ -2866,12 +2823,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
         const measurements = [counter("opencode.llm.host_retry_scheduled.count", 1, attributes)]
         if (input.delayMs !== undefined && Number.isFinite(input.delayMs) && input.delayMs >= 0)
           measurements.push(
-            histogram(
-              "opencode.llm.host_retry.delay",
-              input.delayMs,
-              [10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 120_000, 600_000],
-              attributes,
-            ),
+            histogram("opencode.llm.host_retry.delay", input.delayMs, RETRY_DELAY_MS_BUCKETS, attributes),
           )
         yield* emit("opencode.llm.host_retry.scheduled", measurements).pipe(Effect.ensuring(retryTrace(scope, input)))
       }),
