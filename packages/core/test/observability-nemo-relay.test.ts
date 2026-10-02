@@ -278,6 +278,17 @@ function fakeRuntime(input?: {
   }
 }
 
+function enabledLifecycle(
+  runtime: ReturnType<typeof fakeRuntime>,
+  options: { readonly startupTimeoutMs?: number } = {},
+) {
+  return createLifecycleForTesting({
+    loader: async () => runtime.module,
+    environment: { OPENCODE_NEMO_RELAY: "1" },
+    ...options,
+  })
+}
+
 describe("NeMo Relay observability", () => {
   test("maps arbitrary identifiers into closed families and categories", () => {
     expect(providerFamily("openrouter-team-secret")).toBe("openrouter")
@@ -1564,11 +1575,7 @@ describe("NeMo Relay process lifecycle", () => {
   test("closes a plugin host that activates after the startup deadline", async () => {
     const initialize = deferred()
     const runtime = fakeRuntime({ initializeWait: initialize.promise })
-    const lifecycle = createLifecycleForTesting({
-      loader: async () => runtime.module,
-      environment: { OPENCODE_NEMO_RELAY: "1" },
-      startupTimeoutMs: 5,
-    })
+    const lifecycle = enabledLifecycle(runtime, { startupTimeoutMs: 5 })
 
     expect((await lifecycle.acquire()).status).toEqual({ state: "unavailable", reason: "startup_timeout" })
     expect(runtime.state.close).toBe(0)
@@ -1590,10 +1597,7 @@ describe("NeMo Relay process lifecycle", () => {
     const conflictRuntime = fakeRuntime({
       initializeFails: new Error("plugin configuration is owned by an active dynamic plugin host"),
     })
-    const conflict = createLifecycleForTesting({
-      loader: async () => conflictRuntime.module,
-      environment: { OPENCODE_NEMO_RELAY: "1" },
-    })
+    const conflict = enabledLifecycle(conflictRuntime)
     expect((await conflict.acquire()).status).toEqual({ state: "unavailable", reason: "activation_conflict" })
     await conflict.release()
 
@@ -1627,10 +1631,7 @@ describe("NeMo Relay process lifecycle", () => {
 
   test("summarizes empty, configured, and degraded activation reports without exposing paths", async () => {
     const emptyRuntime = fakeRuntime({ report: report({ components: 0 }) })
-    const empty = createLifecycleForTesting({
-      loader: async () => emptyRuntime.module,
-      environment: { OPENCODE_NEMO_RELAY: "1" },
-    })
+    const empty = enabledLifecycle(emptyRuntime)
     expect((await empty.acquire()).status).toMatchObject({
       state: "active",
       activation: "healthy",
@@ -1647,10 +1648,7 @@ describe("NeMo Relay process lifecycle", () => {
         configPaths: ["/private/plugins.toml"],
       }),
     })
-    const degraded = createLifecycleForTesting({
-      loader: async () => degradedRuntime.module,
-      environment: { OPENCODE_NEMO_RELAY: "1" },
-    })
+    const degraded = enabledLifecycle(degradedRuntime)
     const status = (await degraded.acquire()).status
     expect(status).toMatchObject({
       state: "active",
@@ -1670,10 +1668,7 @@ describe("NeMo Relay process lifecycle", () => {
 
   test("refreshes bounded process health from Relay's live activation report", async () => {
     const runtime = fakeRuntime({ report: report({ components: 0 }) })
-    const lifecycle = createLifecycleForTesting({
-      loader: async () => runtime.module,
-      environment: { OPENCODE_NEMO_RELAY: "1" },
-    })
+    const lifecycle = enabledLifecycle(runtime)
     expect((await lifecycle.acquire()).status).toMatchObject({ state: "active", activation: "healthy" })
 
     runtime.state.report = report({
@@ -1704,10 +1699,7 @@ describe("NeMo Relay process lifecycle", () => {
 
   test("throwing activation getters fail closed without escaping into the host", async () => {
     for (const runtime of [fakeRuntime({ isActiveThrows: true }), fakeRuntime({ reportThrows: true })]) {
-      const lifecycle = createLifecycleForTesting({
-        loader: async () => runtime.module,
-        environment: { OPENCODE_NEMO_RELAY: "1" },
-      })
+      const lifecycle = enabledLifecycle(runtime)
       expect((await lifecycle.acquire()).status).toEqual({ state: "unavailable", reason: "invalid_activation" })
       expect(runtime.state.close).toBe(1)
       await lifecycle.release()
@@ -1716,10 +1708,7 @@ describe("NeMo Relay process lifecycle", () => {
 
   test("concurrent owners initialize once and the final owner closes once", async () => {
     const runtime = fakeRuntime()
-    const lifecycle = createLifecycleForTesting({
-      loader: async () => runtime.module,
-      environment: { OPENCODE_NEMO_RELAY: "1" },
-    })
+    const lifecycle = enabledLifecycle(runtime)
     const [first, second] = await Promise.all([lifecycle.acquire(), lifecycle.acquire()])
     expect(first.status.state).toBe("active")
     expect(second.status.state).toBe("active")
@@ -1733,10 +1722,7 @@ describe("NeMo Relay process lifecycle", () => {
 
   test("failed close retains and retries the same activation before reopening", async () => {
     const runtime = fakeRuntime({ closeFailsOnce: true })
-    const lifecycle = createLifecycleForTesting({
-      loader: async () => runtime.module,
-      environment: { OPENCODE_NEMO_RELAY: "1" },
-    })
+    const lifecycle = enabledLifecycle(runtime)
     await lifecycle.acquire()
     await lifecycle.release()
     expect(lifecycle.health().phase).toBe("teardown_failed")
@@ -1751,10 +1737,7 @@ describe("NeMo Relay process lifecycle", () => {
 
   test("shutdown is single-flight and drains an admitted tool before flush and close", async () => {
     const runtime = fakeRuntime()
-    const lifecycle = createLifecycleForTesting({
-      loader: async () => runtime.module,
-      environment: { OPENCODE_NEMO_RELAY: "1" },
-    })
+    const lifecycle = enabledLifecycle(runtime)
     const relay = await lifecycle.acquire()
     const tool = await Effect.runPromise(relay.beginTool({ name: "read", execution: "local" }))
     const first = lifecycle.shutdown(1_000)
@@ -1768,10 +1751,7 @@ describe("NeMo Relay process lifecycle", () => {
 
   test("lazy observations that never execute do not hold process shutdown open", async () => {
     const runtime = fakeRuntime()
-    const lifecycle = createLifecycleForTesting({
-      loader: async () => runtime.module,
-      environment: { OPENCODE_NEMO_RELAY: "1" },
-    })
+    const lifecycle = enabledLifecycle(runtime)
     const relay = await lifecycle.acquire()
     relay.observeLlmStream(
       { role: "primary", agentRuntime: "v1", runtime: "native", provider: "openai", model: "gpt" },
@@ -1785,10 +1765,7 @@ describe("NeMo Relay process lifecycle", () => {
 
   test("bounded shutdown abandons an active operation without closing underneath it", async () => {
     const runtime = fakeRuntime()
-    const lifecycle = createLifecycleForTesting({
-      loader: async () => runtime.module,
-      environment: { OPENCODE_NEMO_RELAY: "1" },
-    })
+    const lifecycle = enabledLifecycle(runtime)
     const relay = await lifecycle.acquire()
     const tool = await Effect.runPromise(relay.beginTool({ name: "read", execution: "local" }))
 
@@ -1804,10 +1781,7 @@ describe("NeMo Relay process lifecycle", () => {
   test("a timed-out close retains and retries the same closing activation", async () => {
     const close = deferred()
     const runtime = fakeRuntime({ closeWait: close.promise })
-    const lifecycle = createLifecycleForTesting({
-      loader: async () => runtime.module,
-      environment: { OPENCODE_NEMO_RELAY: "1" },
-    })
+    const lifecycle = enabledLifecycle(runtime)
     await lifecycle.acquire()
 
     expect(await lifecycle.shutdown(20)).toEqual({ drained: true, flushed: true, closed: false })
@@ -1822,10 +1796,7 @@ describe("NeMo Relay process lifecycle", () => {
   test("a timed-out flush is awaited once before the retained activation closes", async () => {
     const flush = deferred()
     const runtime = fakeRuntime({ flushWait: flush.promise })
-    const lifecycle = createLifecycleForTesting({
-      loader: async () => runtime.module,
-      environment: { OPENCODE_NEMO_RELAY: "1" },
-    })
+    const lifecycle = enabledLifecycle(runtime)
     await lifecycle.acquire()
 
     expect(await lifecycle.shutdown(20)).toEqual({ drained: true, flushed: false, closed: false })
@@ -1841,10 +1812,7 @@ describe("NeMo Relay process lifecycle", () => {
   test("shutdown racing an in-flight runtime load retains and closes the late activation", async () => {
     const initialize = deferred()
     const runtime = fakeRuntime({ initializeWait: initialize.promise })
-    const lifecycle = createLifecycleForTesting({
-      loader: async () => runtime.module,
-      environment: { OPENCODE_NEMO_RELAY: "1" },
-    })
+    const lifecycle = enabledLifecycle(runtime)
     const acquiring = lifecycle.acquire()
     while (runtime.state.initialize === 0) await Promise.resolve()
 
@@ -1857,10 +1825,7 @@ describe("NeMo Relay process lifecycle", () => {
 
   test("flush failure is reported but still closes the activation", async () => {
     const runtime = fakeRuntime({ flushFails: true })
-    const lifecycle = createLifecycleForTesting({
-      loader: async () => runtime.module,
-      environment: { OPENCODE_NEMO_RELAY: "1" },
-    })
+    const lifecycle = enabledLifecycle(runtime)
     await lifecycle.acquire()
     const result = await lifecycle.shutdown(1_000)
     expect(result).toEqual({ drained: true, flushed: false, closed: true })
@@ -1873,10 +1838,7 @@ describe("NeMo Relay process lifecycle", () => {
 
   test("release preserves a failed flush for root shutdown reporting", async () => {
     const runtime = fakeRuntime({ flushThrowsSynchronously: true })
-    const lifecycle = createLifecycleForTesting({
-      loader: async () => runtime.module,
-      environment: { OPENCODE_NEMO_RELAY: "1" },
-    })
+    const lifecycle = enabledLifecycle(runtime)
     await lifecycle.acquire()
     await lifecycle.release()
 
