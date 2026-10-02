@@ -31,6 +31,7 @@ import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/l
 import { Reference } from "@opencode-ai/core/reference"
 import { Location } from "@opencode-ai/core/location"
 import { PluginV2 } from "@opencode-ai/core/plugin"
+import * as NemoRelay from "@opencode-ai/core/observability/nemo-relay"
 
 export const Info = Schema.Struct({
   name: Schema.String,
@@ -94,6 +95,7 @@ const layer = Layer.effect(
     const skill = yield* Skill.Service
     const provider = yield* Provider.Service
     const locations = yield* LocationServiceMap.Service
+    const relay = yield* NemoRelay.Service
 
     const state = yield* InstanceState.make<State>(
       Effect.fn("Agent.state")(function* (ctx) {
@@ -415,24 +417,50 @@ const layer = Layer.effect(
           ),
         } satisfies Parameters<typeof generateObject>[0]
 
-        if (isOpenaiOauth) {
-          return yield* Effect.promise(async () => {
-            const result = streamObject({
-              ...params,
-              providerOptions: ProviderTransform.providerOptions(resolved, {
-                instructions: system.join("\n"),
-                store: false,
-              }),
-              onError: () => {},
+        const generation = isOpenaiOauth
+          ? Effect.promise(async () => {
+              const result = streamObject({
+                ...params,
+                providerOptions: ProviderTransform.providerOptions(resolved, {
+                  instructions: system.join("\n"),
+                  store: false,
+                }),
+                onError: () => {},
+              })
+              for await (const part of result.fullStream) {
+                if (part.type === "error") throw part.error
+              }
+              return {
+                object: await result.object,
+                finishReason: await result.finishReason,
+                usage: await result.usage,
+              }
             })
-            for await (const part of result.fullStream) {
-              if (part.type === "error") throw part.error
-            }
-            return result.object
-          })
-        }
+          : Effect.promise(() => generateObject(params))
 
-        return yield* Effect.promise(() => generateObject(params).then((r) => r.object))
+        const result = yield* relay.observeLlmUnary(
+          {
+            role: "agent_generation",
+            agentRuntime: "v1",
+            runtime: "ai_sdk",
+            provider: resolved.providerID,
+            model: resolved.id,
+            contextLimit: resolved.limit.context,
+          },
+          generation,
+          (value) => ({
+            finish: value.finishReason,
+            tokens: {
+              inputTotal: value.usage.inputTokens,
+              inputNonCached: value.usage.inputTokenDetails.noCacheTokens,
+              inputCacheRead: value.usage.inputTokenDetails.cacheReadTokens,
+              inputCacheWrite: value.usage.inputTokenDetails.cacheWriteTokens,
+              outputTotal: value.usage.outputTokens,
+              outputReasoning: value.usage.outputTokenDetails.reasoningTokens,
+            },
+          }),
+        )
+        return result.object
       }),
     })
   }),
@@ -447,7 +475,7 @@ const locationServiceMapNode = LayerNode.make({
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [Config.node, Auth.node, Plugin.node, Skill.node, Provider.node, locationServiceMapNode],
+  deps: [Config.node, Auth.node, Plugin.node, Skill.node, Provider.node, locationServiceMapNode, NemoRelay.node],
 })
 
 export * as Agent from "./agent"

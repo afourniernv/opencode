@@ -92,6 +92,16 @@ const live: Layer.Layer<
       return "primary"
     }
 
+    const nativeProtocol = (model: Provider.Model) => {
+      if (["@ai-sdk/openai", "@ai-sdk/azure"].includes(model.api.npm)) return "openai-responses"
+      if (model.api.npm === "@ai-sdk/anthropic") return "anthropic-messages"
+      if (model.api.npm === "@ai-sdk/google") return "gemini"
+      if (model.api.npm === "@ai-sdk/amazon-bedrock") return "bedrock-converse"
+      if (model.api.npm === "@ai-sdk/openai-compatible") return "openai-compatible-chat"
+      if (model.api.npm === "@openrouter/ai-sdk-provider") return "openrouter-chat"
+      return undefined
+    }
+
     const run = Effect.fn("LLM.run")(function* (input: StreamRequest) {
       yield* Effect.logInfo("stream", {
         providerID: input.model.providerID,
@@ -384,6 +394,8 @@ const live: Layer.Layer<
                   runtime: "native",
                   provider: input.model.providerID,
                   model: input.model.id,
+                  protocol: nativeProtocol(input.model),
+                  contextLimit: input.model.limit.context,
                 },
                 result.stream,
               )
@@ -404,6 +416,7 @@ const live: Layer.Layer<
                 runtime: result.runtime,
                 provider: input.model.providerID,
                 model: input.model.id,
+                contextLimit: input.model.limit.context,
               },
               source,
             )
