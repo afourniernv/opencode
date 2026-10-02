@@ -26,6 +26,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { LLMEvent } from "@opencode-ai/llm"
+import * as NemoRelay from "@opencode-ai/core/observability/nemo-relay"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -206,8 +207,56 @@ const providerErrorLLM = Layer.succeed(
       ),
   }),
 )
-const providerErrorEnv = LayerNode.compile(root, [...replacements, [LLM.node, providerErrorLLM]])
+const providerToolObservations: NemoRelay.ToolCompleted[] = []
+const relay = Layer.succeed(
+  NemoRelay.Service,
+  NemoRelay.Service.of({
+    status: { state: "active" },
+    llmCompleted: () => Effect.void,
+    toolCompleted: (input) => Effect.sync(() => providerToolObservations.push(input)),
+  }),
+)
+const providerErrorEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, providerErrorLLM],
+  [NemoRelay.node, relay],
+])
 const itProviderError = testEffect(providerErrorEnv)
+
+const localSuccessLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "call-1", name: "lookup" }),
+        LLMEvent.toolInputEnd({ id: "call-1", name: "lookup" }),
+        LLMEvent.toolCall({ id: "call-1", name: "lookup", input: {} }),
+        LLMEvent.toolResult({
+          id: "call-1",
+          name: "lookup",
+          result: { type: "json", value: { title: "Lookup", output: "ok", metadata: {} } },
+        }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      ),
+  }),
+)
+const localToolObservations: NemoRelay.ToolCompleted[] = []
+const localRelay = Layer.succeed(
+  NemoRelay.Service,
+  NemoRelay.Service.of({
+    status: { state: "active" },
+    llmCompleted: () => Effect.void,
+    toolCompleted: (input) => Effect.sync(() => localToolObservations.push(input)),
+  }),
+)
+const localSuccessEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, localSuccessLLM],
+  [NemoRelay.node, localRelay],
+])
+const itLocalSuccess = testEffect(localSuccessEnv)
 
 const fragmentFailureLLM = Layer.succeed(
   LLM.Service,
@@ -471,6 +520,7 @@ it.live("session.processor effect tests reset reasoning state across retries", (
   provideTmpdirServer(
     ({ dir, llm }) =>
       Effect.gen(function* () {
+        providerToolObservations.length = 0
         const { processors, session, provider } = yield* boot()
 
         yield* llm.push(reply().reason("one").reset(), reply().reason("two").stop())
@@ -1112,6 +1162,60 @@ itProviderError.live("session.processor effect tests fail provider-executed erro
         expect(seen).toContain(MessageV2.Event.PartUpdated.type)
         expect(seen).toContain(MessageV2.Event.Updated.type)
         expect(seen.filter((type) => type.startsWith("session.next."))).toEqual([])
+        expect(providerToolObservations).toEqual([
+          {
+            name: "lookup",
+            outcome: "failed",
+            execution: "provider",
+            durationMs: undefined,
+          },
+        ])
+      }),
+    { config: cfg },
+  ),
+)
+
+itLocalSuccess.live("session.processor effect tests observe completed local tools", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        localToolObservations.length = 0
+        const { processors, session, provider } = yield* boot()
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "local tool")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+        yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "local tool" }],
+          tools: {},
+        })
+
+        const parts = yield* MessageV2.parts(msg.id)
+        const call = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
+        expect(call?.state.status).toBe("completed")
+        expect(localToolObservations).toEqual([
+          {
+            name: "lookup",
+            outcome: "success",
+            execution: "local",
+            durationMs: expect.any(Number),
+          },
+        ])
       }),
     { config: cfg },
   ),

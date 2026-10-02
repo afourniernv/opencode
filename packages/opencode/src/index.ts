@@ -29,6 +29,7 @@ import { DbCommand } from "./cli/cmd/db"
 import { errorMessage } from "./util/error"
 import { PluginCommand } from "./cli/cmd/plug"
 import { Heap } from "./cli/heap"
+import { shutdown as shutdownNemoRelay } from "@opencode-ai/core/observability/nemo-relay"
 
 const args = hideBin(process.argv)
 
@@ -134,6 +135,7 @@ try {
   }
   process.exitCode = 1
 } finally {
+  await shutdownNemoRelay()
   // Some subprocesses don't react properly to SIGTERM and similar signals.
   // Most notably, some docker-container-based MCP servers don't handle such signals unless
   // run using `docker run --init`.
