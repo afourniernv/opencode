@@ -57,6 +57,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
+import * as NemoRelay from "@opencode-ai/core/observability/nemo-relay"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -242,6 +243,30 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
 const it = testEffect(makeHttp())
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
+const subtaskToolObservations: NemoRelay.ToolCompleted[] = []
+const subtaskRelay = Layer.succeed(
+  NemoRelay.Service,
+  NemoRelay.Service.of(
+    NemoRelay.makeForTesting(
+      {
+        MetricKind: { Counter: "counter", Histogram: "histogram" },
+        MetricValueType: { U64: "u64", F64: "f64" },
+        metric() {},
+        flushSubscribers: async () => {},
+      },
+      { toolCompleted: (input) => Effect.sync(() => subtaskToolObservations.push(input)) },
+    ),
+  ),
+)
+const observedSubtask = testEffect(
+  LayerNode.compile(promptRoot, [
+    [SessionSummary.node, summary],
+    [LSP.node, lsp],
+    [MCP.node, makeMcp()],
+    [RuntimeFlags.node, runtimeFlags],
+    [NemoRelay.node, subtaskRelay],
+  ]),
+)
 const withMcpInstructions = testEffect(
   makeHttp({
     mcpInstructions: [
@@ -1285,10 +1310,11 @@ raceNoLLMServer.instance(
   3_000,
 )
 
-noLLMServer.instance(
+observedSubtask.instance(
   "cancel finalizes subtask tool state",
   () =>
     Effect.gen(function* () {
+      subtaskToolObservations.length = 0
       const ready = yield* Deferred.make<void>()
       const aborted = yield* Deferred.make<void>()
       const registry = yield* ToolRegistry.Service
@@ -1327,6 +1353,9 @@ noLLMServer.instance(
       expect(tool.state.status).not.toBe("running")
       expect(taskMsg.info.time.completed).toBeDefined()
       expect(taskMsg.info.finish).toBeDefined()
+      expect(subtaskToolObservations).toEqual([
+        expect.objectContaining({ name: "task", execution: "local", outcome: "cancelled" }),
+      ])
     }),
   { config: cfg },
   30_000,

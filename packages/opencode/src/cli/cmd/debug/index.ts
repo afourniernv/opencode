@@ -15,6 +15,7 @@ import { SnapshotCommand } from "./snapshot"
 import { AgentCommand } from "./agent"
 import { StartupCommand } from "./startup"
 import { V2Command } from "./v2"
+import * as NemoRelay from "@opencode-ai/core/observability/nemo-relay"
 
 export const DebugCommand = cmd({
   command: "debug",
@@ -31,6 +32,7 @@ export const DebugCommand = cmd({
       .command(StartupCommand)
       .command(AgentCommand)
       .command(V2Command)
+      .command(NemoRelayCommand)
       .command(InfoCommand)
       .command(PathsCommand)
       .command(WaitCommand)
@@ -43,6 +45,26 @@ const WaitCommand = effectCmd({
   describe: "wait indefinitely (for debugging)",
   handler: Effect.fn("Cli.debug.wait")(function* () {
     yield* Effect.sleep(Duration.days(1))
+  }),
+})
+
+const NemoRelayCommand = effectCmd({
+  command: "nemo-relay",
+  describe: "show NeMo Relay adapter and plugin-host status",
+  instance: false,
+  handler: Effect.fn("Cli.debug.nemoRelay")(function* () {
+    const relay = yield* NemoRelay.Service
+    process.stdout.write(
+      JSON.stringify(
+        {
+          service: relay.status,
+          process: NemoRelay.health(),
+          exporterDelivery: "not_probed",
+        },
+        null,
+        2,
+      ) + "\n",
+    )
   }),
 })
 

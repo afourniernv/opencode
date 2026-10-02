@@ -63,6 +63,7 @@ type ToolCall = {
   messageID: SessionV1.ToolPart["messageID"]
   sessionID: SessionV1.ToolPart["sessionID"]
   done: Deferred.Deferred<void>
+  relay?: NemoRelay.ToolObservation
 }
 
 interface ProcessorContext extends Input {
@@ -115,12 +116,25 @@ const layer = Layer.effect(
         reasoningMap: {},
       }
       let aborted = false
+      const claimedTerminalCallIDs = new Set<string>()
+
+      const claimTerminal = (toolCallID: string) => {
+        if (claimedTerminalCallIDs.has(toolCallID)) return false
+        claimedTerminalCallIDs.add(toolCallID)
+        return true
+      }
 
       const parse = (e: unknown) =>
         MessageV2.fromError(e, {
           providerID: input.model.providerID,
           aborted,
         })
+
+      const blockedError = (error: unknown) =>
+        error instanceof PermissionV1.DeniedError ||
+        error instanceof PermissionV1.RejectedError ||
+        error instanceof PermissionV1.CorrectedError ||
+        error instanceof Question.RejectedError
 
       const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
         const done = ctx.toolcalls[toolCallID]?.done
@@ -137,7 +151,11 @@ const layer = Layer.effect(
           sessionID: call.sessionID,
         })
         if (!part || part.type !== "tool") {
-          delete ctx.toolcalls[toolCallID]
+          if (claimTerminal(toolCallID)) {
+            yield* Effect.uninterruptible(
+              (call.relay?.complete("failed") ?? Effect.void).pipe(Effect.ensuring(settleToolCall(toolCallID))),
+            )
+          }
           return undefined
         }
         return { call, part }
@@ -169,62 +187,77 @@ const layer = Layer.effect(
         },
       ) {
         const match = yield* readToolCall(toolCallID)
-        if (!match || match.part.state.status !== "running") return
+        if (!match) return
+        const state = match.part.state
+        if (state.status !== "running") return
+        if (!claimTerminal(toolCallID)) return
         const end = Date.now()
-        const providerExecuted = match.part.metadata?.providerExecuted === true
-        yield* session.updatePart({
-          ...match.part,
-          state: {
-            status: "completed",
-            input: match.part.state.input,
-            output: output.output,
-            metadata: output.metadata,
-            title: output.title,
-            time: { start: match.part.state.time.start, end },
-            attachments: output.attachments,
-          },
-        })
-        if (relay.status.state === "active")
-          yield* relay.toolCompleted({
-            name: match.part.tool,
-            outcome: "success",
-            execution: providerExecuted ? "provider" : "local",
-            durationMs: providerExecuted ? undefined : end - match.part.state.time.start,
-          })
-        yield* settleToolCall(toolCallID)
+        yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            const updated = yield* session
+              .updatePart({
+                ...match.part,
+                state: {
+                  status: "completed",
+                  input: state.input,
+                  output: output.output,
+                  metadata: output.metadata,
+                  title: output.title,
+                  time: { start: state.time.start, end },
+                  attachments: output.attachments,
+                },
+              })
+              .pipe(Effect.exit)
+            if (Exit.isFailure(updated)) {
+              claimedTerminalCallIDs.delete(toolCallID)
+              yield* Effect.failCause(updated.cause)
+            }
+            const relayCompletion = match.call.relay?.complete("success")
+            if (relayCompletion) yield* relayCompletion
+            yield* settleToolCall(toolCallID)
+          }),
+        )
       })
 
       const failToolCall = Effect.fn("SessionProcessor.failToolCall")(function* (toolCallID: string, error: unknown) {
         const match = yield* readToolCall(toolCallID)
-        if (!match || match.part.state.status !== "running") return false
+        if (!match) return false
+        const state = match.part.state
+        if (state.status !== "running") return false
+        if (!claimTerminal(toolCallID)) return false
         const end = Date.now()
-        const providerExecuted = match.part.metadata?.providerExecuted === true
-        const rejected = error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError
+        const blocked = blockedError(error)
         const cancelled =
-          !rejected && typeof error === "object" && error !== null && "name" in error && error.name === "AbortError"
-        yield* session.updatePart({
-          ...match.part,
-          state: {
-            status: "error",
-            input: match.part.state.input,
-            error: errorMessage(error),
-            // Keep metadata streamed while running so failures retain progress detail (e.g. execute's child calls).
-            metadata: match.part.state.metadata,
-            time: { start: match.part.state.time.start, end },
-          },
-        })
-        if (relay.status.state === "active")
-          yield* relay.toolCompleted({
-            name: match.part.tool,
-            outcome: rejected ? "blocked" : cancelled ? "cancelled" : "failed",
-            execution: providerExecuted ? "provider" : "local",
-            durationMs: providerExecuted ? undefined : end - match.part.state.time.start,
-          })
-        if (rejected) {
-          ctx.blocked = ctx.shouldBreak
-        }
-        yield* settleToolCall(toolCallID)
-        return true
+          !blocked && typeof error === "object" && error !== null && "name" in error && error.name === "AbortError"
+        const outcome: NemoRelay.ToolOutcome = blocked ? "blocked" : cancelled ? "cancelled" : "failed"
+        return yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            const updated = yield* session
+              .updatePart({
+                ...match.part,
+                state: {
+                  status: "error",
+                  input: state.input,
+                  error: errorMessage(error),
+                  // Keep metadata streamed while running so failures retain progress detail (e.g. execute's child calls).
+                  metadata: state.metadata,
+                  time: { start: state.time.start, end },
+                },
+              })
+              .pipe(Effect.exit)
+            if (Exit.isFailure(updated)) {
+              claimedTerminalCallIDs.delete(toolCallID)
+              return yield* Effect.failCause(updated.cause)
+            }
+            const relayCompletion = match.call.relay?.complete(outcome)
+            if (relayCompletion) yield* relayCompletion
+            yield* settleToolCall(toolCallID)
+            if (blocked) {
+              ctx.blocked = ctx.shouldBreak
+            }
+            return true
+          }),
+        )
       })
 
       const finishReasoning = Effect.fn("SessionProcessor.finishReasoning")(function* (reasoningID: string) {
@@ -256,6 +289,10 @@ const layer = Layer.effect(
           }
           return { call: ctx.toolcalls[input.id], part }
         }
+        // Provider retries may legitimately reuse a call id after the prior
+        // generation settled. Terminal ownership is per admitted generation,
+        // not forever per string id.
+        claimedTerminalCallIDs.delete(input.id)
         const part = yield* session.updatePart({
           id: PartID.ascending(),
           messageID: ctx.assistantMessage.id,
@@ -357,7 +394,7 @@ const layer = Layer.effect(
             }
             yield* ensureToolCall(value)
             const input = isRecord(value.input) ? value.input : { value: value.input }
-            yield* updateToolCall(value.id, (match) => ({
+            const running = yield* updateToolCall(value.id, (match) => ({
               ...match,
               tool: value.name,
               state:
@@ -372,6 +409,16 @@ const layer = Layer.effect(
                 ? { ...value.providerMetadata, providerExecuted: true }
                 : value.providerMetadata,
             }))
+            const observed = ctx.toolcalls[value.id]
+            if (running?.state.status === "running" && observed && !observed.relay)
+              yield* Effect.uninterruptible(
+                relay
+                  .beginTool({
+                    name: value.name,
+                    execution: running.metadata?.providerExecuted === true ? "provider" : "local",
+                  })
+                  .pipe(Effect.tap((observation) => Effect.sync(() => (observed.relay = observation)))),
+              )
 
             const parts = yield* MessageV2.parts(ctx.assistantMessage.id).pipe(
               Effect.provideService(Database.Service, database),
@@ -573,7 +620,7 @@ const layer = Layer.effect(
         }
       })
 
-      const cleanup = Effect.fn("SessionProcessor.cleanup")(function* () {
+      const cleanup = Effect.fn("SessionProcessor.cleanup")(function* (unsettledOutcome: NemoRelay.ToolOutcome) {
         if (ctx.snapshot) {
           const patch = yield* snapshot.patch(ctx.snapshot)
           if (patch.files.length) {
@@ -614,30 +661,29 @@ const layer = Layer.effect(
         for (const toolCallID of Object.keys(ctx.toolcalls)) {
           const match = yield* readToolCall(toolCallID)
           if (!match) continue
+          if (!claimTerminal(toolCallID)) continue
           const part = match.part
           const end = Date.now()
           const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
-          yield* session.updatePart({
-            ...part,
-            state: {
-              ...part.state,
-              status: "error",
-              error: "Tool execution aborted",
-              metadata: { ...metadata, interrupted: true },
-              time: { start: "time" in part.state ? part.state.time.start : end, end },
-            },
-          })
-          const providerExecuted = part.metadata?.providerExecuted === true
-          if (relay.status.state === "active")
-            yield* relay.toolCompleted({
-              name: part.tool,
-              outcome: "cancelled",
-              execution: providerExecuted ? "provider" : "local",
-              durationMs:
-                providerExecuted || !("time" in part.state) || part.state.time.start === undefined
-                  ? undefined
-                  : end - part.state.time.start,
+          yield* session
+            .updatePart({
+              ...part,
+              state: {
+                ...part.state,
+                status: "error",
+                error: "Tool execution aborted",
+                metadata: { ...metadata, interrupted: true },
+                time: { start: "time" in part.state ? part.state.time.start : end, end },
+              },
             })
+            .pipe(
+              // Pending calls were observed but never executed. Only an
+              // admitted running observation owns a terminal tool metric.
+              Effect.onExit(
+                (exit) => match.call.relay?.complete(Exit.isSuccess(exit) ? unsettledOutcome : "failed") ?? Effect.void,
+              ),
+              Effect.ensuring(settleToolCall(toolCallID)),
+            )
         }
         ctx.toolcalls = {}
         ctx.assistantMessage.time.completed = Date.now()
@@ -678,9 +724,11 @@ const layer = Layer.effect(
           messageID: input.assistantMessage.id,
         })
         ctx.needsCompaction = false
+        ctx.blocked = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
+        let unsettledOutcome: NemoRelay.ToolOutcome = "failed"
 
-        return yield* Effect.gen(function* () {
+        const turn = Effect.gen(function* () {
           yield* Effect.gen(function* () {
             ctx.currentText = undefined
             ctx.reasoningMap = {}
@@ -695,6 +743,7 @@ const layer = Layer.effect(
           }).pipe(
             Effect.onInterrupt(() =>
               Effect.gen(function* () {
+                unsettledOutcome = "cancelled"
                 aborted = true
                 if (!ctx.assistantMessage.error) {
                   yield* halt(new DOMException("Aborted", "AbortError"))
@@ -703,31 +752,59 @@ const layer = Layer.effect(
             ),
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterruptsOnly(cause),
-              (cause) => Effect.fail(Cause.squash(cause)),
+              (cause) => {
+                const error = Cause.squash(cause)
+                unsettledOutcome = blockedError(error) ? "blocked" : "failed"
+                return Effect.fail(error)
+              },
             ),
             Effect.retry(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
-                set: (info) => {
-                  return status.set(ctx.sessionID, {
-                    type: "retry",
-                    attempt: info.attempt,
-                    message: info.message,
-                    action: info.action,
-                    next: info.next,
-                  })
-                },
+                set: (info) =>
+                  Effect.all(
+                    [
+                      status.set(ctx.sessionID, {
+                        type: "retry",
+                        attempt: info.attempt,
+                        message: info.message,
+                        action: info.action,
+                        next: info.next,
+                      }),
+                      relay.retryScheduled({ runtime: "v1", attempt: info.attempt }),
+                    ],
+                    { discard: true },
+                  ),
               }),
             ),
             Effect.catch(halt),
-            Effect.ensuring(cleanup()),
+            Effect.ensuring(Effect.suspend(() => cleanup(unsettledOutcome))),
           )
 
           if (ctx.needsCompaction) return "compact"
           if (ctx.blocked || ctx.assistantMessage.error) return "stop"
           return "continue"
         })
+        const role: NemoRelay.CallRole =
+          streamInput.agent.name === "compaction"
+            ? "compaction"
+            : streamInput.agent.name === "title"
+              ? "title"
+              : streamInput.agent.name === "summary"
+                ? "summary"
+                : "primary"
+        return yield* relay.observeTurn({ runtime: "v1", role }, turn, (exit) =>
+          Exit.isSuccess(exit)
+            ? exit.value === "stop"
+              ? ctx.blocked
+                ? "blocked"
+                : ctx.assistantMessage.error
+                  ? "failed"
+                  : "success"
+              : "success"
+            : undefined,
+        )
       })
 
       return {
