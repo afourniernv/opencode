@@ -181,19 +181,50 @@ export type ProcessHealth = {
   readonly status: Status
 }
 
-type Host = {
-  status: Status
-  relay?: RelayRuntime
-  activation?: PluginHostActivation
+class Host {
   accepting: boolean
-  operations: number
-  drainWaiters: Set<() => void>
+  operations = 0
+  readonly drainWaiters = new Set<() => void>()
   flushTask?: Promise<{ readonly ok: boolean }>
   flushComplete?: boolean
   flushSucceeded?: boolean
   closeTask?: Promise<{ readonly ok: boolean }>
   closeComplete?: boolean
   activationTask?: Promise<void>
+
+  constructor(
+    public status: Status,
+    public readonly relay?: RelayRuntime,
+    public activation?: PluginHostActivation,
+  ) {
+    this.accepting = status.state === "active"
+  }
+
+  admit() {
+    if (!this.accepting || this.status.state !== "active") return undefined
+    if (this.activation && activationIsActive(this.activation) !== true) return undefined
+    this.operations++
+    return new ObservationLease(this)
+  }
+
+  finish() {
+    this.operations = Math.max(0, this.operations - 1)
+    if (this.operations !== 0) return
+    for (const resolve of this.drainWaiters) resolve()
+    this.drainWaiters.clear()
+  }
+}
+
+class ObservationLease {
+  private released = false
+
+  constructor(private readonly host: Host) {}
+
+  release() {
+    if (this.released) return
+    this.released = true
+    this.host.finish()
+  }
 }
 
 export type Runtime = "native" | "ai_sdk" | "workflow" | "unknown"
@@ -670,11 +701,11 @@ function activationMetric(relay: RelayModule) {
 }
 
 function inactive(status: Status): Host {
-  return { status, accepting: false, operations: 0, drainWaiters: new Set() }
+  return new Host(status)
 }
 
 function activeHost(status: Status, relay: RelayRuntime, activation?: PluginHostActivation): Host {
-  return { status, relay, activation, accepting: status.state === "active", operations: 0, drainWaiters: new Set() }
+  return new Host(status, relay, activation)
 }
 
 function activationIsActive(activation: PluginHostActivation) {
@@ -1051,17 +1082,7 @@ class Lifecycle {
   }
 
   admit(host: Host) {
-    if (this.stopping || this.stopped || !host.accepting || host.status.state !== "active") return false
-    if (host.activation && activationIsActive(host.activation) !== true) return false
-    host.operations++
-    return true
-  }
-
-  finish(host: Host) {
-    host.operations = Math.max(0, host.operations - 1)
-    if (host.operations !== 0) return
-    for (const resolve of host.drainWaiters) resolve()
-    host.drainWaiters.clear()
+    return this.stopping || this.stopped ? undefined : host.admit()
   }
 
   shutdown(timeoutMs = DEFAULT_TEARDOWN_TIMEOUT_MS) {
@@ -2510,15 +2531,12 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
       yield* publication.pipe(Effect.ensuring(providerAttemptTrace(traceState, scope, event)))
     })
 
-  const admit = () => (lifecycle ? lifecycle.admit(host) : host.accepting)
-  const finish = () => {
-    if (lifecycle) lifecycle.finish(host)
-  }
+  const admit = () => (lifecycle ? lifecycle.admit(host) : host.admit())
 
   const beginTool: Interface["beginTool"] = (input) =>
     Effect.gen(function* () {
-      if (!admit()) return noopTool
-      if (!lifecycle) host.operations++
+      const lease = admit()
+      if (!lease) return noopTool
       const run = yield* CurrentRelayRun
       if (run) run.toolCalls++
       const parent = yield* CurrentRelayScope
@@ -2545,10 +2563,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
             return toolCompleted(completedInput).pipe(
               Effect.ensuring(endToolTrace(traceScope, completedInput)),
               Effect.ensuring(
-                Effect.sync(() => {
-                  if (lifecycle) finish()
-                  else host.operations = Math.max(0, host.operations - 1)
-                }),
+                Effect.sync(() => lease.release()),
               ),
             )
           })
@@ -2564,8 +2579,8 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
       Effect.gen(function* () {
         // Acquire at subscription time: an unconsumed lazy stream must not
         // hold shutdown open, and each subscription is a distinct attempt.
-        if (!admit()) return source
-        if (!lifecycle) host.operations++
+        const lease = admit()
+        if (!lease) return source
         const run = yield* CurrentRelayRun
         if (run) run.llmOperations++
         const parent = yield* CurrentRelayScope
@@ -2647,10 +2662,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
             )
           }),
           Stream.ensuring(
-            Effect.sync(() => {
-              if (lifecycle) finish()
-              else host.operations = Math.max(0, host.operations - 1)
-            }),
+            Effect.sync(() => lease.release()),
           ),
         )
       }),
@@ -2658,8 +2670,8 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
 
   const observeLlmUnary: Interface["observeLlmUnary"] = (input, effect, project) =>
     Effect.suspend(() => {
-      if (!admit()) return effect
-      if (!lifecycle) host.operations++
+      const lease = admit()
+      if (!lease) return effect
       const started = performance.now()
       return Effect.gen(function* () {
         const run = yield* CurrentRelayRun
@@ -2688,10 +2700,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
             )
           }),
           Effect.ensuring(
-            Effect.sync(() => {
-              if (lifecycle) finish()
-              else host.operations = Math.max(0, host.operations - 1)
-            }),
+            Effect.sync(() => lease.release()),
           ),
         )
       })
@@ -2699,8 +2708,8 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
 
   const observePermissionWait: Interface["observePermissionWait"] = (input, effect, classify) =>
     Effect.suspend(() => {
-      if (!admit()) return effect
-      if (!lifecycle) host.operations++
+      const lease = admit()
+      if (!lease) return effect
       const started = performance.now()
       return Effect.gen(function* () {
         const run = yield* CurrentRelayRun
@@ -2720,10 +2729,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
             )
           }),
           Effect.ensuring(
-            Effect.sync(() => {
-              if (lifecycle) finish()
-              else host.operations = Math.max(0, host.operations - 1)
-            }),
+            Effect.sync(() => lease.release()),
           ),
         )
       })
@@ -2731,8 +2737,8 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
 
   const observeQuestionWait: Interface["observeQuestionWait"] = (input, effect, classify) =>
     Effect.suspend(() => {
-      if (!admit()) return effect
-      if (!lifecycle) host.operations++
+      const lease = admit()
+      if (!lease) return effect
       const started = performance.now()
       return Effect.gen(function* () {
         const run = yield* CurrentRelayRun
@@ -2752,10 +2758,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
             )
           }),
           Effect.ensuring(
-            Effect.sync(() => {
-              if (lifecycle) finish()
-              else host.operations = Math.max(0, host.operations - 1)
-            }),
+            Effect.sync(() => lease.release()),
           ),
         )
       })
@@ -2763,8 +2766,8 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
 
   const observeRun: Interface["observeRun"] = (input, effect, classify) =>
     Effect.suspend(() => {
-      if (!admit()) return effect
-      if (!lifecycle) host.operations++
+      const lease = admit()
+      if (!lease) return effect
       const started = performance.now()
       const operations: MutableRunOperationCounts = {
         turns: 0,
@@ -2804,10 +2807,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
             return runCompleted(completedInput).pipe(Effect.ensuring(endRunTrace(traceScope, completedInput)))
           }),
           Effect.ensuring(
-            Effect.sync(() => {
-              if (lifecycle) finish()
-              else host.operations = Math.max(0, host.operations - 1)
-            }),
+            Effect.sync(() => lease.release()),
           ),
         )
       })
@@ -2821,8 +2821,8 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
     Effect.suspend(() => {
       // Effects are lazy too; lease the actual execution rather than the
       // constructed Effect value.
-      if (!admit()) return effect
-      if (!lifecycle) host.operations++
+      const lease = admit()
+      if (!lease) return effect
       const started = performance.now()
       return Effect.gen(function* () {
         const run = yield* CurrentRelayRun
@@ -2842,10 +2842,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
             return turnCompleted(completedInput).pipe(Effect.ensuring(endTurnTrace(traceScope, completedInput)))
           }),
           Effect.ensuring(
-            Effect.sync(() => {
-              if (lifecycle) finish()
-              else host.operations = Math.max(0, host.operations - 1)
-            }),
+            Effect.sync(() => lease.release()),
           ),
         )
       })
