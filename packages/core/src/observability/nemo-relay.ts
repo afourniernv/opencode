@@ -515,7 +515,7 @@ const CurrentRelayScope = Context.Reference<RelayScopeContext | undefined>("@ope
 })
 
 type MutableRunOperationCounts = { -readonly [K in keyof RunOperationCounts]: RunOperationCounts[K] } & {
-  lastTurnOutcome?: TurnOutcome
+  lastPrimaryTurnOutcome?: TurnOutcome
 }
 
 const CurrentRelayRun = Context.Reference<MutableRunOperationCounts | undefined>("@opencode/NemoRelay/CurrentRun", {
@@ -2780,7 +2780,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
         return yield* observed.pipe(
           Effect.onExit((exit) => {
             const classified = classifyExit(exit, classify)
-            const outcome = classified === "success" ? (operations.lastTurnOutcome ?? classified) : classified
+            const outcome = classified === "success" ? (operations.lastPrimaryTurnOutcome ?? classified) : classified
             const completedInput = {
               ...input,
               outcome,
@@ -2818,7 +2818,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
         return yield* observed.pipe(
           Effect.onExit((exit) => {
             const outcome = classifyExit(exit, classify)
-            if (run) run.lastTurnOutcome = outcome
+            if (run && input.role === "primary") run.lastPrimaryTurnOutcome = outcome
             const completedInput = {
               ...input,
               outcome,

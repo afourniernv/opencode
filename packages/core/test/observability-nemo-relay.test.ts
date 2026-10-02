@@ -820,6 +820,40 @@ describe("NeMo Relay observability", () => {
     expect(completed.map((item) => item.outcome)).toEqual(["blocked", "cancelled"])
   })
 
+  test("derives run outcome from primary turns when concurrent support turns finish later", async () => {
+    const primaryClosed = deferred()
+    let completed: { readonly outcome: string; readonly turns: number } | undefined
+    const relay = makeForTesting(driver(), {
+      turnCompleted: (input) =>
+        Effect.sync(() => {
+          if (input.role === "primary") primaryClosed.resolve()
+        }),
+      runCompleted: (input) =>
+        Effect.sync(() => {
+          completed = { outcome: input.outcome, turns: input.operations.turns }
+        }),
+    })
+
+    await Effect.runPromise(
+      relay.observeRun(
+        { runtime: "v2" },
+        Effect.all(
+          [
+            relay.observeTurn({ runtime: "v2", role: "primary" }, Effect.void, () => "success"),
+            relay.observeTurn(
+              { runtime: "v2", role: "compaction" },
+              Effect.promise(() => primaryClosed.promise),
+              () => "failed",
+            ),
+          ],
+          { concurrency: "unbounded", discard: true },
+        ),
+      ),
+    )
+
+    expect(completed).toEqual({ outcome: "success", turns: 2 })
+  })
+
   test("creates independent observations per subscription and identifies downstream early close", async () => {
     const completed: LlmStreamCompleted[] = []
     const relay = makeForTesting(driver(), {
