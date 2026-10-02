@@ -184,6 +184,26 @@ test("unsettled provider tools are cancelled once during interruption cleanup", 
   ])
 })
 
+test("the observation-only finalizer closes provider tools once without changing durable state", async () => {
+  const { observed, published, publisher } = capture()
+  await Effect.runPromise(
+    publisher.publish(
+      LLMEvent.toolCall({ id: "call-provider-finalizer", name: "lookup", input: {}, providerExecuted: true }),
+    ),
+  )
+  await Effect.runPromise(publisher.closeUnsettledRelay("failed"))
+  await Effect.runPromise(publisher.closeUnsettledRelay("cancelled"))
+
+  expect(observed).toEqual([
+    {
+      name: "lookup",
+      execution: "provider",
+      outcome: "failed",
+    },
+  ])
+  expect(published.some((event) => event.type === "session.next.tool.failed.1")).toBe(false)
+})
+
 test("durable tool failure remains fail-fast while all Relay observations close", async () => {
   const { attempted, observed, publisher } = capture("session.next.tool.failed.1")
   await Effect.runPromise(

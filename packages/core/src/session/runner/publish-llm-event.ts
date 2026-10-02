@@ -45,6 +45,18 @@ type SettledOutput =
   | { readonly structured: Record<string, unknown>; readonly content: ToolOutput["content"] }
   | { readonly error: { readonly type: "unknown"; readonly message: string } }
 
+type ToolState = {
+  readonly assistantMessageID: SessionMessage.ID
+  readonly name: string
+  inputEnded: boolean
+  called: boolean
+  settled: boolean
+  providerExecuted: boolean
+  providerMetadata?: ProviderMetadata
+  relay?: ToolObservation
+  relayCompleted: boolean
+}
+
 const settledOutput = (value: ToolOutput | undefined, result: ToolResultValue): SettledOutput => {
   if (result.type === "error") return { error: { type: "unknown", message: message(result.value) } }
   const settled = value ?? ToolOutput.fromResultValue(result)
@@ -54,19 +66,7 @@ const settledOutput = (value: ToolOutput | undefined, result: ToolResultValue): 
 
 /** Persist one provider turn without executing tools or starting a continuation turn. */
 export const createLLMEventPublisher = (events: EventV2.Interface, input: Input) => {
-  const tools = new Map<
-    string,
-    {
-      readonly assistantMessageID: SessionMessage.ID
-      readonly name: string
-      inputEnded: boolean
-      called: boolean
-      settled: boolean
-      providerExecuted: boolean
-      providerMetadata?: ProviderMetadata
-      relay?: ToolObservation
-    }
-  >()
+  const tools = new Map<string, ToolState>()
   const timestamp = DateTime.now
   let assistantMessageID: SessionMessage.ID | undefined
   let assistantActive = false
@@ -175,6 +175,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
       called: false,
       settled: false,
       providerExecuted: false,
+      relayCompleted: false,
     })
     yield* toolInput.start(event.id)
     yield* events.publish(SessionEvent.Tool.Input.Started, {
@@ -213,6 +214,17 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
     })
   })
 
+  const completeRelay = (tool: ToolState, outcome: ToolOutcome) =>
+    Effect.suspend(() => {
+      if (!tool.relay || tool.relayCompleted) return Effect.void
+      tool.relayCompleted = true
+      return tool.relay.complete(outcome)
+    })
+
+  const closeUnsettledRelay = Effect.fnUntraced(function* (outcome: ToolOutcome) {
+    for (const tool of tools.values()) yield* completeRelay(tool, outcome).pipe(Effect.exit)
+  })
+
   const failUnsettledTools = Effect.fn("SessionRunner.failUnsettledTools")(function* (
     message: string,
     hostedOnly = false,
@@ -221,7 +233,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
     const closeRemainingRelay = Effect.fnUntraced(function* () {
       for (const tool of tools.values()) {
         if (tool.settled || (hostedOnly && !tool.providerExecuted)) continue
-        yield* (tool.relay?.complete(outcome) ?? Effect.void).pipe(Effect.exit)
+        yield* completeRelay(tool, outcome).pipe(Effect.exit)
       }
     })
     for (const [callID, tool] of tools) {
@@ -239,7 +251,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
             ...(tool.providerMetadata === undefined ? {} : { metadata: tool.providerMetadata }),
           },
         })
-        .pipe(Effect.ensuring(tool.relay?.complete(outcome) ?? Effect.void))
+        .pipe(Effect.ensuring(completeRelay(tool, outcome)))
         .pipe(
           Effect.catchCause((cause) =>
             Effect.gen(function* () {
@@ -364,7 +376,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
           .pipe(
             Effect.onExit((exit) =>
               Exit.isFailure(exit)
-                ? (tool.relay?.complete(Cause.hasInterruptsOnly(exit.cause) ? "cancelled" : "failed") ?? Effect.void)
+                ? completeRelay(tool, Cause.hasInterruptsOnly(exit.cause) ? "cancelled" : "failed")
                 : Effect.void,
             ),
           )
@@ -402,7 +414,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
               result: event.result,
               provider,
             })
-            .pipe(Effect.ensuring(tool.relay?.complete("failed") ?? Effect.void))
+            .pipe(Effect.ensuring(completeRelay(tool, "failed")))
           return
         }
         yield* events
@@ -417,11 +429,11 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
             provider,
           })
           .pipe(
-            Effect.onExit(
-              (exit) =>
-                tool.relay?.complete(
-                  Exit.isSuccess(exit) ? "success" : Cause.hasInterruptsOnly(exit.cause) ? "cancelled" : "failed",
-                ) ?? Effect.void,
+            Effect.onExit((exit) =>
+              completeRelay(
+                tool,
+                Exit.isSuccess(exit) ? "success" : Cause.hasInterruptsOnly(exit.cause) ? "cancelled" : "failed",
+              ),
             ),
           )
         return
@@ -445,7 +457,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
               ...(event.providerMetadata === undefined ? {} : { metadata: event.providerMetadata }),
             },
           })
-          .pipe(Effect.ensuring(tool.relay?.complete("failed") ?? Effect.void))
+          .pipe(Effect.ensuring(completeRelay(tool, "failed")))
         return
       }
       case "step-finish":
@@ -468,6 +480,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
     flush,
     failAssistant,
     failUnsettledTools,
+    closeUnsettledRelay,
     hasActiveAssistant: () => assistantActive,
     hasAssistantStarted: () => assistantMessageID !== undefined,
     hasProviderError: () => providerFailed,

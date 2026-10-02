@@ -39,6 +39,120 @@ function driver(emissions: Emission[] = []) {
   }
 }
 
+type TraceRecord = {
+  readonly phase: "start" | "end" | "event"
+  readonly kind: "scope" | "llm" | "tool" | "event"
+  readonly id?: string
+  readonly parent?: string
+  readonly name: string
+  readonly payload?: unknown
+  readonly metadata?: unknown
+}
+
+function traceDriver(records: TraceRecord[] = []) {
+  type Handle = { readonly id: string; readonly parent?: Handle; readonly name: string }
+  type Stack = { current?: Handle }
+  let active: Stack | undefined
+  let next = 0
+  const handle = (name: string) => ({ id: `trace-${++next}`, parent: active?.current, name })
+  const start = (kind: "scope" | "llm" | "tool", name: string, payload?: unknown, metadata?: unknown) => {
+    const value = handle(name)
+    records.push({ phase: "start", kind, id: value.id, parent: value.parent?.id, name, payload, metadata })
+    return value
+  }
+  return {
+    ScopeType: { Agent: "agent", Llm: "llm", Tool: "tool" },
+    createScopeStack: () => ({ current: handle("implicit-root") }) satisfies Stack,
+    capturePropagationContext: () => ({ parent: active?.current }),
+    createScopeStackFromPropagation: (context: unknown) => ({
+      current: (context as { readonly parent?: Handle }).parent,
+    }),
+    withScopeStack(stack: unknown, callback: () => unknown) {
+      const previous = active
+      active = stack as Stack
+      try {
+        return callback()
+      } finally {
+        active = previous
+      }
+    },
+    pushScope(
+      name: string,
+      _scopeType: unknown,
+      _handle?: unknown,
+      _attributes?: number | null,
+      _data?: unknown,
+      metadata?: unknown,
+      payload?: unknown,
+    ) {
+      const value = start("scope", name, payload, metadata)
+      if (active) active.current = value
+      return value
+    },
+    popScope(value: unknown, payload?: unknown, _timestamp?: number | null, metadata?: unknown) {
+      const item = value as Handle
+      records.push({
+        phase: "end",
+        kind: "scope",
+        id: item.id,
+        parent: item.parent?.id,
+        name: item.name,
+        payload,
+        metadata,
+      })
+      if (active) active.current = item.parent
+    },
+    llmCall(
+      name: string,
+      payload: unknown,
+      _handle?: unknown,
+      _attributes?: number | null,
+      _data?: unknown,
+      metadata?: unknown,
+    ) {
+      return start("llm", name, payload, metadata)
+    },
+    llmCallEnd(value: unknown, payload?: unknown, _data?: unknown, metadata?: unknown) {
+      const item = value as Handle
+      records.push({
+        phase: "end",
+        kind: "llm",
+        id: item.id,
+        parent: item.parent?.id,
+        name: item.name,
+        payload,
+        metadata,
+      })
+    },
+    toolCall(
+      name: string,
+      payload: unknown,
+      _handle?: unknown,
+      _attributes?: number | null,
+      _data?: unknown,
+      metadata?: unknown,
+    ) {
+      return start("tool", name, payload, metadata)
+    },
+    toolCallEnd(value: unknown, payload?: unknown, _data?: unknown, metadata?: unknown) {
+      const item = value as Handle
+      records.push({
+        phase: "end",
+        kind: "tool",
+        id: item.id,
+        parent: item.parent?.id,
+        name: item.name,
+        payload,
+        metadata,
+      })
+    },
+    event(name: string, value?: unknown, payload?: unknown, metadata?: unknown) {
+      const item = value as Handle | undefined
+      records.push({ phase: "event", kind: "event", parent: item?.id, name, payload, metadata })
+    },
+  }
+}
+
 function deferred() {
   let resolve!: () => void
   const promise = new Promise<void>((done) => {
@@ -110,6 +224,7 @@ function fakeRuntime(input?: {
     state,
     module: {
       ...metrics,
+      ...traceDriver(),
       flushSubscribers() {
         state.flush++
         if (input?.flushThrowsSynchronously) throw new Error("flush failed synchronously")
@@ -132,6 +247,7 @@ describe("NeMo Relay observability", () => {
   test("maps arbitrary identifiers into closed families and categories", () => {
     expect(providerFamily("openrouter-team-secret")).toBe("openrouter")
     expect(providerFamily("azure-openai-prod")).toBe("azure")
+    expect(providerFamily("nvidia")).toBe("nvidia")
     expect(providerFamily("customer-provider-with-private-name")).toBe("custom")
     expect(modelFamily("tenant/private-model-name")).toBe("custom")
     expect(modelFamily("anthropic/claude-sonnet-4")).toBe("claude")
@@ -212,7 +328,7 @@ describe("NeMo Relay observability", () => {
     expect(JSON.stringify(emissions)).not.toContain("tenant/private-model-name")
   })
 
-  test("prefers aggregate finish usage, sums step fallbacks, and marks missing finish incomplete", async () => {
+  test("prefers aggregate finish usage, sanitizes step fields before summing, and marks missing finish incomplete", async () => {
     const completed: Array<{ readonly outcome: string; readonly tokens?: { readonly inputTotal?: number } }> = []
     const relay = makeForTesting(driver(), {
       llmStreamCompleted: (input) => Effect.sync(() => completed.push(input)),
@@ -251,10 +367,36 @@ describe("NeMo Relay observability", () => {
         )
         .pipe(Stream.runDrain),
     )
+    await Effect.runPromise(
+      relay
+        .observeLlmStream(
+          { role: "primary", agentRuntime: "v1", runtime: "native", provider: "openai", model: "gpt" },
+          Stream.fromIterable([
+            {
+              type: "step-finish",
+              reason: "tool-calls",
+              usage: { inputTokens: -2, outputTokens: Number.NaN, cacheReadInputTokens: Number.POSITIVE_INFINITY },
+            },
+            { type: "step-finish", reason: "stop", usage: { inputTokens: 5, outputTokens: 1.9 } },
+          ]),
+        )
+        .pipe(Stream.runDrain),
+    )
     expect(completed).toEqual([
       expect.objectContaining({ outcome: "success", tokens: expect.objectContaining({ inputTotal: 11 }) }),
       expect.objectContaining({ outcome: "incomplete", tokens: expect.objectContaining({ inputTotal: 7 }) }),
       expect.objectContaining({ outcome: "success", tokens: expect.objectContaining({ inputTotal: 13 }) }),
+      expect.objectContaining({
+        outcome: "incomplete",
+        tokens: {
+          inputTotal: 5,
+          inputNonCached: undefined,
+          inputCacheRead: undefined,
+          inputCacheWrite: undefined,
+          outputTotal: 1,
+          outputReasoning: undefined,
+        },
+      }),
     ])
   })
 
@@ -357,6 +499,52 @@ describe("NeMo Relay observability", () => {
     await expect(
       Effect.runPromise(relay.toolCompleted({ name: "read", execution: "local", outcome: "success", durationMs: 10 })),
     ).resolves.toBeUndefined()
+  })
+
+  test("emits privacy-bounded turn, LLM, tool, and retry traces on isolated child stacks", async () => {
+    const records: TraceRecord[] = []
+    const relay = makeForTesting({ ...driver(), ...traceDriver(records) })
+
+    await Effect.runPromise(
+      relay.observeTurn(
+        { role: "primary", runtime: "v2" },
+        Effect.gen(function* () {
+          yield* Effect.all(
+            ["first-private-model", "second-private-model"].map((model) =>
+              relay
+                .observeLlmStream(
+                  {
+                    role: "primary",
+                    agentRuntime: "v2",
+                    runtime: "native",
+                    provider: "private-provider-name",
+                    model,
+                  },
+                  Stream.make({ type: "finish", reason: "stop", usage: { inputTokens: 2, outputTokens: 1 } }),
+                )
+                .pipe(Stream.runDrain),
+            ),
+            { concurrency: "unbounded", discard: true },
+          )
+          const tool = yield* relay.beginTool({ name: "private-tool-name", execution: "local" })
+          yield* tool.complete("success")
+          yield* relay.retryScheduled({ runtime: "v2", attempt: 2 })
+        }),
+      ),
+    )
+
+    const turn = records.find((item) => item.phase === "start" && item.kind === "scope")
+    const children = records.filter((item) => item.phase === "start" && ["llm", "tool"].includes(item.kind))
+    expect(turn?.name).toBe("opencode.agent.turn")
+    expect(children).toHaveLength(3)
+    expect(children.every((item) => item.parent === turn?.id)).toBe(true)
+    expect(records.find((item) => item.phase === "event")?.parent).toBe(turn?.id)
+    expect(records.at(-1)).toMatchObject({ phase: "end", kind: "scope", id: turn?.id })
+    expect(JSON.stringify(records)).not.toContain("private-provider-name")
+    expect(JSON.stringify(records)).not.toContain("private-tool-name")
+    expect(JSON.stringify(records)).not.toContain("first-private-model")
+    expect(JSON.stringify(records)).toContain("provider_family")
+    expect(JSON.stringify(records)).toContain("model_family")
   })
 })
 

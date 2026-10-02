@@ -1,4 +1,5 @@
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -395,11 +396,131 @@ const fragmentFailureLLM = Layer.succeed(
 const fragmentFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, fragmentFailureLLM]])
 const itFragmentFailure = testEffect(fragmentFailureEnv)
 
+const relayMetrics = {
+  MetricKind: { Counter: "counter", Histogram: "histogram" },
+  MetricValueType: { U64: "u64", F64: "f64" },
+  metric() {},
+  flushSubscribers: async () => {},
+}
+
+function policyFailureLLM(error: PermissionV1.Error) {
+  return Layer.succeed(
+    LLM.Service,
+    LLM.Service.of({
+      stream: () =>
+        Stream.make(
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolInputStart({ id: "call-policy", name: "lookup" }),
+          LLMEvent.toolInputEnd({ id: "call-policy", name: "lookup" }),
+          LLMEvent.toolCall({ id: "call-policy", name: "lookup", input: {} }),
+          LLMEvent.toolError({ id: "call-policy", name: "lookup", message: error.message, error }),
+          LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+          LLMEvent.finish({ reason: "stop" }),
+        ),
+    }),
+  )
+}
+
+function policyFailureEnv(error: PermissionV1.Error, observations: NemoRelay.ToolCompleted[]) {
+  const policyRelay = Layer.succeed(
+    NemoRelay.Service,
+    NemoRelay.Service.of(
+      NemoRelay.makeForTesting(relayMetrics, {
+        toolCompleted: (input) => Effect.sync(() => observations.push(input)),
+      }),
+    ),
+  )
+  return LayerNode.compile(root, [...replacements, [LLM.node, policyFailureLLM(error)], [NemoRelay.node, policyRelay]])
+}
+
+const deniedToolObservations: NemoRelay.ToolCompleted[] = []
+const correctedToolObservations: NemoRelay.ToolCompleted[] = []
+const rejectedToolObservations: NemoRelay.ToolCompleted[] = []
+const itDeniedTool = testEffect(policyFailureEnv(new PermissionV1.DeniedError({ ruleset: [] }), deniedToolObservations))
+const itCorrectedTool = testEffect(
+  policyFailureEnv(new PermissionV1.CorrectedError({ feedback: "Use another tool" }), correctedToolObservations),
+)
+const itRejectedTool = testEffect(policyFailureEnv(new PermissionV1.RejectedError(), rejectedToolObservations))
+
+let cleanupFailureGate = defer<void>()
+const cleanupFailureLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "call-first", name: "first" }),
+        LLMEvent.toolInputEnd({ id: "call-first", name: "first" }),
+        LLMEvent.toolCall({ id: "call-first", name: "first", input: {} }),
+        LLMEvent.toolInputStart({ id: "call-second", name: "second" }),
+        LLMEvent.toolInputEnd({ id: "call-second", name: "second" }),
+        LLMEvent.toolCall({ id: "call-second", name: "second", input: {} }),
+      ).pipe(
+        Stream.concat(
+          Stream.unwrap(
+            Effect.promise(() => cleanupFailureGate.promise).pipe(
+              Effect.as(Stream.make(LLMEvent.providerError({ message: "provider boom" }))),
+            ),
+          ),
+        ),
+      ),
+  }),
+)
+const cleanupFailureObservations: NemoRelay.ToolCompleted[] = []
+const cleanupFailureRelay = Layer.succeed(
+  NemoRelay.Service,
+  NemoRelay.Service.of(
+    NemoRelay.makeForTesting(relayMetrics, {
+      toolCompleted: (input) =>
+        Effect.sync(() => {
+          cleanupFailureObservations.push(input)
+          if (input.name === "first") throw new Error("first Relay completion failed")
+        }),
+    }),
+  ),
+)
+const cleanupFailureEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, cleanupFailureLLM],
+  [NemoRelay.node, cleanupFailureRelay],
+])
+const itCleanupFailure = testEffect(cleanupFailureEnv)
+
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
   const session = yield* Session.Service
   const provider = yield* Provider.Service
   return { processors, session, provider }
+})
+
+const runPolicyFailure = Effect.fn("test.runPolicyFailure")(function* (dir: string, prompt: string) {
+  const { processors, session, provider } = yield* boot()
+  const chat = yield* session.create({})
+  const parent = yield* user(chat.id, prompt)
+  const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+  const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+  const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+  const result = yield* handle.process({
+    user: {
+      id: parent.id,
+      sessionID: chat.id,
+      role: "user",
+      time: parent.time,
+      agent: parent.agent,
+      model: { providerID: ref.providerID, modelID: ref.modelID },
+    } satisfies SessionV1.User,
+    sessionID: chat.id,
+    model: mdl,
+    agent: agent(),
+    system: [],
+    messages: [{ role: "user", content: prompt }],
+    tools: {},
+  })
+  const parts = yield* MessageV2.parts(msg.id)
+  return {
+    result,
+    call: parts.find((part): part is SessionV1.ToolPart => part.type === "tool"),
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -1361,6 +1482,119 @@ itProviderError.live("session.processor effect tests fail provider-executed erro
           },
         ])
       }),
+    { config: cfg },
+  ),
+)
+
+itDeniedTool.live("session.processor effect tests continue after a denied tool while reporting blocked", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        deniedToolObservations.length = 0
+        const result = yield* runPolicyFailure(dir, "denied tool")
+
+        expect(result.result).toBe("continue")
+        expect(result.call?.state.status).toBe("error")
+        expect(deniedToolObservations).toEqual([
+          expect.objectContaining({ name: "lookup", execution: "local", outcome: "blocked" }),
+        ])
+      }),
+    { config: cfg },
+  ),
+)
+
+itCorrectedTool.live("session.processor effect tests continue after a corrected tool while reporting blocked", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        correctedToolObservations.length = 0
+        const result = yield* runPolicyFailure(dir, "corrected tool")
+
+        expect(result.result).toBe("continue")
+        expect(result.call?.state.status).toBe("error")
+        expect(correctedToolObservations).toEqual([
+          expect.objectContaining({ name: "lookup", execution: "local", outcome: "blocked" }),
+        ])
+      }),
+    { config: cfg },
+  ),
+)
+
+itRejectedTool.live("session.processor effect tests stop after a rejected tool while reporting blocked", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        rejectedToolObservations.length = 0
+        const result = yield* runPolicyFailure(dir, "rejected tool")
+
+        expect(result.result).toBe("stop")
+        expect(result.call?.state.status).toBe("error")
+        expect(rejectedToolObservations).toEqual([
+          expect.objectContaining({ name: "lookup", execution: "local", outcome: "blocked" }),
+        ])
+      }),
+    { config: cfg },
+  ),
+)
+
+itCleanupFailure.live("session.processor effect tests settle every Relay tool after cleanup I/O failure", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        cleanupFailureGate = defer<void>()
+        cleanupFailureObservations.length = 0
+        const database = yield* Database.Service
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "cleanup failure")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+        const run = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "cleanup failure" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+
+        yield* waitFor(
+          MessageV2.parts(msg.id).pipe(
+            Effect.map((parts) => {
+              const calls = parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
+              return calls.length === 2 && calls.every((call) => call.state.status === "running") ? calls : undefined
+            }),
+          ),
+          "timed out waiting for running cleanup tool parts",
+        )
+
+        // Rename the table only after both tools are durably admitted. This
+        // makes cleanup getPart fail for every call without permanently
+        // damaging the test database.
+        yield* database.db.run("ALTER TABLE part RENAME TO part_cleanup_failure")
+        cleanupFailureGate.resolve()
+        const exit = yield* Fiber.await(run).pipe(
+          Effect.ensuring(database.db.run("ALTER TABLE part_cleanup_failure RENAME TO part").pipe(Effect.ignore)),
+        )
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(cleanupFailureObservations).toEqual([
+          expect.objectContaining({ name: "first", execution: "local", outcome: "failed" }),
+          expect.objectContaining({ name: "second", execution: "local", outcome: "failed" }),
+        ])
+      }).pipe(Effect.ensuring(Effect.sync(() => cleanupFailureGate.resolve()))),
     { config: cfg },
   ),
 )
