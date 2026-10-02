@@ -2533,6 +2533,15 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
 
   const admit = () => (lifecycle ? lifecycle.admit(host) : host.admit())
 
+  const leasedEffect = <A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+    observe: () => Effect.Effect<A, E, R>,
+  ): Effect.Effect<A, E, R> =>
+    Effect.suspend(() => {
+      const lease = admit()
+      return lease ? observe().pipe(Effect.ensuring(Effect.sync(() => lease.release()))) : effect
+    })
+
   const beginTool: Interface["beginTool"] = (input) =>
     Effect.gen(function* () {
       const lease = admit()
@@ -2669,9 +2678,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
     )
 
   const observeLlmUnary: Interface["observeLlmUnary"] = (input, effect, project) =>
-    Effect.suspend(() => {
-      const lease = admit()
-      if (!lease) return effect
+    leasedEffect(effect, () => {
       const started = performance.now()
       return Effect.gen(function* () {
         const run = yield* CurrentRelayRun
@@ -2699,17 +2706,12 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
               Effect.ensuring(endLlmTrace(traceScope, completedInput, "unary")),
             )
           }),
-          Effect.ensuring(
-            Effect.sync(() => lease.release()),
-          ),
         )
       })
     })
 
   const observePermissionWait: Interface["observePermissionWait"] = (input, effect, classify) =>
-    Effect.suspend(() => {
-      const lease = admit()
-      if (!lease) return effect
+    leasedEffect(effect, () => {
       const started = performance.now()
       return Effect.gen(function* () {
         const run = yield* CurrentRelayRun
@@ -2728,17 +2730,12 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
               Effect.ensuring(endPermissionWaitTrace(traceScope, completedInput)),
             )
           }),
-          Effect.ensuring(
-            Effect.sync(() => lease.release()),
-          ),
         )
       })
     })
 
   const observeQuestionWait: Interface["observeQuestionWait"] = (input, effect, classify) =>
-    Effect.suspend(() => {
-      const lease = admit()
-      if (!lease) return effect
+    leasedEffect(effect, () => {
       const started = performance.now()
       return Effect.gen(function* () {
         const run = yield* CurrentRelayRun
@@ -2757,17 +2754,12 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
               Effect.ensuring(endQuestionWaitTrace(traceScope, completedInput)),
             )
           }),
-          Effect.ensuring(
-            Effect.sync(() => lease.release()),
-          ),
         )
       })
     })
 
   const observeRun: Interface["observeRun"] = (input, effect, classify) =>
-    Effect.suspend(() => {
-      const lease = admit()
-      if (!lease) return effect
+    leasedEffect(effect, () => {
       const started = performance.now()
       const operations: MutableRunOperationCounts = {
         turns: 0,
@@ -2806,9 +2798,6 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
             }
             return runCompleted(completedInput).pipe(Effect.ensuring(endRunTrace(traceScope, completedInput)))
           }),
-          Effect.ensuring(
-            Effect.sync(() => lease.release()),
-          ),
         )
       })
     })
@@ -2818,11 +2807,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
     effect: Effect.Effect<A, E, R>,
     classify?: (exit: Exit.Exit<A, E>) => TurnOutcome | undefined,
   ): Effect.Effect<A, E, R> =>
-    Effect.suspend(() => {
-      // Effects are lazy too; lease the actual execution rather than the
-      // constructed Effect value.
-      const lease = admit()
-      if (!lease) return effect
+    leasedEffect(effect, () => {
       const started = performance.now()
       return Effect.gen(function* () {
         const run = yield* CurrentRelayRun
@@ -2841,9 +2826,6 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
             }
             return turnCompleted(completedInput).pipe(Effect.ensuring(endTurnTrace(traceScope, completedInput)))
           }),
-          Effect.ensuring(
-            Effect.sync(() => lease.release()),
-          ),
         )
       })
     })
