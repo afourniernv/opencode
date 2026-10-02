@@ -1,13 +1,14 @@
 export * as SessionCompaction from "./compaction"
 
 import { LLM, LLMError, LLMEvent, Message, type LLMRequest, type Model } from "@opencode-ai/llm"
-import { DateTime, Effect, Stream } from "effect"
+import { DateTime, Effect, Exit, Stream } from "effect"
 import type { Config } from "../config"
 import type { EventV2 } from "../event"
 import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
 import { SessionSchema } from "./schema"
 import { Token } from "../util/token"
+import type { Interface as NemoRelayInterface } from "../observability/nemo-relay"
 
 const DEFAULT_BUFFER = 20_000
 const DEFAULT_KEEP_TOKENS = 8_000
@@ -71,6 +72,7 @@ type Dependencies = {
     readonly stream: (request: LLMRequest) => Stream.Stream<LLMEvent, LLMError>
   }
   readonly config: readonly Config.Entry[]
+  readonly relay: NemoRelayInterface
 }
 
 type Input = {
@@ -196,19 +198,28 @@ export const make = (dependencies: Dependencies) => {
       reason: "auto",
     })
 
-    const chunks: string[] = []
-    let failed = false
-    const summarized = yield* dependencies.llm
-      .stream(
-        LLM.request({
-          model: input.model,
-          http: input.request.http,
-          messages: [Message.user(summaryPrompt)],
-          tools: [],
-          generation: { maxTokens: summaryOutput },
-        }),
+    const operation = Effect.gen(function* () {
+      const chunks: string[] = []
+      let failed = false
+      const summaryStream = dependencies.relay.observeLlmStream(
+        {
+          role: "compaction",
+          agentRuntime: "v2",
+          runtime: "native",
+          provider: input.model.provider,
+          model: input.model.id,
+        },
+        dependencies.llm.stream(
+          LLM.request({
+            model: input.model,
+            http: input.request.http,
+            messages: [Message.user(summaryPrompt)],
+            tools: [],
+            generation: { maxTokens: summaryOutput },
+          }),
+        ),
       )
-      .pipe(
+      const summarized = yield* summaryStream.pipe(
         Stream.runForEach((event) => {
           if (LLMEvent.is.providerError(event)) failed = true
           if (LLMEvent.is.textDelta(event)) chunks.push(event.text)
@@ -217,17 +228,21 @@ export const make = (dependencies: Dependencies) => {
         Effect.as(true),
         Effect.catchTag("LLM.Error", () => Effect.succeed(false)),
       )
-    const summary = chunks.join("")
-    if (!summarized || failed || !summary.trim()) return false
-    yield* dependencies.events.publish(SessionEvent.Compaction.Ended, {
-      sessionID: input.sessionID,
-      messageID,
-      timestamp: yield* DateTime.now,
-      reason: "auto",
-      text: summary,
-      recent: selected.recent,
+      const summary = chunks.join("")
+      if (!summarized || failed || !summary.trim()) return false
+      yield* dependencies.events.publish(SessionEvent.Compaction.Ended, {
+        sessionID: input.sessionID,
+        messageID,
+        timestamp: yield* DateTime.now,
+        reason: "auto",
+        text: summary,
+        recent: selected.recent,
+      })
+      return true
     })
-    return true
+    return yield* dependencies.relay.observeTurn({ runtime: "v2", role: "compaction" }, operation, (exit) =>
+      Exit.isSuccess(exit) ? (exit.value ? "success" : "failed") : undefined,
+    )
   })
   const compactIfNeeded = Effect.fn("SessionCompaction.compactIfNeeded")(function* (input: Input) {
     if (!config.auto) return false

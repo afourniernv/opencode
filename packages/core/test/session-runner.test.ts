@@ -72,15 +72,23 @@ let toolExecutionsStarted: Deferred.Deferred<void> | undefined
 let toolExecutionsReady = 5
 let activeToolExecutions = 0
 let maxActiveToolExecutions = 0
-const relayObservations: NemoRelay.LlmCompleted[] = []
-const relay = Layer.succeed(
-  NemoRelay.Service,
-  NemoRelay.Service.of({
-    status: { state: "active" },
-    llmCompleted: (input) => Effect.sync(() => relayObservations.push(input)),
-    toolCompleted: () => Effect.void,
-  }),
+const relayObservations: NemoRelay.LlmStreamCompleted[] = []
+const relayTurnObservations: Array<NemoRelay.TurnStarted & { readonly outcome: NemoRelay.TurnOutcome }> = []
+const relayToolObservations: NemoRelay.ToolCompleted[] = []
+const relayAdapter = NemoRelay.makeForTesting(
+  {
+    MetricKind: { Counter: "counter", Histogram: "histogram" },
+    MetricValueType: { U64: "u64", F64: "f64" },
+    metric: () => {},
+    flushSubscribers: async () => {},
+  },
+  {
+    llmStreamCompleted: (input) => Effect.sync(() => relayObservations.push(input)),
+    turnCompleted: (input) => Effect.sync(() => relayTurnObservations.push(input)),
+    toolCompleted: (input) => Effect.sync(() => relayToolObservations.push(input)),
+  },
 )
+const relay = Layer.succeed(NemoRelay.Service, NemoRelay.Service.of(relayAdapter))
 const client = Layer.succeed(
   LLMClient.Service,
   LLMClient.Service.of({
@@ -342,6 +350,8 @@ const setup = Effect.gen(function* () {
   activeToolExecutions = 0
   maxActiveToolExecutions = 0
   relayObservations.length = 0
+  relayTurnObservations.length = 0
+  relayToolObservations.length = 0
   yield* db
     .insert(ProjectTable)
     .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
@@ -1484,6 +1494,7 @@ describe("SessionRunnerLLM", () => {
       expect(relayObservations).toEqual([
         {
           role: "primary",
+          agentRuntime: "v2",
           runtime: "native",
           provider: "fake",
           model: "fake-model",
@@ -2763,7 +2774,7 @@ describe("SessionRunnerLLM", () => {
           output: Schema.Struct({}),
           execute: () =>
             Effect.fail(new PermissionV2.BlockedError({ rules: [] })).pipe(
-              Effect.mapError(() => new Tool.Failure({ message: "Permission blocked" })),
+              Effect.mapError((error) => new Tool.Failure({ message: "Permission blocked", error })),
             ),
         }),
       })
@@ -2787,6 +2798,7 @@ describe("SessionRunnerLLM", () => {
       yield* session.resume(sessionID)
 
       expect(requests).toHaveLength(2)
+      expect(relayToolObservations.at(-1)?.outcome).toBe("blocked")
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "user", text: "Call blocked" },
         {
@@ -2827,6 +2839,7 @@ describe("SessionRunnerLLM", () => {
 
       expect(exit._tag).toBe("Failure")
       if (exit._tag === "Failure") expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+      expect(relayTurnObservations.at(-1)?.outcome).toBe("blocked")
       expect(requests).toHaveLength(1)
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "user", text: "Call declined" },
@@ -2856,7 +2869,7 @@ describe("SessionRunnerLLM", () => {
           output: Schema.Struct({}),
           execute: () =>
             Effect.fail(new PermissionV2.CorrectedError({ feedback: "Use another tool" })).pipe(
-              Effect.mapError(() => new Tool.Failure({ message: "Use another tool" })),
+              Effect.mapError((error) => new Tool.Failure({ message: "Use another tool", error })),
             ),
         }),
       })
@@ -2880,6 +2893,7 @@ describe("SessionRunnerLLM", () => {
       yield* session.resume(sessionID)
 
       expect(requests).toHaveLength(2)
+      expect(relayToolObservations.at(-1)?.outcome).toBe("blocked")
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "user", text: "Call corrected" },
         {
@@ -2932,6 +2946,7 @@ describe("SessionRunnerLLM", () => {
 
       expect(exit._tag).toBe("Failure")
       if (exit._tag === "Failure") expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+      expect(relayTurnObservations.at(-1)?.outcome).toBe("blocked")
       expect(requests).toHaveLength(1)
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "user", text: "Ask then stop" },
@@ -3212,6 +3227,7 @@ describe("SessionRunnerLLM", () => {
         { type: "user", text: "Fail durably" },
         { type: "assistant", finish: "error", error: { type: "unknown", message: "Provider unavailable" } },
       ])
+      expect(relayTurnObservations.at(-1)?.outcome).toBe("failed")
     }),
   )
 
@@ -3333,6 +3349,10 @@ describe("SessionRunnerLLM", () => {
           content: [{ type: "tool", id: "call-hosted-provider-error", state: { status: "error" } }],
         },
       ])
+      expect(relayToolObservations).toEqual([
+        expect.objectContaining({ name: "web_search", execution: "provider", outcome: "failed" }),
+      ])
+      expect(relayTurnObservations.at(-1)?.outcome).toBe("failed")
     }),
   )
 
@@ -3365,6 +3385,7 @@ describe("SessionRunnerLLM", () => {
     Effect.gen(function* () {
       yield* setup
       const session = yield* SessionV2.Service
+      const { db } = yield* Database.Service
       yield* session.prompt({
         sessionID,
         prompt: Prompt.make({ text: "Fail hosted tool on raw failure" }),
@@ -3385,6 +3406,21 @@ describe("SessionRunnerLLM", () => {
       )
 
       expect(yield* session.resume(sessionID).pipe(Effect.flip)).toBe(failure)
+      const failureEvents = yield* db
+        .select({ type: EventTable.type })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, sessionID))
+        .orderBy(asc(EventTable.seq))
+        .all()
+        .pipe(
+          Effect.orDie,
+          Effect.map((events) =>
+            events
+              .map((event) => event.type)
+              .filter((type) => type === "session.next.tool.failed.1" || type === "session.next.step.failed.2"),
+          ),
+        )
+      expect(failureEvents).toEqual(["session.next.tool.failed.1", "session.next.step.failed.2"])
       yield* replaySessionProjection(sessionID)
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "user", text: "Fail hosted tool on raw failure" },
