@@ -1,11 +1,13 @@
 import { Cause, Context, Effect, Exit, Layer, Stream } from "effect"
+import { RequestExecutor, type AttemptEvent, type AttemptOrdinal } from "@opencode-ai/llm/route"
+import type { LlmHandle, PropagationContext, ScopeHandle, ScopeStack, ToolHandle } from "nemo-relay-node"
 import { makeGlobalNode } from "../effect/app-node"
 
 const ENABLE_ENV = "OPENCODE_NEMO_RELAY"
 const CONFIG_ENV = "OPENCODE_NEMO_RELAY_PLUGINS_TOML"
 const RUNTIME_MODULE_ENV = "OPENCODE_NEMO_RELAY_RUNTIME_MODULE"
 const RUNTIME_MODULE = "nemo-relay-node"
-const SCHEMA_VERSION = "2"
+const SCHEMA_VERSION = "3"
 const DEFAULT_STARTUP_TIMEOUT_MS = 5_000
 const DEFAULT_TEARDOWN_TIMEOUT_MS = 5_000
 
@@ -40,44 +42,48 @@ type RelayMetrics = {
   readonly flushSubscribers: () => Promise<void>
 }
 
-type RelayScopeContext = {
-  readonly stack: unknown
-  readonly handle: unknown
+type RelayHandle = ScopeHandle | LlmHandle | ToolHandle
+
+type RelayScopeContext<Handle extends RelayHandle = RelayHandle> = {
+  readonly stack: ScopeStack
+  readonly handle: Handle
 }
 
 type RelayTracing = {
   readonly ScopeType: {
     readonly Agent: unknown
+    readonly Function?: unknown
     readonly Llm: unknown
     readonly Tool: unknown
+    readonly Guardrail?: unknown
   }
-  readonly createScopeStack: () => unknown
-  readonly capturePropagationContext: () => unknown
-  readonly createScopeStackFromPropagation: (context: unknown) => unknown
-  readonly withScopeStack: (stack: unknown, callback: () => unknown) => unknown
+  readonly createScopeStack: () => ScopeStack
+  readonly capturePropagationContext: () => PropagationContext
+  readonly createScopeStackFromPropagation: (context: PropagationContext) => ScopeStack
+  readonly withScopeStack: <A>(stack: ScopeStack, callback: () => A) => A
   readonly pushScope: (
     name: string,
     scopeType: unknown,
-    handle?: unknown,
+    handle?: ScopeHandle | null,
     attributes?: number | null,
     data?: unknown,
     metadata?: unknown,
     input?: unknown,
     timestamp?: number | null,
-  ) => unknown
-  readonly popScope: (handle: unknown, output?: unknown, timestamp?: number | null, metadata?: unknown) => void
+  ) => ScopeHandle
+  readonly popScope: (handle: ScopeHandle, output?: unknown, timestamp?: number | null, metadata?: unknown) => void
   readonly llmCall: (
     name: string,
     request: unknown,
-    handle?: unknown,
+    handle?: ScopeHandle | null,
     attributes?: number | null,
     data?: unknown,
     metadata?: unknown,
     modelName?: string | null,
     timestamp?: number | null,
-  ) => unknown
+  ) => LlmHandle
   readonly llmCallEnd: (
-    handle: unknown,
+    handle: LlmHandle,
     response: unknown,
     data?: unknown,
     metadata?: unknown,
@@ -86,15 +92,15 @@ type RelayTracing = {
   readonly toolCall: (
     name: string,
     args: unknown,
-    handle?: unknown,
+    handle?: ScopeHandle | null,
     attributes?: number | null,
     data?: unknown,
     metadata?: unknown,
     toolCallId?: string | null,
     timestamp?: number | null,
-  ) => unknown
+  ) => ToolHandle
   readonly toolCallEnd: (
-    handle: unknown,
+    handle: ToolHandle,
     result: { readonly result: unknown },
     data?: unknown,
     metadata?: unknown,
@@ -102,7 +108,7 @@ type RelayTracing = {
   ) => void
   readonly event: (
     name: string,
-    handle?: unknown,
+    handle?: ScopeHandle | null,
     data?: unknown,
     metadata?: unknown,
     timestamp?: number | null,
@@ -193,9 +199,38 @@ type Host = {
 export type Runtime = "native" | "ai_sdk" | "workflow" | "unknown"
 export type TurnRuntime = "v1" | "v2"
 export type CallRole = "primary" | "compaction" | "title" | "summary" | "agent_generation" | "other"
+export type LlmMode = "stream" | "unary"
+export type LlmOutputKind = "text" | "reasoning" | "tool"
+export type LlmOperation =
+  | "openai.chat_completions"
+  | "openai.responses"
+  | "anthropic.messages"
+  | "google.generate_content"
+  | "aws.converse"
+  | "openrouter.chat_completions"
+  | "unknown"
 export type LlmOutcome = "success" | "provider_error" | "failed" | "cancelled" | "incomplete" | "unknown"
+export type LlmCostSource = "provider_reported" | "price_table_estimate"
+export type HostRetryErrorKind = "rate_limit" | "quota_exceeded" | "provider_internal" | "transport" | "unknown"
+export type HostRetryDelaySource = "retry_after" | "backoff" | "unknown"
 export type TurnOutcome = "success" | "failed" | "blocked" | "cancelled"
 export type ToolOutcome = "success" | "failed" | "blocked" | "cancelled" | "unknown"
+export type TerminalResultFamily = "zero_exit" | "nonzero_exit" | "timeout" | "aborted" | "signal" | "unknown"
+export type PermissionEffect = "allow" | "deny" | "ask"
+export type PermissionResolution = "once" | "always" | "reject" | "corrected" | "cancelled" | "unknown"
+export type QuestionResolution = "answered" | "rejected" | "cancelled" | "unknown"
+export type CompactionTrigger = "proactive" | "overflow_recovery" | "manual"
+export type CompactionOutcome = "success" | "failed" | "not_possible" | "cancelled"
+export type PermissionFamily =
+  | "filesystem"
+  | "terminal"
+  | "network"
+  | "delegation"
+  | "interaction"
+  | "safety"
+  | "mcp"
+  | "other"
+  | "unknown"
 export type ToolCategory =
   | "code_search"
   | "file_read"
@@ -228,6 +263,9 @@ export type LlmStreamStarted = {
   readonly runtime: Runtime
   readonly provider: string
   readonly model: string
+  readonly protocol?: string
+  /** Selected catalog context limit. Used only with provider-reported input usage. */
+  readonly contextLimit?: number
 }
 
 export type LlmStreamCompleted = LlmStreamStarted & {
@@ -235,6 +273,53 @@ export type LlmStreamCompleted = LlmStreamStarted & {
   readonly finish?: string
   readonly durationMs: number
   readonly tokens?: TokenUsage
+  /** One ratio per provider step; never a host-stream aggregate divided by one context window. */
+  readonly inputContextUtilizations?: ReadonlyArray<number>
+  readonly firstOutput?: {
+    readonly kind: LlmOutputKind
+    readonly latencyMs: number
+  }
+  readonly providerError?: {
+    readonly classification: string
+    readonly retryable?: boolean
+  }
+}
+
+export type LlmUnaryCompleted = LlmStreamStarted & {
+  readonly outcome: Exclude<LlmOutcome, "provider_error" | "incomplete" | "unknown">
+  readonly finish?: string
+  readonly durationMs: number
+  readonly tokens?: TokenUsage
+}
+
+export type LlmCostRecorded = {
+  readonly role: CallRole
+  readonly agentRuntime: TurnRuntime
+  readonly provider: string
+  readonly model: string
+  readonly costUsd: number
+  readonly source: LlmCostSource
+}
+
+export type RunStarted = {
+  readonly runtime: TurnRuntime
+}
+
+export type RunOperationCounts = {
+  readonly turns: number
+  readonly llmOperations: number
+  readonly toolCalls: number
+  readonly hostRetries: number
+  readonly providerAttempts: number
+  readonly providerRetries: number
+  readonly permissionWaits: number
+  readonly questionWaits: number
+}
+
+export type RunCompleted = RunStarted & {
+  readonly outcome: TurnOutcome
+  readonly durationMs: number
+  readonly operations: RunOperationCounts
 }
 
 export type TurnStarted = {
@@ -251,10 +336,55 @@ export type ToolStarted = {
 export type ToolCompleted = ToolStarted & {
   readonly outcome: ToolOutcome
   readonly durationMs?: number
+  readonly terminalResult?: TerminalResultFamily
+}
+
+export type ToolCompletionDetails = {
+  readonly terminalResult?: TerminalResultFamily
+}
+
+export type PermissionEvaluation = {
+  readonly runtime: TurnRuntime
+  readonly family: PermissionFamily
+  readonly effect: PermissionEffect
+}
+
+export type PermissionWaitStarted = {
+  readonly runtime: TurnRuntime
+  readonly family: PermissionFamily
+}
+
+export type PermissionWaitCompleted = PermissionWaitStarted & {
+  readonly resolution: PermissionResolution
+  readonly durationMs: number
+}
+
+export type QuestionWaitStarted = {
+  readonly runtime: TurnRuntime
+}
+
+export type QuestionWaitCompleted = QuestionWaitStarted & {
+  readonly resolution: QuestionResolution
+  readonly durationMs: number
+}
+
+export type CompactionCompleted = {
+  readonly runtime: "v2"
+  readonly sourceEstimatedTokens: number
+  readonly summaryEstimatedTokens: number
+  readonly retainedRecentEstimatedTokens: number
+}
+
+export type CompactionAttemptCompleted = {
+  readonly runtime: TurnRuntime
+  readonly trigger: CompactionTrigger
+  readonly outcome: CompactionOutcome
+  readonly durationMs: number
 }
 
 export interface ToolObservation {
-  readonly complete: (outcome: ToolOutcome) => Effect.Effect<void>
+  readonly run: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
+  readonly complete: (outcome: ToolOutcome, details?: ToolCompletionDetails) => Effect.Effect<void>
 }
 
 type UsageLike = {
@@ -268,36 +398,83 @@ type UsageLike = {
 
 type LlmEventLike = {
   readonly type: string
+  readonly text?: string
   readonly reason?: string
   readonly usage?: UsageLike
+  readonly classification?: string
+  readonly retryable?: boolean
 }
 
 export interface Interface {
   readonly status: Status
+  readonly detached: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
+  readonly observeRun: <A, E, R>(
+    input: RunStarted,
+    effect: Effect.Effect<A, E, R>,
+    classify?: (exit: Exit.Exit<A, E>) => TurnOutcome | undefined,
+  ) => Effect.Effect<A, E, R>
   readonly observeLlmStream: <A extends LlmEventLike, E, R>(
     input: LlmStreamStarted,
     source: Stream.Stream<A, E, R>,
   ) => Stream.Stream<A, E, R>
+  readonly observeLlmUnary: <A, E, R>(
+    input: LlmStreamStarted,
+    effect: Effect.Effect<A, E, R>,
+    project?: (value: A) => { readonly finish?: string; readonly tokens?: TokenUsage },
+  ) => Effect.Effect<A, E, R>
   readonly observeTurn: <A, E, R>(
     input: TurnStarted,
     effect: Effect.Effect<A, E, R>,
     classify?: (exit: Exit.Exit<A, E>) => TurnOutcome | undefined,
   ) => Effect.Effect<A, E, R>
+  readonly observePermissionWait: <A, E, R>(
+    input: PermissionWaitStarted,
+    effect: Effect.Effect<A, E, R>,
+    classify?: (exit: Exit.Exit<A, E>) => PermissionResolution | undefined,
+  ) => Effect.Effect<A, E, R>
+  readonly observeQuestionWait: <A, E, R>(
+    input: QuestionWaitStarted,
+    effect: Effect.Effect<A, E, R>,
+    classify?: (exit: Exit.Exit<A, E>) => QuestionResolution | undefined,
+  ) => Effect.Effect<A, E, R>
   readonly beginTool: (input: ToolStarted) => Effect.Effect<ToolObservation>
+  readonly runStarted: (input: RunStarted) => Effect.Effect<void>
+  readonly runCompleted: (input: RunCompleted) => Effect.Effect<void>
   readonly llmStreamCompleted: (input: LlmStreamCompleted) => Effect.Effect<void>
+  readonly llmUnaryCompleted: (input: LlmUnaryCompleted) => Effect.Effect<void>
+  readonly llmCostRecorded: (input: LlmCostRecorded) => Effect.Effect<void>
   readonly turnCompleted: (
     input: TurnStarted & { readonly outcome: TurnOutcome; readonly durationMs: number },
   ) => Effect.Effect<void>
   readonly toolCompleted: (input: ToolCompleted) => Effect.Effect<void>
-  readonly retryScheduled: (input: { readonly runtime: TurnRuntime; readonly attempt: number }) => Effect.Effect<void>
+  readonly permissionEvaluated: (input: PermissionEvaluation) => Effect.Effect<void>
+  readonly permissionWaitCompleted: (input: PermissionWaitCompleted) => Effect.Effect<void>
+  readonly questionWaitCompleted: (input: QuestionWaitCompleted) => Effect.Effect<void>
+  readonly compactionAttemptCompleted: (input: CompactionAttemptCompleted) => Effect.Effect<void>
+  readonly compactionCompleted: (input: CompactionCompleted) => Effect.Effect<void>
+  readonly retryScheduled: (input: {
+    readonly runtime: TurnRuntime
+    readonly attempt: number
+    readonly delayMs?: number
+    readonly delaySource?: HostRetryDelaySource
+    readonly errorKind?: HostRetryErrorKind
+  }) => Effect.Effect<void>
 }
 
 export type TestingHooks = {
+  readonly runStarted?: (input: RunStarted) => Effect.Effect<void>
+  readonly runCompleted?: (input: RunCompleted) => Effect.Effect<void>
   readonly llmStreamCompleted?: (input: LlmStreamCompleted) => Effect.Effect<void>
+  readonly llmUnaryCompleted?: (input: LlmUnaryCompleted) => Effect.Effect<void>
+  readonly llmCostRecorded?: (input: LlmCostRecorded) => Effect.Effect<void>
   readonly turnCompleted?: (
     input: TurnStarted & { readonly outcome: TurnOutcome; readonly durationMs: number },
   ) => Effect.Effect<void>
   readonly toolCompleted?: (input: ToolCompleted) => Effect.Effect<void>
+  readonly permissionWaitCompleted?: (input: PermissionWaitCompleted) => Effect.Effect<void>
+  readonly questionWaitCompleted?: (input: QuestionWaitCompleted) => Effect.Effect<void>
+  readonly compactionAttemptCompleted?: (input: CompactionAttemptCompleted) => Effect.Effect<void>
+  readonly compactionCompleted?: (input: CompactionCompleted) => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/NemoRelay") {}
@@ -306,16 +483,38 @@ const CurrentRelayScope = Context.Reference<RelayScopeContext | undefined>("@ope
   defaultValue: () => undefined,
 })
 
+type MutableRunOperationCounts = { -readonly [K in keyof RunOperationCounts]: RunOperationCounts[K] } & {
+  lastTurnOutcome?: TurnOutcome
+}
+
+const CurrentRelayRun = Context.Reference<MutableRunOperationCounts | undefined>("@opencode/NemoRelay/CurrentRun", {
+  defaultValue: () => undefined,
+})
+
 const disabledStatus: Status = { state: "disabled", reason: "not_requested" }
-const noopTool: ToolObservation = { complete: () => Effect.void }
+const noopTool: ToolObservation = { run: (effect) => effect, complete: () => Effect.void }
 const noop: Interface = {
   status: disabledStatus,
+  detached: (effect) => effect,
+  observeRun: (_input, effect) => effect,
   observeLlmStream: (_input, source) => source,
+  observeLlmUnary: (_input, effect) => effect,
   observeTurn: (_input, effect) => effect,
+  observePermissionWait: (_input, effect) => effect,
+  observeQuestionWait: (_input, effect) => effect,
   beginTool: () => Effect.succeed(noopTool),
+  runStarted: () => Effect.void,
+  runCompleted: () => Effect.void,
   llmStreamCompleted: () => Effect.void,
+  llmUnaryCompleted: () => Effect.void,
+  llmCostRecorded: () => Effect.void,
   turnCompleted: () => Effect.void,
   toolCompleted: () => Effect.void,
+  permissionEvaluated: () => Effect.void,
+  permissionWaitCompleted: () => Effect.void,
+  questionWaitCompleted: () => Effect.void,
+  compactionAttemptCompleted: () => Effect.void,
+  compactionCompleted: () => Effect.void,
   retryScheduled: () => Effect.void,
 }
 
@@ -368,6 +567,14 @@ function relayModule(value: unknown): RelayModule {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
+}
+
+function isScopeEventParent(value: RelayHandle): value is ScopeHandle {
+  try {
+    return isRecord(value) && value.scopeType !== undefined
+  } catch {
+    return false
+  }
 }
 
 function strings(value: unknown) {
@@ -944,6 +1151,20 @@ function integer(value: number | undefined) {
   return Math.min(Number.MAX_SAFE_INTEGER, Math.floor(value))
 }
 
+function inputContextUtilization(inputTokens: number | undefined, contextLimit: number | undefined) {
+  const tokens = integer(inputTokens)
+  if (
+    tokens === undefined ||
+    tokens <= 0 ||
+    contextLimit === undefined ||
+    !Number.isFinite(contextLimit) ||
+    contextLimit <= 0
+  )
+    return undefined
+  const ratio = tokens / contextLimit
+  return Number.isFinite(ratio) && ratio >= 0 ? ratio : undefined
+}
+
 export function durationBucket(value: number) {
   if (!Number.isFinite(value) || value < 0) return "unknown"
   if (value < 1_000) return "lt_1s"
@@ -979,10 +1200,22 @@ export function providerFamily(value: string) {
     ["google-vertex", "google"],
     ["vertex", "google"],
     ["nvidia", "nvidia"],
+    ["perplexity", "perplexity"],
+    ["cerebras", "cerebras"],
+    ["together", "together"],
+    ["cohere", "cohere"],
+    ["groq", "groq"],
+    ["moonshot", "moonshot"],
+    ["alibaba", "alibaba"],
+    ["dashscope", "alibaba"],
+    ["gitlab", "gitlab"],
+    ["venice", "venice"],
     ["anthropic", "anthropic"],
     ["azure", "azure"],
     ["openai", "openai"],
     ["google", "google"],
+    ["xai", "xai"],
+    ["meta", "meta"],
   ]
   const known = patterns.find(([pattern]) => provider.includes(pattern))?.[1]
   if (known) return known
@@ -998,7 +1231,10 @@ export function modelFamily(value: string) {
     [/gemini/, "gemini"],
     [/gemma/, "gemma"],
     [/nemotron/, "nemotron"],
-    [/(^|[/_-])gpt|(^|[/_-])o[134]($|[/_.-])|codex/, "gpt"],
+    [/(^|[/_-])o1($|[/_.-])/, "o1"],
+    [/(^|[/_-])o3($|[/_.-])/, "o3"],
+    [/(^|[/_-])o4($|[/_.-])/, "o4"],
+    [/(^|[/_-])gpt|codex/, "gpt"],
     [/llama/, "llama"],
     [/qwen/, "qwen"],
     [/deepseek/, "deepseek"],
@@ -1006,8 +1242,26 @@ export function modelFamily(value: string) {
     [/grok/, "grok"],
     [/(^|[/_.-])glm/, "glm"],
     [/kimi|moonshot/, "kimi"],
+    [/minimax/, "minimax"],
+    [/(^|[/_.-])mimo/, "mimo"],
+    [/(^|[/_.-])nova/, "nova"],
+    [/(^|[/_.-])step/, "step"],
+    [/trinity/, "trinity"],
+    [/(^|[/_.-])muse/, "muse"],
   ]
   return patterns.find(([pattern]) => pattern.test(model))?.[1] ?? "custom"
+}
+
+export function llmOperation(value: string | undefined): LlmOperation {
+  const protocol = value?.trim().toLowerCase().replaceAll("_", "-")
+  if (!protocol) return "unknown"
+  if (protocol === "openai-chat" || protocol === "openai-compatible-chat") return "openai.chat_completions"
+  if (protocol === "openai-responses" || protocol === "openai-responses-websocket") return "openai.responses"
+  if (protocol === "anthropic-messages") return "anthropic.messages"
+  if (protocol === "gemini") return "google.generate_content"
+  if (protocol === "bedrock-converse") return "aws.converse"
+  if (protocol === "openrouter" || protocol === "openrouter-chat") return "openrouter.chat_completions"
+  return "unknown"
 }
 
 export function toolCategory(value: string | undefined): ToolCategory {
@@ -1028,12 +1282,53 @@ export function toolCategory(value: string | undefined): ToolCategory {
   return "extension"
 }
 
+export function terminalResultFamily(input: unknown): TerminalResultFamily {
+  if (!isRecord(input)) return "unknown"
+  if (input.aborted === true) return "aborted"
+  if (input.timeout === true) return "timeout"
+  if (input.signal === true || (typeof input.signal === "string" && input.signal.length > 0)) return "signal"
+  if (typeof input.exit !== "number" || !Number.isFinite(input.exit)) return "unknown"
+  return input.exit === 0 ? "zero_exit" : "nonzero_exit"
+}
+
+export function permissionFamily(value: string | undefined): PermissionFamily {
+  const action = value?.trim().toLowerCase()
+  if (!action) return "unknown"
+  if (["read", "write", "edit", "apply_patch", "glob", "grep", "list", "external_directory"].includes(action))
+    return "filesystem"
+  if (["bash", "shell", "terminal", "execute"].includes(action)) return "terminal"
+  if (["webfetch", "web_fetch", "websearch", "web_search", "network"].includes(action)) return "network"
+  if (["task", "delegate", "delegate_task"].includes(action)) return "delegation"
+  if (["question", "ask_question", "request_user_input"].includes(action)) return "interaction"
+  if (["doom_loop", "policy", "guardrail"].includes(action)) return "safety"
+  if (["mcp", "list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"].includes(action)) return "mcp"
+  return "other"
+}
+
 export function finishReason(value: string | undefined) {
   const finish = value?.toLowerCase().replaceAll("_", "-")
   if (!finish) return "unknown"
   if (finish === "tool-calls") return "tool_calls"
   if (["stop", "length", "content-filter", "error"].includes(finish)) return finish.replace("-", "_")
   return "unknown"
+}
+
+function firstOutputKind(event: LlmEventLike): LlmOutputKind | undefined {
+  if (event.type === "text-delta") return event.text ? "text" : undefined
+  if (event.type === "reasoning-delta") return event.text ? "reasoning" : undefined
+  if (event.type === "tool-input-delta") return event.text ? "tool" : undefined
+  if (event.type === "tool-call") return "tool"
+  return undefined
+}
+
+function providerErrorClassification(value: string | undefined) {
+  if (!value) return "unknown"
+  if (value.toLowerCase().replaceAll("_", "-") === "context-overflow") return "context_overflow"
+  return "other"
+}
+
+function retryable(value: boolean | undefined) {
+  return value === undefined ? "unknown" : value ? "true" : "false"
 }
 
 function usage(value: UsageLike | undefined): TokenUsage | undefined {
@@ -1080,6 +1375,36 @@ function classifyExit<A, E>(
   return Cause.hasInterruptsOnly(exit.cause) ? "cancelled" : "failed"
 }
 
+function classifyPermissionWait<A, E>(
+  exit: Exit.Exit<A, E>,
+  classify?: (exit: Exit.Exit<A, E>) => PermissionResolution | undefined,
+): PermissionResolution {
+  if (classify) {
+    try {
+      const resolution = classify(exit)
+      if (resolution) return resolution
+    } catch {
+      // A telemetry classifier must never change host execution.
+    }
+  }
+  return Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause) ? "cancelled" : "unknown"
+}
+
+function classifyQuestionWait<A, E>(
+  exit: Exit.Exit<A, E>,
+  classify?: (exit: Exit.Exit<A, E>) => QuestionResolution | undefined,
+): QuestionResolution {
+  if (classify) {
+    try {
+      const resolution = classify(exit)
+      if (resolution) return resolution
+    } catch {
+      // A telemetry classifier must never change host execution.
+    }
+  }
+  return Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause) ? "cancelled" : "unknown"
+}
+
 function tracing(relay: RelayRuntime): RelayTracing | undefined {
   if (
     !relay.ScopeType ||
@@ -1121,8 +1446,53 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
   const branchStack = (parent: RelayScopeContext | undefined) => {
     if (!trace || !parent) return trace?.createScopeStack()
     const propagation = trace.withScopeStack(parent.stack, () => trace.capturePropagationContext())
-    return trace.createScopeStackFromPropagation(propagation)
+    return trace.createScopeStackFromPropagation({ ...propagation, parentUuid: parent.handle.uuid })
   }
+
+  const beginRunTrace = (input: RunStarted, parent: RelayScopeContext | undefined) => {
+    if (!trace) return undefined
+    try {
+      const stack = branchStack(parent)
+      if (!stack) return undefined
+      const metadata = {
+        "opencode.trace.schema_version": SCHEMA_VERSION,
+        "opencode.runtime": input.runtime,
+      }
+      const handle = trace.withScopeStack(stack, () =>
+        trace.pushScope(
+          "opencode.agent.run",
+          trace.ScopeType.Agent,
+          null,
+          null,
+          null,
+          metadata,
+          { runtime: input.runtime },
+          wallMicros(),
+        ),
+      )
+      return { stack, handle } satisfies RelayScopeContext<ScopeHandle>
+    } catch {
+      return undefined
+    }
+  }
+
+  const endRunTrace = (scope: RelayScopeContext<ScopeHandle> | undefined, input: RunCompleted) =>
+    Effect.sync(() => {
+      if (!trace || !scope) return
+      try {
+        trace.withScopeStack(scope.stack, () =>
+          trace.popScope(scope.handle, { outcome: input.outcome, operations: input.operations }, wallMicros(), {
+            "opencode.trace.schema_version": SCHEMA_VERSION,
+            "opencode.outcome": input.outcome,
+            "opencode.duration_bucket": durationBucket(input.durationMs),
+            "otel.status_code": otelStatus(input.outcome),
+            ...(traceErrorType(input.outcome) ? { "error.type": traceErrorType(input.outcome) } : {}),
+          }),
+        )
+      } catch {
+        // Tracing is observation-only and must never alter host execution.
+      }
+    })
 
   const beginTurnTrace = (input: TurnStarted, parent: RelayScopeContext | undefined) => {
     if (!trace) return undefined
@@ -1146,14 +1516,14 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
           wallMicros(),
         ),
       )
-      return { stack, handle } satisfies RelayScopeContext
+      return { stack, handle } satisfies RelayScopeContext<ScopeHandle>
     } catch {
       return undefined
     }
   }
 
   const endTurnTrace = (
-    scope: RelayScopeContext | undefined,
+    scope: RelayScopeContext<ScopeHandle> | undefined,
     input: TurnStarted & { readonly outcome: TurnOutcome; readonly durationMs: number },
   ) =>
     Effect.sync(() => {
@@ -1173,7 +1543,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
       }
     })
 
-  const beginLlmTrace = (input: LlmStreamStarted, parent: RelayScopeContext | undefined) => {
+  const beginLlmTrace = (input: LlmStreamStarted, parent: RelayScopeContext | undefined, mode: LlmMode) => {
     if (!trace) return undefined
     try {
       const stack = branchStack(parent)
@@ -1181,14 +1551,17 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
       const route = {
         provider_family: providerFamily(input.provider),
         model_family: modelFamily(input.model),
+        operation: llmOperation(input.protocol),
       }
       const metadata = {
         "opencode.trace.schema_version": SCHEMA_VERSION,
         "opencode.call_role": input.role,
         "opencode.agent_runtime": input.agentRuntime,
         "opencode.llm_runtime": input.runtime,
+        "opencode.llm_mode": mode,
         "opencode.provider_family": route.provider_family,
         "opencode.model_family": route.model_family,
+        "opencode.llm_operation": route.operation,
       }
       const handle = trace.withScopeStack(stack, () =>
         trace.llmCall(
@@ -1199,6 +1572,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
               call_role: input.role,
               agent_runtime: input.agentRuntime,
               llm_runtime: input.runtime,
+              llm_mode: mode,
               ...route,
             },
           },
@@ -1210,13 +1584,17 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
           wallMicros(),
         ),
       )
-      return { stack, handle } satisfies RelayScopeContext
+      return { stack, handle } satisfies RelayScopeContext<LlmHandle>
     } catch {
       return undefined
     }
   }
 
-  const endLlmTrace = (scope: RelayScopeContext | undefined, input: LlmStreamCompleted) =>
+  const endLlmTrace = (
+    scope: RelayScopeContext<LlmHandle> | undefined,
+    input: LlmStreamCompleted | LlmUnaryCompleted,
+    mode: LlmMode,
+  ) =>
     Effect.sync(() => {
       if (!trace || !scope) return
       try {
@@ -1250,11 +1628,26 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
             null,
             {
               "opencode.trace.schema_version": SCHEMA_VERSION,
+              "opencode.llm_mode": mode,
               "opencode.outcome": input.outcome,
               "opencode.finish_reason": finishReason(input.finish),
               "opencode.duration_bucket": durationBucket(input.durationMs),
               "otel.status_code": otelStatus(input.outcome),
               ...(traceErrorType(input.outcome) ? { "error.type": traceErrorType(input.outcome) } : {}),
+              ...("firstOutput" in input && input.firstOutput
+                ? {
+                    "opencode.first_output_kind": input.firstOutput.kind,
+                    "opencode.first_output_latency_bucket": toolDurationBucket(input.firstOutput.latencyMs),
+                  }
+                : {}),
+              ...("providerError" in input && input.providerError
+                ? {
+                    "opencode.provider_error_classification": providerErrorClassification(
+                      input.providerError.classification,
+                    ),
+                    "opencode.provider_error_retryable": retryable(input.providerError.retryable),
+                  }
+                : {}),
             },
             wallMicros(),
           ),
@@ -1287,24 +1680,33 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
           wallMicros(),
         ),
       )
-      return { stack, handle } satisfies RelayScopeContext
+      return { stack, handle } satisfies RelayScopeContext<ToolHandle>
     } catch {
       return undefined
     }
   }
 
-  const endToolTrace = (scope: RelayScopeContext | undefined, input: ToolCompleted) =>
+  const endToolTrace = (scope: RelayScopeContext<ToolHandle> | undefined, input: ToolCompleted) =>
     Effect.sync(() => {
       if (!trace || !scope) return
       try {
+        const category = input.category ?? toolCategory(input.name)
+        const terminalResult =
+          input.execution === "local" && category === "terminal" ? input.terminalResult : undefined
         trace.withScopeStack(scope.stack, () =>
           trace.toolCallEnd(
             scope.handle,
-            { result: { outcome: input.outcome } },
+            {
+              result: {
+                outcome: input.outcome,
+                ...(terminalResult === undefined ? {} : { terminal_result_family: terminalResult }),
+              },
+            },
             null,
             {
               "opencode.trace.schema_version": SCHEMA_VERSION,
               "opencode.outcome": input.outcome,
+              ...(terminalResult === undefined ? {} : { "opencode.terminal_result_family": terminalResult }),
               "otel.status_code": otelStatus(input.outcome),
               ...(traceErrorType(input.outcome) ? { "error.type": traceErrorType(input.outcome) } : {}),
               ...(input.durationMs === undefined
@@ -1319,20 +1721,159 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
       }
     })
 
-  const retryTrace = (
-    scope: RelayScopeContext | undefined,
-    input: { readonly runtime: TurnRuntime; readonly attempt: number },
-  ) =>
+  const permissionEvaluationTrace = (parent: RelayScopeContext | undefined, input: PermissionEvaluation) =>
+    Effect.sync(() => {
+      if (!trace || !parent || trace.ScopeType.Guardrail === undefined) return
+      try {
+        const stack = branchStack(parent)
+        if (!stack) return
+        const started = wallMicros()
+        const handle = trace.withScopeStack(stack, () =>
+          trace.pushScope(
+            "opencode.permission.evaluated",
+            trace.ScopeType.Guardrail,
+            null,
+            null,
+            null,
+            {
+              "opencode.trace.schema_version": SCHEMA_VERSION,
+              "opencode.runtime": input.runtime,
+              "opencode.permission_family": input.family,
+            },
+            { runtime: input.runtime, permission_family: input.family },
+            started,
+          ),
+        )
+        trace.withScopeStack(stack, () =>
+          trace.popScope(handle, { effect: input.effect }, wallMicros(), {
+            "opencode.trace.schema_version": SCHEMA_VERSION,
+            "opencode.permission_effect": input.effect,
+            "otel.status_code": input.effect === "allow" ? "OK" : input.effect === "deny" ? "ERROR" : "UNSET",
+            ...(input.effect === "deny" ? { "error.type": "opencode.permission.denied" } : {}),
+          }),
+        )
+      } catch {
+        // Tracing is observation-only and must never alter host execution.
+      }
+    })
+
+  const beginPermissionWaitTrace = (input: PermissionWaitStarted, parent: RelayScopeContext | undefined) => {
+    if (!trace || trace.ScopeType.Guardrail === undefined) return undefined
+    try {
+      const stack = branchStack(parent)
+      if (!stack) return undefined
+      const metadata = {
+        "opencode.trace.schema_version": SCHEMA_VERSION,
+        "opencode.runtime": input.runtime,
+        "opencode.permission_family": input.family,
+      }
+      const handle = trace.withScopeStack(stack, () =>
+        trace.pushScope(
+          "opencode.permission.wait",
+          trace.ScopeType.Guardrail,
+          null,
+          null,
+          null,
+          metadata,
+          { runtime: input.runtime, permission_family: input.family },
+          wallMicros(),
+        ),
+      )
+      return { stack, handle } satisfies RelayScopeContext<ScopeHandle>
+    } catch {
+      return undefined
+    }
+  }
+
+  const endPermissionWaitTrace = (scope: RelayScopeContext<ScopeHandle> | undefined, input: PermissionWaitCompleted) =>
     Effect.sync(() => {
       if (!trace || !scope) return
       try {
         trace.withScopeStack(scope.stack, () =>
+          trace.popScope(scope.handle, { resolution: input.resolution }, wallMicros(), {
+            "opencode.trace.schema_version": SCHEMA_VERSION,
+            "opencode.permission_resolution": input.resolution,
+            "opencode.duration_bucket": toolDurationBucket(input.durationMs),
+            "otel.status_code": ["reject", "corrected"].includes(input.resolution) ? "ERROR" : "OK",
+            ...(["reject", "corrected"].includes(input.resolution)
+              ? { "error.type": `opencode.permission.${input.resolution}` }
+              : {}),
+          }),
+        )
+      } catch {
+        // Tracing is observation-only and must never alter host execution.
+      }
+    })
+
+  const beginQuestionWaitTrace = (input: QuestionWaitStarted, parent: RelayScopeContext | undefined) => {
+    if (!trace || trace.ScopeType.Function === undefined) return undefined
+    try {
+      const stack = branchStack(parent)
+      if (!stack) return undefined
+      const metadata = {
+        "opencode.trace.schema_version": SCHEMA_VERSION,
+        "opencode.runtime": input.runtime,
+      }
+      const handle = trace.withScopeStack(stack, () =>
+        trace.pushScope(
+          "opencode.question.wait",
+          trace.ScopeType.Function,
+          null,
+          null,
+          null,
+          metadata,
+          { runtime: input.runtime },
+          wallMicros(),
+        ),
+      )
+      return { stack, handle } satisfies RelayScopeContext<ScopeHandle>
+    } catch {
+      return undefined
+    }
+  }
+
+  const endQuestionWaitTrace = (scope: RelayScopeContext<ScopeHandle> | undefined, input: QuestionWaitCompleted) =>
+    Effect.sync(() => {
+      if (!trace || !scope) return
+      try {
+        trace.withScopeStack(scope.stack, () =>
+          trace.popScope(scope.handle, { resolution: input.resolution }, wallMicros(), {
+            "opencode.trace.schema_version": SCHEMA_VERSION,
+            "opencode.question_resolution": input.resolution,
+            "opencode.duration_bucket": toolDurationBucket(input.durationMs),
+            "otel.status_code": input.resolution === "answered" ? "OK" : "UNSET",
+          }),
+        )
+      } catch {
+        // Tracing is observation-only and must never alter host execution.
+      }
+    })
+
+  const retryTrace = (
+    scope: RelayScopeContext | undefined,
+    input: {
+      readonly runtime: TurnRuntime
+      readonly attempt: number
+      readonly delayMs?: number
+      readonly delaySource?: HostRetryDelaySource
+      readonly errorKind?: HostRetryErrorKind
+    },
+  ) =>
+    Effect.sync(() => {
+      if (!trace || !scope) return
+      const handle = scope.handle
+      if (!isScopeEventParent(handle)) return
+      try {
+        trace.withScopeStack(scope.stack, () =>
           trace.event(
             "opencode.llm.host_retry.scheduled",
-            scope.handle,
+            handle,
             {
               runtime: input.runtime,
               attempt: input.attempt <= 1 ? "first" : input.attempt === 2 ? "second" : "third_or_later",
+              delay_source: input.delaySource ?? "unknown",
+              error_kind: input.errorKind ?? "unknown",
+              ...(input.delayMs === undefined ? {} : { delay_bucket: toolDurationBucket(input.delayMs) }),
             },
             { "opencode.trace.schema_version": SCHEMA_VERSION },
             wallMicros(),
@@ -1340,6 +1881,187 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
         )
       } catch {
         // Tracing is observation-only and must never alter host execution.
+      }
+    })
+
+  type ProviderAttemptTraceEntry = {
+    readonly scope: RelayScopeContext<ScopeHandle>
+    readonly startedAt: number
+    readonly completion?: {
+      readonly event: Extract<AttemptEvent, { readonly type: "completed" }>
+      readonly timestamp: number
+    }
+  }
+
+  type ProviderAttemptTraceState = Map<AttemptOrdinal, ProviderAttemptTraceEntry>
+
+  const beginProviderAttemptTrace = (parent: RelayScopeContext | undefined, attempt: AttemptOrdinal) => {
+    if (!trace || !parent || trace.ScopeType.Function === undefined) return undefined
+    try {
+      const stack = branchStack(parent)
+      if (!stack) return undefined
+      const handle = trace.withScopeStack(stack, () =>
+        trace.pushScope(
+          "opencode.llm.provider_attempt",
+          trace.ScopeType.Function,
+          null,
+          null,
+          null,
+          {
+            "opencode.trace.schema_version": SCHEMA_VERSION,
+            "opencode.provider_attempt": attempt,
+          },
+          { attempt },
+          wallMicros(),
+        ),
+      )
+      return { stack, handle } satisfies RelayScopeContext<ScopeHandle>
+    } catch {
+      return undefined
+    }
+  }
+
+  const endProviderAttemptTrace = (
+    scope: RelayScopeContext<ScopeHandle>,
+    event: Extract<AttemptEvent, { readonly type: "completed" }>,
+    timestamp = wallMicros(),
+  ) => {
+    if (!trace) return
+    const errorKind = "errorKind" in event ? event.errorKind : "none"
+    const retryableValue = "retryable" in event ? retryable(event.retryable) : "unknown"
+    trace.withScopeStack(scope.stack, () =>
+      trace.popScope(
+        scope.handle,
+        {
+          outcome: event.outcome,
+          status_family: event.statusFamily,
+          error_kind: errorKind,
+          retryable: retryableValue,
+          will_retry: event.willRetry ? "true" : "false",
+        },
+        timestamp,
+        {
+          "opencode.trace.schema_version": SCHEMA_VERSION,
+          "opencode.outcome": event.outcome,
+          "opencode.status_family": event.statusFamily,
+          "opencode.error_kind": errorKind,
+          "opencode.retryable": retryableValue,
+          "opencode.will_retry": event.willRetry ? "true" : "false",
+          "opencode.duration_bucket": toolDurationBucket(event.durationMs),
+          "otel.status_code": event.outcome === "failed" ? "ERROR" : event.outcome === "success" ? "OK" : "UNSET",
+          ...(event.outcome === "failed" ? { "error.type": `opencode.provider_attempt.${errorKind}` } : {}),
+        },
+      ),
+    )
+  }
+
+  const providerAttemptTrace = (
+    state: ProviderAttemptTraceState,
+    parent: RelayScopeContext | undefined,
+    event: AttemptEvent,
+  ) =>
+    Effect.sync(() => {
+      if (!trace || !parent) return
+      try {
+        if (event.type === "started") {
+          const existing = state.get(event.attempt)
+          if (existing) {
+            if (existing.completion) {
+              endProviderAttemptTrace(existing.scope, existing.completion.event, existing.completion.timestamp)
+            } else {
+              endProviderAttemptTrace(existing.scope, {
+                type: "completed",
+                attempt: event.attempt,
+                outcome: "failed",
+                durationMs: Math.max(0, performance.now() - existing.startedAt),
+                statusFamily: "none",
+                errorKind: "unknown",
+                retryable: false,
+                willRetry: false,
+              })
+            }
+            state.delete(event.attempt)
+          }
+          const scope = beginProviderAttemptTrace(parent, event.attempt)
+          if (scope) state.set(event.attempt, { scope, startedAt: performance.now() })
+          return
+        }
+
+        const entry = state.get(event.attempt)
+        if (!entry) return
+
+        if (event.type === "completed") {
+          const timestamp = wallMicros()
+          if (event.willRetry) {
+            state.set(event.attempt, { ...entry, completion: { event, timestamp } })
+            return
+          }
+          endProviderAttemptTrace(entry.scope, event, timestamp)
+          state.delete(event.attempt)
+          return
+        }
+
+        const timestamp = wallMicros()
+        if (!entry.completion) return
+        const handle = entry.scope.handle
+        if (isScopeEventParent(handle)) {
+          trace.withScopeStack(entry.scope.stack, () =>
+            trace.event(
+              "opencode.llm.provider_retry.scheduled",
+              handle,
+              {
+                attempt: event.attempt,
+                next_attempt: event.nextAttempt,
+                delay_source: event.delaySource,
+                delay_bucket: toolDurationBucket(event.delayMs),
+              },
+              { "opencode.trace.schema_version": SCHEMA_VERSION },
+              timestamp,
+            ),
+          )
+        }
+        endProviderAttemptTrace(entry.scope, entry.completion.event, timestamp)
+        state.delete(event.attempt)
+      } catch {
+        // Tracing is observation-only and must never alter host execution.
+      }
+    })
+
+  const finalizeProviderAttemptTraces = (state: ProviderAttemptTraceState, outcome: LlmOutcome) =>
+    Effect.sync(() => {
+      for (const [attempt, entry] of state) {
+        try {
+          if (entry.completion) {
+            endProviderAttemptTrace(entry.scope, entry.completion.event, entry.completion.timestamp)
+          } else {
+            const durationMs = Math.max(0, performance.now() - entry.startedAt)
+            if (outcome === "cancelled") {
+              endProviderAttemptTrace(entry.scope, {
+                type: "completed",
+                attempt,
+                outcome: "cancelled",
+                durationMs,
+                statusFamily: "none",
+                willRetry: false,
+              })
+            } else {
+              endProviderAttemptTrace(entry.scope, {
+                type: "completed",
+                attempt,
+                outcome: "failed",
+                durationMs,
+                statusFamily: "none",
+                errorKind: "unknown",
+                retryable: false,
+                willRetry: false,
+              })
+            }
+          }
+        } catch {
+          // Tracing is observation-only and must never alter host execution.
+        } finally {
+          state.delete(attempt)
+        }
       }
     })
 
@@ -1366,31 +2088,82 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
     attributes: attributes(input),
   })
 
+  const floatCounter = (name: string, value: number, input?: MetricAttributes, unit?: string): MetricMeasurement => ({
+    name,
+    kind: relay.MetricKind.Counter,
+    valueType: relay.MetricValueType.F64,
+    value,
+    unit,
+    attributes: attributes(input),
+  })
+
   const histogram = (
     name: string,
     value: number,
     boundaries: ReadonlyArray<number>,
     input?: MetricAttributes,
+    unit = "ms",
   ): MetricMeasurement => ({
     name,
     kind: relay.MetricKind.Histogram,
     valueType: relay.MetricValueType.F64,
     value: Number.isFinite(value) && value >= 0 ? value : 0,
-    unit: "ms",
+    unit,
     boundaries,
     attributes: attributes(input),
   })
+
+  const runStarted = (input: RunStarted) =>
+    hooks?.runStarted
+      ? hooks.runStarted(input)
+      : emit("opencode.agent.run.started", [counter("opencode.agent.run.started.count", 1, { runtime: input.runtime })])
+
+  const runCompleted = (input: RunCompleted) => {
+    if (hooks?.runCompleted) return hooks.runCompleted(input)
+    const base = { runtime: input.runtime, outcome: input.outcome }
+    return emit("opencode.agent.run.completed", [
+      counter("opencode.agent.run.completed.count", 1, base),
+      histogram(
+        "opencode.agent.run.duration",
+        input.durationMs,
+        [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 120_000, 600_000],
+        base,
+      ),
+      ...(
+        [
+          ["turn", input.operations.turns],
+          ["llm_operation", input.operations.llmOperations],
+          ["tool_call", input.operations.toolCalls],
+          ["host_retry", input.operations.hostRetries],
+          ["provider_attempt", input.operations.providerAttempts],
+          ["provider_retry", input.operations.providerRetries],
+          ["permission_wait", input.operations.permissionWaits],
+          ["question_wait", input.operations.questionWaits],
+        ] as const
+      ).map(([kind, value]) =>
+        histogram(
+          "opencode.agent.run.operation_count",
+          value,
+          [0, 1, 2, 3, 5, 10, 20, 50, 100],
+          { ...base, kind },
+          "{operation}",
+        ),
+      ),
+    ])
+  }
 
   const llmStreamCompleted = (input: LlmStreamCompleted) => {
     if (hooks?.llmStreamCompleted) return hooks.llmStreamCompleted(input)
     const route = {
       provider_family: providerFamily(input.provider),
       model_family: modelFamily(input.model),
+      operation: llmOperation(input.protocol),
     }
     const base = {
       call_role: input.role,
       agent_runtime: input.agentRuntime,
       llm_runtime: input.runtime,
+      llm_mode: "stream",
       ...route,
     }
     const measurements = [
@@ -1403,6 +2176,79 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
           ...base,
           outcome: input.outcome,
         },
+      ),
+      counter("opencode.model_route.count", 1, base),
+    ]
+    if (input.finish)
+      measurements.push(
+        counter("opencode.llm.finish_reason.count", 1, {
+          ...base,
+          finish_reason: finishReason(input.finish),
+        }),
+      )
+    if (input.firstOutput)
+      measurements.push(
+        histogram(
+          "opencode.llm.time_to_first_output",
+          input.firstOutput.latencyMs,
+          [10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000],
+          { ...base, outcome: input.outcome, output_kind: input.firstOutput.kind },
+        ),
+      )
+    if (input.providerError)
+      measurements.push(
+        counter("opencode.llm.provider_error.count", 1, {
+          ...base,
+          classification: providerErrorClassification(input.providerError.classification),
+          retryable: retryable(input.providerError.retryable),
+        }),
+      )
+    const tokens = [
+      ["input_total", input.tokens?.inputTotal],
+      ["input_non_cached", input.tokens?.inputNonCached],
+      ["input_cache_read", input.tokens?.inputCacheRead],
+      ["input_cache_write", input.tokens?.inputCacheWrite],
+      ["output_total", input.tokens?.outputTotal],
+      ["output_reasoning", input.tokens?.outputReasoning],
+    ] as const
+    for (const [kind, value] of tokens) {
+      const count = integer(value)
+      if (count === undefined) continue
+      measurements.push(counter("opencode.llm.tokens", count, { ...base, kind }))
+    }
+    for (const utilization of input.inputContextUtilizations ?? []) {
+      if (!Number.isFinite(utilization) || utilization <= 0) continue
+      measurements.push(
+        histogram(
+          "opencode.llm.input_context_utilization",
+          utilization,
+          [0.25, 0.5, 0.75, 0.85, 0.9, 0.95, 1, 1.1],
+          { ...base, scope: "provider_step" },
+          "1",
+        ),
+      )
+    }
+    return emit("opencode.llm.stream.completed", measurements)
+  }
+
+  const llmUnaryCompleted = (input: LlmUnaryCompleted) => {
+    if (hooks?.llmUnaryCompleted) return hooks.llmUnaryCompleted(input)
+    const base = {
+      call_role: input.role,
+      agent_runtime: input.agentRuntime,
+      llm_runtime: input.runtime,
+      llm_mode: "unary",
+      provider_family: providerFamily(input.provider),
+      model_family: modelFamily(input.model),
+      operation: llmOperation(input.protocol),
+    }
+    const measurements = [
+      counter("opencode.llm.unary.count", 1, { ...base, outcome: input.outcome }),
+      histogram(
+        "opencode.llm.unary.duration",
+        input.durationMs,
+        [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 120_000, 600_000],
+        { ...base, outcome: input.outcome },
       ),
       counter("opencode.model_route.count", 1, base),
     ]
@@ -1426,7 +2272,39 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
       if (count === undefined) continue
       measurements.push(counter("opencode.llm.tokens", count, { ...base, kind }))
     }
-    return emit("opencode.llm.stream.completed", measurements)
+    const utilization = inputContextUtilization(input.tokens?.inputTotal, input.contextLimit)
+    if (utilization !== undefined)
+      measurements.push(
+        histogram(
+          "opencode.llm.input_context_utilization",
+          utilization,
+          [0.25, 0.5, 0.75, 0.85, 0.9, 0.95, 1, 1.1],
+          { ...base, scope: "unary_call" },
+          "1",
+        ),
+      )
+    return emit("opencode.llm.unary.completed", measurements)
+  }
+
+  const llmCostRecorded: Interface["llmCostRecorded"] = (input) => {
+    if (hooks?.llmCostRecorded) return hooks.llmCostRecorded(input)
+    if (!Number.isFinite(input.costUsd) || input.costUsd < 0) return Effect.void
+    return emit("opencode.llm.cost.recorded", [
+      floatCounter(
+        "opencode.llm.cost_usd",
+        input.costUsd,
+        {
+          call_role: input.role,
+          agent_runtime: input.agentRuntime,
+          llm_mode: "stream",
+          provider_family: providerFamily(input.provider),
+          model_family: modelFamily(input.model),
+          source: input.source,
+          scope: "provider_step",
+        },
+        "USD",
+      ),
+    ])
   }
 
   const turnCompleted: Interface["turnCompleted"] = (input) =>
@@ -1452,7 +2330,7 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
 
   const toolCompleted = (input: ToolCompleted) => {
     if (hooks?.toolCompleted) return hooks.toolCompleted(input)
-    const category = input.execution === "provider" ? "provider" : (input.category ?? toolCategory(input.name))
+    const category = input.category ?? toolCategory(input.name)
     const measurements = [
       counter("opencode.tool_call.count", 1, {
         category,
@@ -1460,6 +2338,13 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
         outcome: input.outcome,
       }),
     ]
+    if (input.execution === "local" && category === "terminal" && input.terminalResult !== undefined)
+      measurements.push(
+        counter("opencode.tool.terminal_result.count", 1, {
+          result_family: input.terminalResult,
+          outcome: input.outcome,
+        }),
+      )
     if (input.execution === "local" && input.durationMs !== undefined)
       measurements.push(
         histogram(
@@ -1475,6 +2360,153 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
     return emit("opencode.tool.completed", measurements)
   }
 
+  const permissionEvaluated: Interface["permissionEvaluated"] = (input) =>
+    Effect.gen(function* () {
+      const scope = yield* CurrentRelayScope
+      yield* emit("opencode.permission.evaluated", [
+        counter("opencode.permission.evaluation.count", 1, {
+          runtime: input.runtime,
+          permission_family: input.family,
+          effect: input.effect,
+        }),
+      ]).pipe(Effect.ensuring(permissionEvaluationTrace(scope, input)))
+    })
+
+  const permissionWaitCompleted = (input: PermissionWaitCompleted) => {
+    if (hooks?.permissionWaitCompleted) return hooks.permissionWaitCompleted(input)
+    const base = {
+      runtime: input.runtime,
+      permission_family: input.family,
+      resolution: input.resolution,
+    }
+    return emit("opencode.permission.wait.completed", [
+      counter("opencode.permission.wait.count", 1, base),
+      histogram(
+        "opencode.permission.wait.duration",
+        input.durationMs,
+        [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 120_000, 600_000],
+        base,
+      ),
+    ])
+  }
+
+  const questionWaitCompleted = (input: QuestionWaitCompleted) => {
+    if (hooks?.questionWaitCompleted) return hooks.questionWaitCompleted(input)
+    const attributes = {
+      runtime: input.runtime,
+      resolution: input.resolution,
+    }
+    return emit("opencode.question.wait.completed", [
+      counter("opencode.question.wait.count", 1, attributes),
+      histogram(
+        "opencode.question.wait.duration",
+        input.durationMs,
+        [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 120_000, 600_000],
+        attributes,
+      ),
+    ])
+  }
+
+  const compactionCompleted: Interface["compactionCompleted"] = (input) => {
+    if (hooks?.compactionCompleted) return hooks.compactionCompleted(input)
+    const measurements = [counter("opencode.compaction.completed.count", 1, { runtime: input.runtime })]
+    const estimates = [
+      ["source", input.sourceEstimatedTokens],
+      ["summary", input.summaryEstimatedTokens],
+      ["retained_recent", input.retainedRecentEstimatedTokens],
+    ] as const
+    for (const [kind, value] of estimates) {
+      const count = integer(value)
+      if (count === undefined) continue
+      measurements.push(counter("opencode.compaction.estimated_tokens", count, { runtime: input.runtime, kind }))
+    }
+    return emit("opencode.compaction.completed", measurements)
+  }
+
+  const compactionAttemptCompleted: Interface["compactionAttemptCompleted"] = (input) => {
+    if (hooks?.compactionAttemptCompleted) return hooks.compactionAttemptCompleted(input)
+    const attributes = {
+      runtime: input.runtime,
+      trigger: input.trigger,
+      outcome: input.outcome,
+    }
+    return emit("opencode.compaction.attempt.completed", [
+      counter("opencode.compaction.attempt.count", 1, attributes),
+      histogram(
+        "opencode.compaction.duration",
+        input.durationMs,
+        [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 120_000, 600_000],
+        attributes,
+      ),
+    ])
+  }
+
+  const providerAttemptObserved = (
+    input: LlmStreamStarted,
+    event: AttemptEvent,
+    scope: RelayScopeContext | undefined,
+    traceState: ProviderAttemptTraceState,
+  ) =>
+    Effect.gen(function* () {
+      const run = yield* CurrentRelayRun
+      const route = {
+        call_role: input.role,
+        agent_runtime: input.agentRuntime,
+        llm_runtime: input.runtime,
+        llm_mode: "stream",
+        provider_family: providerFamily(input.provider),
+        model_family: modelFamily(input.model),
+        operation: llmOperation(input.protocol),
+      }
+      let publication: Effect.Effect<void>
+      if (event.type === "started") {
+        if (run) run.providerAttempts++
+        publication = emit("opencode.llm.provider_attempt.started", [
+          counter("opencode.llm.provider_attempt.started.count", 1, {
+            ...route,
+            attempt: event.attempt,
+          }),
+        ])
+      } else if (event.type === "retry-scheduled") {
+        if (run) run.providerRetries++
+        const attributes = {
+          ...route,
+          attempt: event.attempt,
+          next_attempt: event.nextAttempt,
+          delay_source: event.delaySource,
+        }
+        publication = emit("opencode.llm.provider_retry.scheduled", [
+          counter("opencode.llm.provider_retry.scheduled.count", 1, attributes),
+          histogram(
+            "opencode.llm.provider_retry.delay",
+            event.delayMs,
+            [10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000],
+            attributes,
+          ),
+        ])
+      } else {
+        const attributes = {
+          ...route,
+          attempt: event.attempt,
+          outcome: event.outcome,
+          status_family: event.statusFamily,
+          error_kind: "errorKind" in event ? event.errorKind : "none",
+          retryable: "retryable" in event ? retryable(event.retryable) : "unknown",
+          will_retry: event.willRetry ? "true" : "false",
+        }
+        publication = emit("opencode.llm.provider_attempt.completed", [
+          counter("opencode.llm.provider_attempt.completed.count", 1, attributes),
+          histogram(
+            "opencode.llm.provider_attempt.time_to_headers",
+            event.durationMs,
+            [10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000],
+            attributes,
+          ),
+        ])
+      }
+      yield* publication.pipe(Effect.ensuring(providerAttemptTrace(traceState, scope, event)))
+    })
+
   const admit = () => (lifecycle ? lifecycle.admit(host) : host.accepting)
   const finish = () => {
     if (lifecycle) lifecycle.finish(host)
@@ -1484,18 +2516,27 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
     Effect.gen(function* () {
       if (!admit()) return noopTool
       if (!lifecycle) host.operations++
+      const run = yield* CurrentRelayRun
+      if (run) run.toolCalls++
       const parent = yield* CurrentRelayScope
       const traceScope = beginToolTrace(input, parent)
       const started = performance.now()
       let completed = false
       return {
-        complete(outcome) {
+        run(effect) {
+          return traceScope ? effect.pipe(Effect.provideService(CurrentRelayScope, traceScope)) : effect
+        },
+        complete(outcome, details) {
           return Effect.suspend(() => {
             if (completed) return Effect.void
             completed = true
+            const category = input.category ?? toolCategory(input.name)
             const completedInput = {
               ...input,
               outcome,
+              ...(input.execution === "local" && category === "terminal" && details?.terminalResult !== undefined
+                ? { terminalResult: details.terminalResult }
+                : {}),
               ...(input.execution === "local" ? { durationMs: performance.now() - started } : {}),
             }
             return toolCompleted(completedInput).pipe(
@@ -1522,31 +2563,58 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
         // hold shutdown open, and each subscription is a distinct attempt.
         if (!admit()) return source
         if (!lifecycle) host.operations++
+        const run = yield* CurrentRelayRun
+        if (run) run.llmOperations++
         const parent = yield* CurrentRelayScope
-        const traceScope = beginLlmTrace(input, parent)
+        const traceScope = beginLlmTrace(input, parent, "stream")
+        const providerAttemptTraceState: ProviderAttemptTraceState = new Map()
         const started = performance.now()
         let outcome: LlmOutcome = "unknown"
         let finishValue: string | undefined
         let stepUsage: TokenUsage | undefined
         let finalUsage: TokenUsage | undefined
+        const inputContextUtilizations: number[] = []
+        let firstOutput: LlmStreamCompleted["firstOutput"]
+        let providerError: LlmStreamCompleted["providerError"]
         let terminal = false
-        return source.pipe(
+        const observedSource =
+          input.runtime === "native"
+            ? source.pipe(
+                Stream.provideService(RequestExecutor.CurrentAttemptObserver, (event) =>
+                  providerAttemptObserved(input, event, traceScope, providerAttemptTraceState),
+                ),
+              )
+            : source
+        return observedSource.pipe(
           Stream.tap((event) =>
             Effect.sync(() => {
+              const kind = firstOutputKind(event)
+              if (!firstOutput && kind) {
+                firstOutput = { kind, latencyMs: performance.now() - started }
+              }
               if (event.type === "provider-error") {
                 outcome = "provider_error"
+                providerError = {
+                  classification: event.classification ?? "",
+                  retryable: event.retryable,
+                }
                 terminal = true
                 return
               }
               if (event.type === "step-finish") {
-                if (outcome !== "provider_error") outcome = event.reason === "error" ? "failed" : "success"
+                if (outcome !== "provider_error")
+                  outcome = event.reason === "error" || event.reason === "content-filter" ? "failed" : "success"
                 finishValue = event.reason
-                stepUsage = addUsage(stepUsage, usage(event.usage))
+                const observedUsage = usage(event.usage)
+                stepUsage = addUsage(stepUsage, observedUsage)
+                const utilization = inputContextUtilization(observedUsage?.inputTotal, input.contextLimit)
+                if (utilization !== undefined) inputContextUtilizations.push(utilization)
                 return
               }
               if (event.type === "finish") {
                 terminal = true
-                if (outcome !== "provider_error") outcome = event.reason === "error" ? "failed" : "success"
+                if (outcome !== "provider_error")
+                  outcome = event.reason === "error" || event.reason === "content-filter" ? "failed" : "success"
                 finishValue = event.reason
                 finalUsage = usage(event.usage)
               }
@@ -1566,8 +2634,14 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
               finish: finishValue,
               durationMs: performance.now() - started,
               tokens: finalUsage ?? stepUsage,
+              inputContextUtilizations,
+              firstOutput,
+              providerError,
             }
-            return llmStreamCompleted(completedInput).pipe(Effect.ensuring(endLlmTrace(traceScope, completedInput)))
+            return llmStreamCompleted(completedInput).pipe(
+              Effect.ensuring(finalizeProviderAttemptTraces(providerAttemptTraceState, outcome)),
+              Effect.ensuring(endLlmTrace(traceScope, completedInput, "stream")),
+            )
           }),
           Stream.ensuring(
             Effect.sync(() => {
@@ -1578,6 +2652,163 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
         )
       }),
     )
+
+  const observeLlmUnary: Interface["observeLlmUnary"] = (input, effect, project) =>
+    Effect.suspend(() => {
+      if (!admit()) return effect
+      if (!lifecycle) host.operations++
+      const started = performance.now()
+      return Effect.gen(function* () {
+        const run = yield* CurrentRelayRun
+        if (run) run.llmOperations++
+        const parent = yield* CurrentRelayScope
+        const traceScope = beginLlmTrace(input, parent, "unary")
+        const observed = traceScope ? effect.pipe(Effect.provideService(CurrentRelayScope, traceScope)) : effect
+        return yield* observed.pipe(
+          Effect.onExit((exit) => {
+            let projected: { readonly finish?: string; readonly tokens?: TokenUsage } = {}
+            if (Exit.isSuccess(exit) && project) {
+              try {
+                projected = project(exit.value)
+              } catch {
+                // A telemetry projector must never change host execution.
+              }
+            }
+            const completedInput: LlmUnaryCompleted = {
+              ...input,
+              ...projected,
+              outcome: Exit.isSuccess(exit) ? "success" : Cause.hasInterruptsOnly(exit.cause) ? "cancelled" : "failed",
+              durationMs: performance.now() - started,
+            }
+            return llmUnaryCompleted(completedInput).pipe(
+              Effect.ensuring(endLlmTrace(traceScope, completedInput, "unary")),
+            )
+          }),
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (lifecycle) finish()
+              else host.operations = Math.max(0, host.operations - 1)
+            }),
+          ),
+        )
+      })
+    })
+
+  const observePermissionWait: Interface["observePermissionWait"] = (input, effect, classify) =>
+    Effect.suspend(() => {
+      if (!admit()) return effect
+      if (!lifecycle) host.operations++
+      const started = performance.now()
+      return Effect.gen(function* () {
+        const run = yield* CurrentRelayRun
+        if (run) run.permissionWaits++
+        const parent = yield* CurrentRelayScope
+        const traceScope = beginPermissionWaitTrace(input, parent)
+        const observed = traceScope ? effect.pipe(Effect.provideService(CurrentRelayScope, traceScope)) : effect
+        return yield* observed.pipe(
+          Effect.onExit((exit) => {
+            const completedInput = {
+              ...input,
+              resolution: classifyPermissionWait(exit, classify),
+              durationMs: performance.now() - started,
+            }
+            return permissionWaitCompleted(completedInput).pipe(
+              Effect.ensuring(endPermissionWaitTrace(traceScope, completedInput)),
+            )
+          }),
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (lifecycle) finish()
+              else host.operations = Math.max(0, host.operations - 1)
+            }),
+          ),
+        )
+      })
+    })
+
+  const observeQuestionWait: Interface["observeQuestionWait"] = (input, effect, classify) =>
+    Effect.suspend(() => {
+      if (!admit()) return effect
+      if (!lifecycle) host.operations++
+      const started = performance.now()
+      return Effect.gen(function* () {
+        const run = yield* CurrentRelayRun
+        if (run) run.questionWaits++
+        const parent = yield* CurrentRelayScope
+        const traceScope = beginQuestionWaitTrace(input, parent)
+        const observed = traceScope ? effect.pipe(Effect.provideService(CurrentRelayScope, traceScope)) : effect
+        return yield* observed.pipe(
+          Effect.onExit((exit) => {
+            const completedInput = {
+              ...input,
+              resolution: classifyQuestionWait(exit, classify),
+              durationMs: performance.now() - started,
+            }
+            return questionWaitCompleted(completedInput).pipe(
+              Effect.ensuring(endQuestionWaitTrace(traceScope, completedInput)),
+            )
+          }),
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (lifecycle) finish()
+              else host.operations = Math.max(0, host.operations - 1)
+            }),
+          ),
+        )
+      })
+    })
+
+  const observeRun: Interface["observeRun"] = (input, effect, classify) =>
+    Effect.suspend(() => {
+      if (!admit()) return effect
+      if (!lifecycle) host.operations++
+      const started = performance.now()
+      const operations: MutableRunOperationCounts = {
+        turns: 0,
+        llmOperations: 0,
+        toolCalls: 0,
+        hostRetries: 0,
+        providerAttempts: 0,
+        providerRetries: 0,
+        permissionWaits: 0,
+        questionWaits: 0,
+      }
+      return Effect.gen(function* () {
+        const parent = yield* CurrentRelayScope
+        const traceScope = beginRunTrace(input, parent)
+        const scoped = traceScope ? effect.pipe(Effect.provideService(CurrentRelayScope, traceScope)) : effect
+        const observed = scoped.pipe(Effect.provideService(CurrentRelayRun, operations))
+        yield* runStarted(input).pipe(Effect.catchCause(() => Effect.void))
+        return yield* observed.pipe(
+          Effect.onExit((exit) => {
+            const classified = classifyExit(exit, classify)
+            const outcome = classified === "success" ? (operations.lastTurnOutcome ?? classified) : classified
+            const completedInput = {
+              ...input,
+              outcome,
+              durationMs: performance.now() - started,
+              operations: {
+                turns: operations.turns,
+                llmOperations: operations.llmOperations,
+                toolCalls: operations.toolCalls,
+                hostRetries: operations.hostRetries,
+                providerAttempts: operations.providerAttempts,
+                providerRetries: operations.providerRetries,
+                permissionWaits: operations.permissionWaits,
+                questionWaits: operations.questionWaits,
+              },
+            }
+            return runCompleted(completedInput).pipe(Effect.ensuring(endRunTrace(traceScope, completedInput)))
+          }),
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (lifecycle) finish()
+              else host.operations = Math.max(0, host.operations - 1)
+            }),
+          ),
+        )
+      })
+    })
 
   const observeTurn = <A, E, R>(
     input: TurnStarted,
@@ -1591,14 +2822,18 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
       if (!lifecycle) host.operations++
       const started = performance.now()
       return Effect.gen(function* () {
+        const run = yield* CurrentRelayRun
+        if (run) run.turns++
         const parent = yield* CurrentRelayScope
         const traceScope = beginTurnTrace(input, parent)
         const observed = traceScope ? effect.pipe(Effect.provideService(CurrentRelayScope, traceScope)) : effect
         return yield* observed.pipe(
           Effect.onExit((exit) => {
+            const outcome = classifyExit(exit, classify)
+            if (run) run.lastTurnOutcome = outcome
             const completedInput = {
               ...input,
-              outcome: classifyExit(exit, classify),
+              outcome,
               durationMs: performance.now() - started,
             }
             return turnCompleted(completedInput).pipe(Effect.ensuring(endTurnTrace(traceScope, completedInput)))
@@ -1615,21 +2850,52 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
 
   return {
     status: host.status,
+    detached: (effect) =>
+      effect.pipe(
+        Effect.provideService(CurrentRelayScope, undefined),
+        Effect.provideService(CurrentRelayRun, undefined),
+      ),
+    observeRun,
     observeLlmStream,
+    observeLlmUnary,
     observeTurn,
+    observePermissionWait,
+    observeQuestionWait,
     beginTool,
+    runStarted,
+    runCompleted,
     llmStreamCompleted,
+    llmUnaryCompleted,
+    llmCostRecorded,
     turnCompleted,
     toolCompleted,
+    permissionEvaluated,
+    permissionWaitCompleted,
+    questionWaitCompleted,
+    compactionAttemptCompleted,
+    compactionCompleted,
     retryScheduled: (input) =>
       Effect.gen(function* () {
+        const run = yield* CurrentRelayRun
+        if (run) run.hostRetries++
         const scope = yield* CurrentRelayScope
-        yield* emit("opencode.llm.host_retry.scheduled", [
-          counter("opencode.llm.host_retry_scheduled.count", 1, {
-            runtime: input.runtime,
-            attempt: input.attempt <= 1 ? "first" : input.attempt === 2 ? "second" : "third_or_later",
-          }),
-        ]).pipe(Effect.ensuring(retryTrace(scope, input)))
+        const attributes = {
+          runtime: input.runtime,
+          attempt: input.attempt <= 1 ? "first" : input.attempt === 2 ? "second" : "third_or_later",
+          delay_source: input.delaySource ?? "unknown",
+          error_kind: input.errorKind ?? "unknown",
+        }
+        const measurements = [counter("opencode.llm.host_retry_scheduled.count", 1, attributes)]
+        if (input.delayMs !== undefined && Number.isFinite(input.delayMs) && input.delayMs >= 0)
+          measurements.push(
+            histogram(
+              "opencode.llm.host_retry.delay",
+              input.delayMs,
+              [10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 120_000, 600_000],
+              attributes,
+            ),
+          )
+        yield* emit("opencode.llm.host_retry.scheduled", measurements).pipe(Effect.ensuring(retryTrace(scope, input)))
       }),
   }
 }
