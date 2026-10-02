@@ -24,7 +24,10 @@ export const Commands = Spec.make(typeof OPENCODE_CLI_NAME === "string" ? OPENCO
     }),
     Spec.make("debug", {
       description: "Debugging and troubleshooting tools",
-      commands: [Spec.make("agents", { description: "List all agents" })],
+      commands: [
+        Spec.make("agents", { description: "List all agents" }),
+        Spec.make("nemo-relay", { description: "Show NeMo Relay adapter and plugin-host status" }),
+      ],
     }),
     Spec.make("migrate", { description: "Migrate v1 data to v2" }),
     Spec.make("service", {
