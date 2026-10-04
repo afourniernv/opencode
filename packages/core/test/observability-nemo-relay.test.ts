@@ -1510,14 +1510,29 @@ describe("NeMo Relay process lifecycle", () => {
     expect(runtime.state.close).toBe(1)
   })
 
-  test("separates activation conflicts and incompatible runtime modules", async () => {
-    const conflictRuntime = fakeRuntime({
-      initializeFails: new Error("plugin configuration is owned by an active dynamic plugin host"),
-    })
-    const conflict = enabledLifecycle(conflictRuntime)
-    expect((await conflict.acquire()).status).toEqual({ state: "unavailable", reason: "activation_conflict" })
-    await conflict.release()
+  test("classifies only Relay's exact plugin-host ownership conflicts", async () => {
+    const messages = [
+      "conflict: plugin configuration is owned by an active dynamic plugin host",
+      "conflict: a static plugin configuration is already active; to combine static and dynamic plugins, provide the static components as the base configuration to dynamic plugin activation before calling plugin initialization",
+    ]
+    for (const message of messages) {
+      const conflict = enabledLifecycle(fakeRuntime({ initializeFails: new Error(message) }))
+      expect((await conflict.acquire()).status).toEqual({ state: "unavailable", reason: "activation_conflict" })
+      await conflict.release()
+    }
 
+    const nearMatch = enabledLifecycle(
+      fakeRuntime({
+        initializeFails: new Error(
+          "plugin failed while reporting that plugin configuration is owned by an active dynamic plugin host",
+        ),
+      }),
+    )
+    expect((await nearMatch.acquire()).status).toEqual({ state: "unavailable", reason: "activation_failed" })
+    await nearMatch.release()
+  })
+
+  test("separates incompatible runtime modules from activation failures", async () => {
     const incompatible = createLifecycleForTesting({
       loader: async () => ({ initialize: async () => undefined }),
       environment: { OPENCODE_NEMO_RELAY: "1" },

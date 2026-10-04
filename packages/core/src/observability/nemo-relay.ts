@@ -10,6 +10,10 @@ const RUNTIME_MODULE = "nemo-relay-node"
 const SCHEMA_VERSION = "3"
 const DEFAULT_STARTUP_TIMEOUT_MS = 5_000
 const DEFAULT_TEARDOWN_TIMEOUT_MS = 5_000
+const PLUGIN_HOST_CONFLICT_MESSAGES = new Set([
+  "conflict: a static plugin configuration is already active; to combine static and dynamic plugins, provide the static components as the base configuration to dynamic plugin activation before calling plugin initialization",
+  "conflict: plugin configuration is owned by an active dynamic plugin host",
+])
 const DURATION_MS_BUCKETS = [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 120_000, 600_000]
 const LATENCY_MS_BUCKETS = [10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000]
 const RETRY_DELAY_MS_BUCKETS = [...LATENCY_MS_BUCKETS, 120_000, 600_000]
@@ -155,6 +159,18 @@ export type ProcessHealth = {
   readonly operations: number
   readonly status: Status
 }
+
+/** Static attachment contract. Runtime activation is reported separately by health(). */
+export const Capabilities = {
+  pluginHost: true,
+  tools: "manual_lifecycle",
+  llm: "manual_lifecycle",
+  managedToolExecution: false,
+  managedLlmExecution: false,
+  policyEnforcement: false,
+  requestMutation: false,
+  resultMutation: false,
+} as const
 
 class Host {
   accepting: boolean
@@ -647,13 +663,7 @@ function request(environment: Readonly<Record<string, string | undefined>>): Req
 }
 
 function activationConflict(error: unknown) {
-  const message = error instanceof Error ? error.message.toLowerCase() : ""
-  return (
-    message.includes("active dynamic plugin host") ||
-    message.includes("static plugin configuration is already active") ||
-    message.includes("plugin configuration is owned by an active") ||
-    message.includes("binding identity is already initialized")
-  )
+  return error instanceof Error && PLUGIN_HOST_CONFLICT_MESSAGES.has(error.message)
 }
 
 function activationMetric(relay: RelayModule) {

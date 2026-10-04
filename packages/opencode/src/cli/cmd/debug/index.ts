@@ -59,6 +59,7 @@ const NemoRelayCommand = effectCmd({
         {
           service: relay.status,
           process: NemoRelay.health(),
+          capabilities: NemoRelay.Capabilities,
           exporterDelivery: "not_probed",
         },
         null,

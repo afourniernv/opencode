@@ -32,6 +32,15 @@ event, flush, and enum surfaces. The module does not expose a version that
 OpenCode can check at runtime, so changing the pin still requires API and
 packaged-artifact requalification.
 
+Relay 0.9.4 is the latest stable release reviewed for this branch. Its public
+Node contract is unchanged and its release is limited to deferred boxing for
+small-thread-stack safety plus dependency alignment. OpenCode does not adopt it
+yet because the repository's three-day minimum release age intentionally
+rejects packages published on 2026-10-04. Revisit the exact pin after that
+window and rerun package and live-inference qualification; do not bypass the
+supply-chain policy. See the [0.9.4 release
+notes](https://github.com/NVIDIA/NeMo-Relay/releases/tag/0.9.4).
+
 The default runtime specifier is `nemo-relay-node`, loaded only after Relay is
 explicitly enabled. Source and Node distributions resolve that metapackage in
 the normal way. Each supported standalone Bun artifact embeds exactly one
@@ -118,6 +127,11 @@ The command prints two related views:
 - `process` reports the process-global phase (`idle`, `starting`, `active`,
   `draining`, `teardown_failed`, or `stopped`) plus configured owner and admitted
   operation counts.
+- `capabilities` reports the adapter contract independently of activation. The
+  plugin host is wired, while Tool and LLM calls currently use Relay's manual
+  lifecycle APIs. Managed execution, policy enforcement, and request or result
+  mutation are therefore reported as unavailable rather than inferred from an
+  active host.
 
 `exporterDelivery` is deliberately `not_probed`. An active plugin host proves
 that Relay accepted the configuration and activation handle; it does not prove
@@ -131,6 +145,33 @@ runs. The build fails when a supported host artifact cannot load its embedded
 addon or when a native macOS x64 build does not report the explicit unsupported
 state. This is an artifact test, not a substitute for live inference and
 exporter delivery.
+
+### Plugin reachability
+
+Relay owns plugin discovery and activation. OpenCode passes the standard
+`plugins.toml` to the one process-global Relay host; it does not parse plugin
+kinds, create a Switchyard-specific path, or reuse OpenCode's unrelated
+top-level `plugin` configuration. Any built-in, native, or worker plugin that
+the selected Relay release can load may therefore appear in the activation
+report.
+
+Activation alone does not make every plugin hook reachable. The current
+attachment contract is:
+
+| Relay plugin behavior                                              | Current OpenCode support           |
+| ------------------------------------------------------------------ | ---------------------------------- |
+| Standard configuration discovery and explicit TOML override        | Yes                                |
+| Built-in, native, and worker plugin activation                     | Yes                                |
+| Subscribers, exporters, metadata injection, and event sanitization | Yes                                |
+| Tool and LLM lifecycle observation                                 | Yes, through manual lifecycle APIs |
+| Tool or LLM conditional-execution policy                           | No                                 |
+| Tool or LLM request/result mutation                                | No                                 |
+| Tool or LLM execution intercepts                                   | No                                 |
+| Relay gateway routing                                              | No                                 |
+
+The last four rows require OpenCode to hand Relay the real downstream callback
+at each canonical dispatcher. They must not be described as enabled merely
+because the plugin host is active.
 
 ## Trace schema
 
