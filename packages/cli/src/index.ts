@@ -12,6 +12,7 @@ const Handlers = Runtime.handlers(Commands, {
   api: () => import("./commands/handlers/api"),
   debug: {
     agents: () => import("./commands/handlers/debug/agents"),
+    "nemo-relay": () => import("./commands/handlers/debug/nemo-relay"),
   },
   migrate: () => import("./commands/handlers/migrate"),
   service: {
