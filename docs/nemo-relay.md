@@ -3,11 +3,11 @@
 Status: experimental fork work. This is not yet an OpenCode or NeMo Relay
 compatibility promise.
 
-This branch supports the currently released `opencode` CLI/server and its
-standalone Bun artifacts. Preview `packages/cli`/`lildax`, Electron desktop,
-and channel-specific Nix, Docker, npm postinstall, shell-installer, AUR, and
-Homebrew work are preserved in separate follow-up branches. Those surfaces are
-not part of this branch's support claim.
+The common branch supports the currently released `opencode` CLI/server and
+its standalone Bun artifacts. This follow-up adds packaged Electron desktop
+support. Preview `packages/cli`/`lildax` and channel-specific Nix, Docker, npm
+postinstall, shell-installer, AUR, and Homebrew work remain separate and are not
+part of this branch's support claim.
 
 The integration is a first-party, in-process observation adapter. It emits two
 parallel, privacy-bounded contracts through Relay at OpenCode-owned execution
@@ -53,6 +53,9 @@ the normal way. Each supported standalone Bun artifact embeds exactly one
 target-native addon behind a generated shim; it does not require an operator
 installation and does not carry the other six addons.
 
+Electron owns the same exact dependency, leaves it external to the JavaScript
+bundle, selects the matching host addon, and unpacks the `.node` file from ASAR.
+
 `OPENCODE_NEMO_RELAY_RUNTIME_MODULE` remains an advanced development and
 qualification override:
 
@@ -70,6 +73,7 @@ packages. OpenCode's distribution contract is:
 | macOS arm64                    | Embedded Darwin arm64 addon                   |
 | Windows x64/arm64              | Embedded `*-msvc` addon                       |
 | macOS x64                      | Explicit `unavailable: unsupported_platform`  |
+| Electron on a supported target | External metapackage plus unpacked host addon |
 
 Baseline and AVX2 variants share the same Relay addon for their OS,
 architecture, and libc. Every standalone artifact includes OpenCode's MIT
@@ -78,6 +82,19 @@ Apache-2.0 license. Channel-specific installation and license propagation are
 owned by the distribution follow-up branch. A custom runtime specifier can be
 used to qualify a separately built macOS x64 addon, but it is not a claimed
 release target.
+
+### Electron desktop support
+
+The desktop shell runs the current OpenCode server inside a Node utility-process
+sidecar. Relay therefore executes in that sidecar rather than in the renderer.
+The desktop build keeps the native addon loadable after packaging and routes
+quit, relaunch, updater-install, and handled-signal paths through an idempotent
+barrier that awaits sidecar shutdown. The watchdog leaves room for Relay drain
+and flush before forcing process termination.
+
+This support applies to the local Electron sidecar. Desktop-launched WSL
+servers invoke a separately installed Linux `opencode` process and do not yet
+share the same structured shutdown path.
 
 ## Activation and health
 
@@ -433,10 +450,13 @@ Normal command termination now reaches one root finalizer before the remaining
 forced process exit. The `serve` and `web` commands translate SIGINT/SIGTERM into
 structured shutdown, stop their server, and dispose reachable instances first.
 The TUI worker similarly stops admission, disposes instances and its application
-runtime, then gives Relay a bounded final drain. Desktop sidecar shutdown is
-owned by the Electron follow-up branch. SIGKILL, host termination, or a deadline
-overrun can still abandon telemetry; OpenCode prints a warning when the Relay
-result is not fully drained, flushed, and closed.
+runtime, then gives Relay a bounded final drain. Electron routes ordinary quit,
+relaunch, updater-install, and handled signal paths through one idempotent,
+awaited quit barrier before resuming application exit. Its sidecar watchdog is
+ten seconds so Relay's five-second drain plus HTTP and IPC finalization can
+complete. SIGKILL, host termination, or a deadline overrun can still abandon
+telemetry; OpenCode prints a warning when the Relay result is not fully drained,
+flushed, and closed.
 
 Only `serve` and `web` currently coordinate SIGINT/SIGTERM with structured
 shutdown. An OS signal delivered to another command, including the TUI parent,
@@ -531,11 +551,11 @@ the same host operations.
   hook.
 - Plugin-host health does not probe exporter delivery. A collector outage can
   coexist with `active` health; validate the destination and shutdown flush.
-- The packaged macOS arm64 `opencode` Bun artifact is qualified locally, and
+- The packaged macOS arm64 `opencode` Bun and Electron artifacts are qualified locally, and
   all 12 current-CLI standalone variants cross-build successfully. Linux glibc,
   Windows, native Linux host execution, and Intel macOS unsupported-state still
-  require their release runners. Electron, Docker, and Nix qualification belong
-  to their follow-up branches.
+  require their release runners. Docker and Nix qualification belong to the
+  distribution follow-up branch. Desktop-launched WSL servers remain unqualified.
 - `bun.lock` changes intentionally require the repository's four-native-runner
   `nix-hashes` workflow after merge. Cross-generated hashes are not
   byte-identical, so do not guess or hand-edit `nix/hashes.json` in a feature
@@ -583,6 +603,11 @@ Run tests from their package directories, never from the repository root.
 (cd packages/llm && bun typecheck)
 (cd packages/core && bun typecheck)
 (cd packages/opencode && bun typecheck)
+(cd packages/desktop && bun typecheck)
+
+(cd packages/desktop && bun test \
+  electron-builder.config.test.ts \
+  src/main/quit-barrier.test.ts)
 
 # The current-host standalone build runs its packaged Relay activation gate.
 (cd packages/opencode && bun run script/build.ts --single)
@@ -694,8 +719,9 @@ and concurrent sessions before treating a packaged target as fully qualified.
 
 ### Latest local qualification evidence
 
-On 2026-09-29, macOS arm64 with Bun 1.3.14, Relay 0.9.3, and Phoenix
-20.16.0 passed the following checks for the current CLI/server branch:
+On 2026-09-29, macOS arm64 with Bun 1.3.14, Electron 42/Node 24.15.0,
+Relay 0.9.3, and Phoenix 20.16.0 passed the following checks for the current
+CLI/server and local Electron sidecar branches:
 
 - standalone `opencode` activated after the installed source addon directory
   was made unavailable, proving that the executable is self-contained;
@@ -704,6 +730,8 @@ On 2026-09-29, macOS arm64 with Bun 1.3.14, Relay 0.9.3, and Phoenix
 - all 12 standalone OpenCode targets cross-built from the pinned metapackage;
 - adversarial ambient runtime-module, plugin-TOML, pure-mode, Relay logging, and
   OTLP variables did not influence the standalone build probe;
+- the Electron directory package contained only the Darwin arm64 Relay addon,
+  loaded it from `app.asar.unpacked`, initialized Relay, and closed it;
 - packaged `opencode` ran live `nvidia/openai/gpt-oss-20b` inference through
   the ordinary AI SDK path, completed a real local file-read tool, and returned
   the file's canary value;
