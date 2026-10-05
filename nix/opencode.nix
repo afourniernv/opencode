@@ -64,6 +64,12 @@ stdenvNoCC.mkDerivation (finalAttrs: {
 
     install -Dm755 dist/opencode-*/bin/opencode $out/bin/opencode
     install -Dm644 schema.json $out/share/opencode/schema.json
+    install -Dm644 dist/opencode-*/bin/LICENSE \
+      $out/share/licenses/opencode/LICENSE
+    if [ -f dist/opencode-*/bin/LICENSE.nemo-relay ]; then
+      install -Dm644 dist/opencode-*/bin/LICENSE.nemo-relay \
+        $out/share/licenses/opencode/LICENSE.nemo-relay
+    fi
 
     wrapProgram $out/bin/opencode \
       --prefix PATH : ${
@@ -102,7 +108,8 @@ stdenvNoCC.mkDerivation (finalAttrs: {
   meta = {
     description = "The open source coding agent";
     homepage = "https://opencode.ai";
-    license = lib.licenses.mit;
+    license = [ lib.licenses.mit ]
+      ++ lib.optional (stdenvNoCC.hostPlatform.system != "x86_64-darwin") lib.licenses.asl20;
     mainProgram = "opencode";
     inherit (node_modules.meta) platforms;
   };
