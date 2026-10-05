@@ -18,7 +18,9 @@ export type SidecarListener = { stop: () => Promise<void> }
 
 const SIDECAR_SERVICE_NAME = "opencode server"
 const SIDECAR_START_STALL_TIMEOUT = 60_000
-const SIDECAR_STOP_TIMEOUT = 6_000
+// Server scope shutdown can spend 5s draining/flushing Relay plus 1s closing
+// HTTP connections. Leave room for the remaining finalizers and IPC exit.
+const SIDECAR_STOP_TIMEOUT = 10_000
 
 type SpawnLocalServerOptions = {
   userDataPath: string
