@@ -17,6 +17,7 @@ export default Runtime.handler(
             {
               service: relay.status,
               process: NemoRelay.health(),
+              capabilities: NemoRelay.Capabilities,
               exporterDelivery: "not_probed",
             },
             null,

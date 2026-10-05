@@ -3,13 +3,37 @@ import { RequestExecutor, type AttemptEvent, type AttemptOrdinal } from "@openco
 import type { LlmHandle, ScopeHandle, ScopeStack, ToolHandle } from "nemo-relay-node"
 import { makeGlobalNode } from "../effect/app-node"
 
-const ENABLE_ENV = "OPENCODE_NEMO_RELAY"
 const CONFIG_ENV = "OPENCODE_NEMO_RELAY_PLUGINS_TOML"
 const RUNTIME_MODULE_ENV = "OPENCODE_NEMO_RELAY_RUNTIME_MODULE"
 const RUNTIME_MODULE = "nemo-relay-node"
 const SCHEMA_VERSION = "3"
 const DEFAULT_STARTUP_TIMEOUT_MS = 5_000
 const DEFAULT_TEARDOWN_TIMEOUT_MS = 5_000
+const PLUGIN_HOST_CONFLICT_MESSAGES = new Set([
+  "conflict: a static plugin configuration is already active; to combine static and dynamic plugins, provide the static components as the base configuration to dynamic plugin activation before calling plugin initialization",
+  "conflict: plugin configuration is owned by an active dynamic plugin host",
+])
+const NON_DEGRADED_WARNING_CODES = new Set(["plugin.configuration_inherited"])
+const SUPPORTED_OBSERVATION_REGISTRATIONS = new Set([
+  "subscriber",
+  "event_metadata_injector",
+  "mark_sanitize_guardrail",
+  "scope_sanitize_start_guardrail",
+  "scope_sanitize_end_guardrail",
+  "tool_sanitize_request_guardrail",
+  "tool_sanitize_response_guardrail",
+  "llm_sanitize_request_guardrail",
+  "llm_sanitize_response_guardrail",
+])
+const UNSUPPORTED_EXECUTION_REGISTRATIONS = new Set([
+  "tool_conditional_execution_guardrail",
+  "tool_request_intercept",
+  "tool_execution_intercept",
+  "llm_conditional_execution_guardrail",
+  "llm_request_intercept",
+  "llm_execution_intercept",
+  "llm_stream_execution_intercept",
+])
 const DURATION_MS_BUCKETS = [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 120_000, 600_000]
 const LATENCY_MS_BUCKETS = [10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000]
 const RETRY_DELAY_MS_BUCKETS = [...LATENCY_MS_BUCKETS, 120_000, 600_000]
@@ -106,6 +130,7 @@ type PluginHostActivation = {
 
 type RelayModule = RelayMetrics &
   RelayTracing & {
+    readonly listRuntimeRegistrations: () => ReadonlyArray<{ readonly kind: string }>
     readonly initialize: (
       config: { readonly version: 1; readonly components: readonly [] },
       additionalPluginsToml?: string,
@@ -126,8 +151,6 @@ export type ReportSummary = {
 }
 
 export type UnavailableReason =
-  | "configuration_without_enable"
-  | "invalid_enable_value"
   | "unsupported_platform"
   | "runtime_unavailable"
   | "incompatible_runtime"
@@ -135,26 +158,45 @@ export type UnavailableReason =
   | "activation_failed"
   | "startup_timeout"
   | "configuration_failed"
+  | "configuration_unverified"
+  | "unsupported_middleware"
   | "invalid_activation"
   | "teardown_failed"
   | "stopped"
 
 export type Status =
-  | { readonly state: "disabled"; readonly reason: "not_requested" | "explicitly_disabled" | "pure_mode" }
+  | { readonly state: "disabled"; readonly reason: "not_started" | "pure_mode" }
   | {
       readonly state: "active"
       readonly activation: "healthy" | "degraded"
       readonly configuration: "empty" | "present"
       readonly report: ReportSummary
     }
-  | { readonly state: "unavailable"; readonly reason: UnavailableReason }
+  | {
+      readonly state: "unavailable"
+      readonly reason: UnavailableReason
+      readonly unsupportedRegistrations?: ReadonlyArray<string>
+    }
 
 export type ProcessHealth = {
   readonly phase: "idle" | "starting" | "active" | "draining" | "teardown_failed" | "stopped"
   readonly owners: number
   readonly operations: number
+  readonly blocking: boolean
   readonly status: Status
 }
+
+/** Static attachment contract. Runtime activation is reported separately by health(). */
+export const Capabilities = {
+  pluginHost: true,
+  tools: "manual_lifecycle",
+  llm: "manual_lifecycle",
+  managedToolExecution: false,
+  managedLlmExecution: false,
+  policyEnforcement: false,
+  requestMutation: false,
+  resultMutation: false,
+} as const
 
 class Host {
   accepting: boolean
@@ -171,15 +213,37 @@ class Host {
     public status: Status,
     public readonly relay?: RelayRuntime,
     public activation?: PluginHostActivation,
+    public blocking = false,
+    private readonly inspectRegistrations?: () => ReadonlyArray<string>,
   ) {
     this.accepting = status.state === "active"
   }
 
   admit() {
+    if (this.blocking) throw blockingError(this.status)
     if (!this.accepting || this.status.state !== "active") return undefined
     if (this.activation && activationIsActive(this.activation) !== true) return undefined
+    if (this.inspectRegistrations) {
+      let unsupported: ReadonlyArray<string>
+      try {
+        unsupported = this.inspectRegistrations()
+      } catch {
+        this.block({ state: "unavailable", reason: "configuration_unverified" })
+        throw blockingError(this.status)
+      }
+      if (unsupported.length > 0) {
+        this.block({ state: "unavailable", reason: "unsupported_middleware", unsupportedRegistrations: unsupported })
+        throw blockingError(this.status)
+      }
+    }
     this.operations++
     return new ObservationLease(this)
+  }
+
+  private block(status: Status) {
+    this.status = status
+    this.blocking = true
+    this.accepting = false
   }
 
   finish() {
@@ -497,7 +561,7 @@ const CurrentRelayRun = Context.Reference<MutableRunOperationCounts | undefined>
   defaultValue: () => undefined,
 })
 
-const disabledStatus: Status = { state: "disabled", reason: "not_requested" }
+const disabledStatus: Status = { state: "disabled", reason: "not_started" }
 const noopTool: ToolObservation = { run: (effect) => effect, complete: () => Effect.void }
 const noop: Interface = {
   status: disabledStatus,
@@ -522,6 +586,39 @@ const noop: Interface = {
   compactionAttemptCompleted: () => Effect.void,
   compactionCompleted: () => Effect.void,
   retryScheduled: () => Effect.void,
+}
+
+function blockingError(status: Status) {
+  const reason = status.state === "unavailable" ? status.reason : "configuration_failed"
+  const code =
+    reason === "unsupported_middleware"
+      ? "OPENCODE_NEMO_RELAY_EXECUTION_MIDDLEWARE_UNSUPPORTED"
+      : reason === "configuration_unverified"
+        ? "OPENCODE_NEMO_RELAY_CONFIGURATION_UNVERIFIED"
+        : reason === "activation_conflict"
+          ? "OPENCODE_NEMO_RELAY_HOST_CONFLICT"
+          : "OPENCODE_NEMO_RELAY_CONFIGURATION_REQUIRED"
+  const suffix =
+    status.state === "unavailable" && status.unsupportedRegistrations?.length
+      ? `: ${status.unsupportedRegistrations.join(", ")}`
+      : ""
+  return Object.assign(new Error(`NeMo Relay cannot safely admit OpenCode execution (${reason})${suffix}`), {
+    name: "NemoRelayConfigurationError",
+    code,
+  })
+}
+
+function blocked(status: Status): Interface {
+  const fail = <A = never>(): Effect.Effect<A> => Effect.die(blockingError(status))
+  return {
+    ...noop,
+    status,
+    observeRun: () => fail(),
+    observeLlmStream: () => Stream.fromEffect(fail()),
+    observeLlmUnary: () => fail(),
+    observeTurn: () => fail(),
+    beginTool: () => fail(),
+  }
 }
 
 const defaultLoader: Loader = async (specifier) => {
@@ -566,6 +663,8 @@ function relayModule(value: unknown): RelayModule {
     throw new Error("NeMo Relay runtime module does not expose the trace API")
   if (typeof candidate.flushSubscribers !== "function")
     throw new Error("NeMo Relay runtime module does not expose flushSubscribers")
+  if (typeof candidate.listRuntimeRegistrations !== "function")
+    throw new Error("NeMo Relay runtime module does not expose listRuntimeRegistrations")
   if (typeof candidate.initialize !== "function")
     throw new Error("NeMo Relay runtime module does not expose initialize")
   return candidate as RelayModule
@@ -605,14 +704,35 @@ function reportSummary(report: unknown): ReportSummary {
   }
 }
 
+function compatibleActivationReport(report: unknown) {
+  try {
+    if (!isRecord(report) || !isRecord(report.config) || !isRecord(report.resolved_config)) return false
+    return (
+      Array.isArray(report.config.diagnostics) &&
+      (report.config.runtime_diagnostics === undefined || Array.isArray(report.config.runtime_diagnostics)) &&
+      Array.isArray(report.config_paths) &&
+      Array.isArray(report.dynamic_plugins) &&
+      Array.isArray(report.resolved_config.components)
+    )
+  } catch {
+    return false
+  }
+}
+
 function reportHasCode(report: unknown, code: string) {
   if (!isRecord(report) || !isRecord(report.config)) return false
   return strings(report.config.diagnostics).some((item) => item.code === code)
 }
 
+function reportHasActionableWarning(report: unknown) {
+  if (!isRecord(report) || !isRecord(report.config)) return false
+  return strings(report.config.diagnostics).some(
+    (item) => item.level === "warning" && (typeof item.code !== "string" || !NON_DEGRADED_WARNING_CODES.has(item.code)),
+  )
+}
+
 type Request =
   | { readonly state: "disabled"; readonly status: Status }
-  | { readonly state: "invalid"; readonly status: Status }
   | {
       readonly state: "enabled"
       readonly config?: string
@@ -621,22 +741,9 @@ type Request =
     }
 
 function request(environment: Readonly<Record<string, string | undefined>>): Request {
-  const raw = environment[ENABLE_ENV]?.trim().toLowerCase()
   const config = environment[CONFIG_ENV]?.trim() || undefined
   const pure = environment.OPENCODE_PURE?.trim().toLowerCase()
   if (pure === "1" || pure === "true") return { state: "disabled", status: { state: "disabled", reason: "pure_mode" } }
-  if (raw === undefined || raw === "") {
-    if (config)
-      return {
-        state: "invalid",
-        status: { state: "unavailable", reason: "configuration_without_enable" },
-      }
-    return { state: "disabled", status: disabledStatus }
-  }
-  if (["0", "false", "no", "off"].includes(raw))
-    return { state: "disabled", status: { state: "disabled", reason: "explicitly_disabled" } }
-  if (!["1", "true", "yes", "on"].includes(raw))
-    return { state: "invalid", status: { state: "unavailable", reason: "invalid_enable_value" } }
   const runtimeSpecifier = environment[RUNTIME_MODULE_ENV]?.trim() || RUNTIME_MODULE
   return {
     state: "enabled",
@@ -647,13 +754,18 @@ function request(environment: Readonly<Record<string, string | undefined>>): Req
 }
 
 function activationConflict(error: unknown) {
-  const message = error instanceof Error ? error.message.toLowerCase() : ""
-  return (
-    message.includes("active dynamic plugin host") ||
-    message.includes("static plugin configuration is already active") ||
-    message.includes("plugin configuration is owned by an active") ||
-    message.includes("binding identity is already initialized")
+  return error instanceof Error && PLUGIN_HOST_CONFLICT_MESSAGES.has(error.message)
+}
+
+function unsupportedRegistrationKinds(relay: RelayModule) {
+  const kinds = relay.listRuntimeRegistrations().map((registration) => registration.kind)
+  if (
+    kinds.some(
+      (kind) => !SUPPORTED_OBSERVATION_REGISTRATIONS.has(kind) && !UNSUPPORTED_EXECUTION_REGISTRATIONS.has(kind),
+    )
   )
+    throw new Error("NeMo Relay reported an unknown runtime registration kind")
+  return [...new Set(kinds.filter((kind) => UNSUPPORTED_EXECUTION_REGISTRATIONS.has(kind)))]
 }
 
 function activationMetric(relay: RelayModule) {
@@ -675,12 +787,18 @@ function activationMetric(relay: RelayModule) {
   )
 }
 
-function inactive(status: Status): Host {
-  return new Host(status)
+function inactive(status: Status, blocking = false): Host {
+  return new Host(status, undefined, undefined, blocking)
 }
 
-function activeHost(status: Status, relay: RelayRuntime, activation?: PluginHostActivation): Host {
-  return new Host(status, relay, activation)
+function activeHost(
+  status: Status,
+  relay: RelayRuntime,
+  activation?: PluginHostActivation,
+  blocking = false,
+  inspectRegistrations?: () => ReadonlyArray<string>,
+): Host {
+  return new Host(status, relay, activation, blocking, inspectRegistrations)
 }
 
 function activationIsActive(activation: PluginHostActivation) {
@@ -733,7 +851,7 @@ async function open(options: OpenOptions): Promise<Host> {
   }
   if (selected.state !== "enabled") return inactive(selected.status)
   if (!selected.customRuntime && options.platform === "darwin" && options.arch === "x64")
-    return inactive({ state: "unavailable", reason: "unsupported_platform" })
+    return inactive({ state: "unavailable", reason: "unsupported_platform" }, selected.config !== undefined)
   const startupDeadline = performance.now() + Math.max(0, options.startupTimeoutMs)
 
   let loaded: unknown
@@ -742,17 +860,17 @@ async function open(options: OpenOptions): Promise<Host> {
       Promise.resolve().then(() => options.loader(selected.runtimeSpecifier)),
       remaining(startupDeadline),
     )
-    if (!result.settled) return inactive({ state: "unavailable", reason: "startup_timeout" })
+    if (!result.settled) return inactive({ state: "unavailable", reason: "startup_timeout" }, true)
     loaded = result.value
   } catch {
-    return inactive({ state: "unavailable", reason: "runtime_unavailable" })
+    return inactive({ state: "unavailable", reason: "runtime_unavailable" }, true)
   }
 
   let relay: RelayModule
   try {
     relay = relayModule(loaded)
   } catch {
-    return inactive({ state: "unavailable", reason: "incompatible_runtime" })
+    return inactive({ state: "unavailable", reason: "incompatible_runtime" }, true)
   }
 
   let rawActivation: unknown
@@ -763,6 +881,7 @@ async function open(options: OpenOptions): Promise<Host> {
     const result = await bounded(initialization, remaining(startupDeadline))
     if (!result.settled) {
       const late = activeHost({ state: "unavailable", reason: "startup_timeout" }, relay)
+      late.blocking = true
       late.accepting = false
       const activationTask = initialization.then(
         (value) => {
@@ -779,10 +898,13 @@ async function open(options: OpenOptions): Promise<Host> {
     }
     rawActivation = result.value
   } catch (error) {
-    return inactive({
-      state: "unavailable",
-      reason: activationConflict(error) ? "activation_conflict" : "activation_failed",
-    })
+    return inactive(
+      {
+        state: "unavailable",
+        reason: activationConflict(error) ? "activation_conflict" : "activation_failed",
+      },
+      true,
+    )
   }
 
   const activation = activationHandle(rawActivation)
@@ -792,14 +914,14 @@ async function open(options: OpenOptions): Promise<Host> {
   } catch {
     activationReport = undefined
   }
-  if (!activation || activationIsActive(activation) !== true || !isRecord(activationReport)) {
+  if (!activation || activationIsActive(activation) !== true || !compatibleActivationReport(activationReport)) {
     if (activation) {
-      const invalid = activeHost({ state: "unavailable", reason: "invalid_activation" }, relay, activation)
+      const invalid = activeHost({ state: "unavailable", reason: "invalid_activation" }, relay, activation, true)
       invalid.accepting = false
       const closed = await closeHost(invalid, 2_000)
       if (!closed.closed) return invalid
     }
-    return inactive({ state: "unavailable", reason: "invalid_activation" })
+    return inactive({ state: "unavailable", reason: "invalid_activation" }, true)
   }
 
   let summary: ReportSummary
@@ -810,16 +932,37 @@ async function open(options: OpenOptions): Promise<Host> {
       summary.errorCount > 0 ||
       (selected.config !== undefined && reportHasCode(activationReport, "plugin.configuration_file_missing"))
   } catch {
-    const invalid = activeHost({ state: "unavailable", reason: "invalid_activation" }, relay, activation)
+    const invalid = activeHost({ state: "unavailable", reason: "invalid_activation" }, relay, activation, true)
     invalid.accepting = false
     const closed = await closeHost(invalid, 2_000)
-    return closed.closed ? inactive(invalid.status) : invalid
+    return closed.closed ? inactive(invalid.status, true) : invalid
   }
   if (invalidConfiguration) {
-    const invalid = activeHost({ state: "unavailable", reason: "configuration_failed" }, relay, activation)
+    const invalid = activeHost({ state: "unavailable", reason: "configuration_failed" }, relay, activation, true)
     invalid.accepting = false
     const closed = await closeHost(invalid, 2_000)
-    return closed.closed ? inactive(invalid.status) : invalid
+    return closed.closed ? inactive(invalid.status, true) : invalid
+  }
+
+  let unsupported: ReadonlyArray<string>
+  try {
+    unsupported = unsupportedRegistrationKinds(relay)
+  } catch {
+    const invalid = activeHost({ state: "unavailable", reason: "configuration_unverified" }, relay, activation, true)
+    invalid.accepting = false
+    const closed = await closeHost(invalid, 2_000)
+    return closed.closed ? inactive(invalid.status, true) : invalid
+  }
+  if (unsupported.length > 0) {
+    const invalid = activeHost(
+      { state: "unavailable", reason: "unsupported_middleware", unsupportedRegistrations: unsupported },
+      relay,
+      activation,
+      true,
+    )
+    invalid.accepting = false
+    const closed = await closeHost(invalid, 2_000)
+    return closed.closed ? inactive(invalid.status, true) : invalid
   }
 
   const configured =
@@ -827,7 +970,10 @@ async function open(options: OpenOptions): Promise<Host> {
     summary.configPathCount > 0 ||
     summary.componentCount > 0 ||
     summary.dynamicSelectedCount > 0
-  const degraded = summary.warningCount > 0 || summary.runtimeDiagnosticCount > 0 || summary.dynamicFailureCount > 0
+  const degraded =
+    reportHasActionableWarning(activationReport) ||
+    summary.runtimeDiagnosticCount > 0 ||
+    summary.dynamicFailureCount > 0
   const status: Status = {
     state: "active",
     activation: degraded ? "degraded" : "healthy",
@@ -840,7 +986,7 @@ async function open(options: OpenOptions): Promise<Host> {
     // Activation remains valid. The health surface reports plugin-host state,
     // not exporter delivery, which must be checked at the destination.
   }
-  return activeHost(status, relay, activation)
+  return activeHost(status, relay, activation, false, () => unsupportedRegistrationKinds(relay))
 }
 
 function refreshStatus(host: Host): Status {
@@ -852,7 +998,7 @@ function refreshStatus(host: Host): Status {
     host.status = { ...host.status, activation: "degraded" }
     return host.status
   }
-  if (!isRecord(value)) {
+  if (!compatibleActivationReport(value)) {
     host.status = { ...host.status, activation: "degraded" }
     return host.status
   }
@@ -866,7 +1012,7 @@ function refreshStatus(host: Host): Status {
         ? "present"
         : "empty"
     const degraded =
-      summary.warningCount > 0 ||
+      reportHasActionableWarning(value) ||
       summary.errorCount > 0 ||
       summary.runtimeDiagnosticCount > 0 ||
       summary.dynamicFailureCount > 0
@@ -989,13 +1135,13 @@ class Lifecycle {
           if (!retry.closed) {
             this.phase = "teardown_failed"
             this.lastStatus = { state: "unavailable", reason: "teardown_failed" }
-            return inactive(this.lastStatus)
+            return inactive(this.lastStatus, true)
           }
           this.retained = undefined
         }
         if (this.stopping || this.stopped) return inactive({ state: "unavailable", reason: "stopped" })
         const host = await open(this.options).catch(() =>
-          inactive({ state: "unavailable", reason: "activation_failed" }),
+          inactive({ state: "unavailable", reason: "activation_failed" }, true),
         )
         this.host = host
         if (this.stopping || this.stopped) {
@@ -1137,6 +1283,7 @@ class Lifecycle {
       phase: this.phase,
       owners: this.owners,
       operations: host?.operations ?? 0,
+      blocking: host?.blocking ?? false,
       status: this.lastStatus,
     }
   }
@@ -1438,6 +1585,7 @@ function traceErrorType(outcome: LlmOutcome | TurnOutcome | ToolOutcome) {
 }
 
 function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interface {
+  if (host.blocking) return blocked(host.status)
   if (!host.relay || host.status.state !== "active") return { ...noop, status: host.status }
   const relay = host.relay
   const trace = tracing(relay)
@@ -2633,7 +2781,9 @@ function make(host: Host, lifecycle?: Lifecycle, hooks?: TestingHooks): Interfac
     })
 
   return {
-    status: host.status,
+    get status() {
+      return host.status
+    },
     detached: (effect) =>
       effect.pipe(
         Effect.provideService(CurrentRelayScope, undefined),
@@ -2753,10 +2903,15 @@ const layer = Layer.effect(
         configuration: host.status.configuration,
         diagnostics: host.status.report.warningCount + host.status.report.errorCount,
       })
-    if (host.status.state === "unavailable")
-      yield* Effect.logWarning("NeMo Relay is unavailable; continuing without Relay instrumentation", {
-        reason: host.status.reason,
-      })
+    if (host.status.state === "unavailable") {
+      const message = host.blocking
+        ? "NeMo Relay configuration prevents OpenCode execution"
+        : "NeMo Relay is unavailable; continuing without Relay instrumentation"
+      const log = host.blocking
+        ? Effect.logError(message, { reason: host.status.reason })
+        : Effect.logWarning(message, { reason: host.status.reason })
+      yield* log
+    }
     return Service.of(make(host, lifecycle))
   }),
 )
@@ -2764,7 +2919,6 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({ service: Service, layer, deps: [] })
 
 export const Environment = {
-  enabled: ENABLE_ENV,
   pluginsToml: CONFIG_ENV,
   runtimeModule: RUNTIME_MODULE_ENV,
 } as const

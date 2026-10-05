@@ -32,13 +32,14 @@ event, flush, and enum surfaces. The module does not expose a version that
 OpenCode can check at runtime, so changing the pin still requires API and
 packaged-artifact requalification.
 
-The default runtime specifier is `nemo-relay-node`, loaded only after Relay is
-explicitly enabled. Source and Node distributions resolve that metapackage in
-the normal way. Each supported standalone Bun artifact embeds exactly one
-target-native addon behind a generated shim; it does not require an operator
-installation and does not carry the other six addons. The Electron distribution
-owns the same exact dependency, leaves it external to the JavaScript bundle,
-and unpacks the selected `.node` file from ASAR.
+The default runtime specifier is `nemo-relay-node`. OpenCode loads it when the
+Relay service starts unless `OPENCODE_PURE=1` is set. Source and Node
+distributions resolve that metapackage in the normal way. Each supported
+standalone Bun artifact embeds exactly one target-native addon behind a
+generated shim; it does not require an operator installation and does not carry
+the other six addons. The Electron distribution owns the same exact dependency,
+leaves it external to the JavaScript bundle, and unpacks the selected `.node`
+file from ASAR.
 
 `OPENCODE_NEMO_RELAY_RUNTIME_MODULE` remains an advanced development and
 qualification override:
@@ -69,46 +70,54 @@ separately built macOS x64 addon, but it is not a claimed release target.
 
 ## Activation and health
 
-Relay is strictly opt-in:
+OpenCode initializes one process-wide Relay plugin host automatically. Relay
+discovers its normal user and system plugin files; OpenCode does not add a
+repository-local discovery rule. The normal locations are:
 
-```text
-OPENCODE_NEMO_RELAY=1
-```
+- user: `$XDG_CONFIG_HOME/nemo-relay/plugins.toml`, falling back to
+  `~/.config/nemo-relay/plugins.toml` (or the same `.config` path below
+  `%USERPROFILE%` on Windows); and
+- system: `/etc/nemo-relay/plugins.toml` on Unix or
+  `%ProgramData%\nemo-relay\plugins.toml` on Windows.
 
-Accepted enable values are `1`, `true`, `yes`, and `on`; accepted disable values
-are `0`, `false`, `no`, and `off`, case-insensitively. An unknown value is
-reported as unavailable. `OPENCODE_PURE=1` or `true` takes precedence and keeps
-Relay disabled.
-
-Select an additional Relay plugin configuration with:
+Set an explicit user-layer file when OpenCode should use a different Relay
+configuration:
 
 ```text
 OPENCODE_NEMO_RELAY_PLUGINS_TOML=/absolute/path/to/plugins.toml
 ```
 
-OpenCode passes this path to Relay as `additionalPluginsToml`; it does not add a
-repository-local discovery rule. Supplying a path without enabling Relay is a
-configuration error. An explicitly missing file, a Relay configuration error,
-an activation conflict, an incompatible module, and an invalid activation
-handle are reported as unavailable. Host execution continues without Relay
-instrumentation in every unavailable case.
+OpenCode passes this path to Relay as `additionalPluginsToml`. It replaces the
+normal user file for that process; the operator-managed system file still loads
+above it and wins conflicts. This setting is independent of OpenCode's own
+JavaScript `plugin` configuration, so the two plugin systems do not share names
+or configuration files. Use `OPENCODE_PURE=1` or `true` when a deliberately
+plugin-free process is required; it bypasses both OpenCode external plugins and
+Relay activation.
+
+An explicitly missing file, invalid Relay configuration, activation conflict,
+incompatible runtime, invalid activation handle, or unsupported execution
+middleware is reported as unavailable and blocks observed work rather than
+silently bypassing requested policy. A missing runtime blocks on supported
+platforms because Relay is a core dependency and ambient enterprise
+configuration cannot otherwise be ruled out. The unsupported macOS x64 target
+remains fail-open unless an explicit Relay configuration was selected.
 
 Runtime loading and plugin-host initialization share a five-second startup
-deadline. OpenCode fails open if that deadline expires. Native initialization
-cannot be cancelled, so an activation that resolves after the deadline is
-retained long enough to flush and close instead of leaking process-global Relay
-state.
+deadline. A timeout is reported as unavailable and blocks new observed work.
+Native initialization cannot be cancelled, so an activation that resolves
+after the deadline is retained long enough to flush and close instead of
+leaking process-global Relay state.
 
 Inspect the adapter from the same packaged artifact and environment that will
 run OpenCode:
 
 ```bash
-OPENCODE_NEMO_RELAY=1 \
 OPENCODE_NEMO_RELAY_PLUGINS_TOML=/absolute/path/to/plugins.toml \
 ./opencode debug nemo-relay
 ```
 
-The command prints two related views:
+The command reports:
 
 - `service` is the status captured by that Effect service acquisition:
   `disabled`, `active`, or `unavailable`. An active status distinguishes
@@ -117,7 +126,30 @@ The command prints two related views:
   plugins, diagnostics, and dynamic-plugin failures.
 - `process` reports the process-global phase (`idle`, `starting`, `active`,
   `draining`, `teardown_failed`, or `stopped`) plus configured owner and admitted
-  operation counts.
+  operation counts and whether the current state blocks observed work.
+- `capabilities` describes the static integration boundary. It distinguishes
+  Relay plugin-host support and manual Tool/LLM lifecycle observation from
+  managed execution, policy enforcement, and payload mutation.
+
+### Plugin compatibility
+
+OpenCode emits copied, bounded observability payloads through Relay. Plugins
+that operate on those copies are supported:
+
+| Relay plugin surface                     | OpenCode behavior                                                                             |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------- |
+| Subscribers and exporters                | Receive OpenCode's Relay events, scopes, and metrics.                                         |
+| Event metadata injectors                 | Add metadata to copied observability events.                                                  |
+| Mark and scope sanitizers                | Sanitize copied marks and scope events before export.                                         |
+| Tool and LLM request/response sanitizers | Sanitize the copied manual lifecycle payload; they do not change the real OpenCode operation. |
+
+OpenCode does not yet pass its real Tool or LLM callbacks to Relay managed
+execution. A configuration that registers Tool/LLM conditional-execution
+guardrails, request intercepts, execution intercepts, or stream-execution
+intercepts is therefore rejected as `unsupported_middleware`. Accepting those
+registrations without calling them would make configured policy appear active
+while OpenCode continued unprotected. Provider routing and request/result
+mutation remain unsupported for the same reason.
 
 `exporterDelivery` is deliberately `not_probed`. An active plugin host proves
 that Relay accepted the configuration and activation handle; it does not prove
@@ -618,7 +650,6 @@ lifecycles are exercised. A permission-wait span requires an `ask` policy and a
 real reply; do not infer it from an automatically allowed tool:
 
 ```bash
-export OPENCODE_NEMO_RELAY=1
 export OPENCODE_NEMO_RELAY_PLUGINS_TOML=/absolute/path/to/plugins.toml
 
 ./opencode debug nemo-relay

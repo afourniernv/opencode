@@ -19,7 +19,5 @@ COPY dist/opencode-linux-arm64-musl/bin/LICENSE.nemo-relay /usr/share/licenses/o
 ARG TARGETARCH
 FROM build-${TARGETARCH}
 RUN opencode --version
-RUN XDG_CONFIG_HOME=/tmp/opencode-relay-config \
-    OPENCODE_NEMO_RELAY=1 \
-    opencode debug nemo-relay | grep -q '"state": "active"'
+RUN XDG_CONFIG_HOME=/tmp/opencode-relay-config opencode debug nemo-relay | grep -q '"state": "active"'
 ENTRYPOINT ["opencode"]

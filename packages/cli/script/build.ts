@@ -88,7 +88,6 @@ const probeRelayRuntime = async (binaryPath: string, supported: boolean) => {
         XDG_CONFIG_HOME: home,
         APPDATA: home,
         LOCALAPPDATA: home,
-        OPENCODE_NEMO_RELAY: "1",
       },
       stdout: "pipe",
       stderr: "pipe",

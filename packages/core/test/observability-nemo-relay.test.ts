@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Exit, Fiber, Stream } from "effect"
+import { Cause, Effect, Exit, Fiber, Stream } from "effect"
 import { RequestExecutor } from "@opencode-ai/llm/route"
 import {
   createLifecycleForTesting,
@@ -223,6 +223,8 @@ function fakeRuntime(input?: {
   readonly closeWait?: Promise<void>
   readonly isActiveThrows?: boolean
   readonly reportThrows?: boolean
+  readonly registrations?: ReadonlyArray<{ readonly kind: string }>
+  readonly registrationInspectionFails?: boolean
   readonly flushThrowsSynchronously?: boolean
 }) {
   const state = {
@@ -233,6 +235,8 @@ function fakeRuntime(input?: {
     closing: false,
     path: undefined as string | undefined,
     report: input?.report ?? report(),
+    registrations: input?.registrations ?? [],
+    registrationInspectionFails: input?.registrationInspectionFails ?? false,
   }
   const metrics = driver()
   const activation = {
@@ -267,6 +271,10 @@ function fakeRuntime(input?: {
         if (input?.flushFails) return Promise.reject(new Error("flush failed"))
         return input?.flushWait ?? Promise.resolve()
       },
+      listRuntimeRegistrations() {
+        if (state.registrationInspectionFails) throw new Error("registration inspection failed")
+        return state.registrations
+      },
       async initialize(_config: unknown, path?: string) {
         state.initialize++
         state.path = path
@@ -285,7 +293,7 @@ function enabledLifecycle(
 ) {
   return createLifecycleForTesting({
     loader: async () => runtime.module,
-    environment: { OPENCODE_NEMO_RELAY: "1" },
+    environment: {},
     ...options,
   })
 }
@@ -1393,41 +1401,34 @@ describe("NeMo Relay observability", () => {
 })
 
 describe("NeMo Relay process lifecycle", () => {
-  test("disabled and invalid activation requests never load the native runtime", async () => {
-    let loads = 0
-    const disabled = createLifecycleForTesting({
-      loader: async () => {
-        loads++
-        return fakeRuntime().module
-      },
-      environment: {},
+  test("discovers plugins by default and accepts an explicit config without a separate enable flag", async () => {
+    const discoveredRuntime = fakeRuntime({
+      report: report({
+        components: 0,
+        diagnostics: [{ level: "warning", code: "plugin.configuration_inherited" }],
+      }),
     })
-    expect((await disabled.acquire()).status).toEqual({ state: "disabled", reason: "not_requested" })
-    await disabled.release()
-
-    const invalid = createLifecycleForTesting({
-      loader: async () => {
-        loads++
-        return fakeRuntime().module
-      },
-      environment: { OPENCODE_NEMO_RELAY: "treu" },
+    const discovered = enabledLifecycle(discoveredRuntime)
+    expect((await discovered.acquire()).status).toMatchObject({
+      state: "active",
+      activation: "healthy",
+      configuration: "empty",
+      report: { warningCount: 1 },
     })
-    expect((await invalid.acquire()).status).toEqual({ state: "unavailable", reason: "invalid_enable_value" })
-    await invalid.release()
+    expect(discoveredRuntime.state.path).toBeUndefined()
+    await discovered.release()
 
-    const orphanConfig = createLifecycleForTesting({
-      loader: async () => {
-        loads++
-        return fakeRuntime().module
-      },
+    const configuredRuntime = fakeRuntime()
+    const configured = createLifecycleForTesting({
+      loader: async () => configuredRuntime.module,
       environment: { OPENCODE_NEMO_RELAY_PLUGINS_TOML: "/private/config.toml" },
     })
-    expect((await orphanConfig.acquire()).status).toEqual({
-      state: "unavailable",
-      reason: "configuration_without_enable",
+    expect((await configured.acquire()).status).toMatchObject({
+      state: "active",
+      configuration: "present",
     })
-    await orphanConfig.release()
-    expect(loads).toBe(0)
+    expect(configuredRuntime.state.path).toBe("/private/config.toml")
+    await configured.release()
   })
 
   test("a custom runtime override may load on a platform unsupported by the default package", async () => {
@@ -1439,7 +1440,6 @@ describe("NeMo Relay process lifecycle", () => {
         return runtime.module
       },
       environment: {
-        OPENCODE_NEMO_RELAY: "1",
         OPENCODE_NEMO_RELAY_RUNTIME_MODULE: "custom-relay-runtime",
       },
       platform: "darwin",
@@ -1458,14 +1458,14 @@ describe("NeMo Relay process lifecycle", () => {
     }
     const pure = createLifecycleForTesting({
       loader,
-      environment: { OPENCODE_NEMO_RELAY: "1", OPENCODE_PURE: "true" },
+      environment: { OPENCODE_PURE: "true", OPENCODE_NEMO_RELAY_PLUGINS_TOML: "/ignored/plugins.toml" },
     })
     expect((await pure.acquire()).status).toEqual({ state: "disabled", reason: "pure_mode" })
     await pure.release()
 
     const unsupported = createLifecycleForTesting({
       loader,
-      environment: { OPENCODE_NEMO_RELAY: "1" },
+      environment: {},
       platform: "darwin",
       arch: "x64",
     })
@@ -1474,18 +1474,45 @@ describe("NeMo Relay process lifecycle", () => {
     expect(loads).toBe(0)
   })
 
-  test("fails open when runtime loading exceeds the startup deadline", async () => {
+  test("a missing runtime blocks on supported platforms where Relay is a core dependency", async () => {
+    const loader = async () => {
+      throw new Error("module unavailable")
+    }
+    const lifecycle = createLifecycleForTesting({ loader, environment: {} })
+    const relay = await lifecycle.acquire()
+    const exit = await Effect.runPromiseExit(relay.observeRun({ runtime: "v2" }, Effect.succeed("must not continue")))
+    expect(Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined).toMatchObject({
+      code: "OPENCODE_NEMO_RELAY_CONFIGURATION_REQUIRED",
+    })
+    expect(lifecycle.health().blocking).toBe(true)
+    await lifecycle.release()
+  })
+
+  test("blocks execution when runtime loading exceeds the startup deadline", async () => {
     const loading = deferred()
     const lifecycle = createLifecycleForTesting({
       loader: async () => {
         await loading.promise
         return fakeRuntime().module
       },
-      environment: { OPENCODE_NEMO_RELAY: "1" },
+      environment: {},
       startupTimeoutMs: 5,
     })
 
-    expect((await lifecycle.acquire()).status).toEqual({ state: "unavailable", reason: "startup_timeout" })
+    const relay = await lifecycle.acquire()
+    expect(relay.status).toEqual({ state: "unavailable", reason: "startup_timeout" })
+    let executed = false
+    const exit = await Effect.runPromiseExit(
+      relay.observeRun(
+        { runtime: "v2" },
+        Effect.sync(() => (executed = true)),
+      ),
+    )
+    expect(executed).toBe(false)
+    expect(Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined).toMatchObject({
+      code: "OPENCODE_NEMO_RELAY_CONFIGURATION_REQUIRED",
+    })
+    expect(lifecycle.health().blocking).toBe(true)
     await lifecycle.release()
   })
 
@@ -1511,19 +1538,28 @@ describe("NeMo Relay process lifecycle", () => {
   })
 
   test("separates activation conflicts and incompatible runtime modules", async () => {
-    const conflictRuntime = fakeRuntime({
-      initializeFails: new Error("plugin configuration is owned by an active dynamic plugin host"),
-    })
-    const conflict = enabledLifecycle(conflictRuntime)
-    expect((await conflict.acquire()).status).toEqual({ state: "unavailable", reason: "activation_conflict" })
-    await conflict.release()
+    for (const message of [
+      "conflict: plugin configuration is owned by an active dynamic plugin host",
+      "conflict: a static plugin configuration is already active; to combine static and dynamic plugins, provide the static components as the base configuration to dynamic plugin activation before calling plugin initialization",
+    ]) {
+      const conflict = enabledLifecycle(fakeRuntime({ initializeFails: new Error(message) }))
+      expect((await conflict.acquire()).status).toEqual({ state: "unavailable", reason: "activation_conflict" })
+      await conflict.release()
+    }
 
     const incompatible = createLifecycleForTesting({
       loader: async () => ({ initialize: async () => undefined }),
-      environment: { OPENCODE_NEMO_RELAY: "1" },
+      environment: {},
     })
     expect((await incompatible.acquire()).status).toEqual({ state: "unavailable", reason: "incompatible_runtime" })
     await incompatible.release()
+
+    const similarRuntime = fakeRuntime({
+      initializeFails: new Error("wrapper mentioned active dynamic plugin host while reporting another failure"),
+    })
+    const similar = enabledLifecycle(similarRuntime)
+    expect((await similar.acquire()).status).toEqual({ state: "unavailable", reason: "activation_failed" })
+    await similar.release()
   })
 
   test("an explicitly missing configuration is not reported active", async () => {
@@ -1535,7 +1571,6 @@ describe("NeMo Relay process lifecycle", () => {
     const lifecycle = createLifecycleForTesting({
       loader: async () => runtime.module,
       environment: {
-        OPENCODE_NEMO_RELAY: "1",
         OPENCODE_NEMO_RELAY_PLUGINS_TOML: "/missing/plugins.toml",
       },
     })
@@ -1544,6 +1579,133 @@ describe("NeMo Relay process lifecycle", () => {
     expect(runtime.state.flush).toBe(1)
     expect(runtime.state.close).toBe(1)
     await lifecycle.release()
+  })
+
+  test("accepts registration surfaces that manual Relay lifecycle publication can honor", async () => {
+    const runtime = fakeRuntime({
+      registrations: [
+        "subscriber",
+        "event_metadata_injector",
+        "mark_sanitize_guardrail",
+        "scope_sanitize_start_guardrail",
+        "scope_sanitize_end_guardrail",
+        "tool_sanitize_request_guardrail",
+        "tool_sanitize_response_guardrail",
+        "llm_sanitize_request_guardrail",
+        "llm_sanitize_response_guardrail",
+      ].map((kind) => ({ kind })),
+    })
+    const lifecycle = enabledLifecycle(runtime)
+
+    expect((await lifecycle.acquire()).status.state).toBe("active")
+    expect(runtime.state.close).toBe(0)
+    await lifecycle.release()
+  })
+
+  test("rejects execution middleware that manual Relay lifecycle publication cannot enforce", async () => {
+    const unsupported = [
+      "tool_conditional_execution_guardrail",
+      "tool_request_intercept",
+      "tool_execution_intercept",
+      "llm_conditional_execution_guardrail",
+      "llm_request_intercept",
+      "llm_execution_intercept",
+      "llm_stream_execution_intercept",
+    ]
+
+    for (const kind of unsupported) {
+      const runtime = fakeRuntime({ registrations: [{ kind }] })
+      const lifecycle = enabledLifecycle(runtime)
+
+      const relay = await lifecycle.acquire()
+      expect(relay.status).toEqual({
+        state: "unavailable",
+        reason: "unsupported_middleware",
+        unsupportedRegistrations: [kind],
+      })
+      let executed = false
+      const exit = await Effect.runPromiseExit(
+        relay.observeRun(
+          { runtime: "v2" },
+          Effect.sync(() => (executed = true)),
+        ),
+      )
+      expect(executed).toBe(false)
+      expect(Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined).toMatchObject({
+        code: "OPENCODE_NEMO_RELAY_EXECUTION_MIDDLEWARE_UNSUPPORTED",
+      })
+      expect(lifecycle.health().blocking).toBe(true)
+      expect(runtime.state.flush).toBe(1)
+      expect(runtime.state.close).toBe(1)
+      await lifecycle.release()
+    }
+  })
+
+  test("fails closed when active plugin registrations cannot be inspected", async () => {
+    const runtime = fakeRuntime({ registrationInspectionFails: true })
+    const lifecycle = enabledLifecycle(runtime)
+
+    expect((await lifecycle.acquire()).status).toEqual({
+      state: "unavailable",
+      reason: "configuration_unverified",
+    })
+    expect(runtime.state.flush).toBe(1)
+    expect(runtime.state.close).toBe(1)
+    await lifecycle.release()
+
+    const unknownRuntime = fakeRuntime({ registrations: [{ kind: "future_execution_surface" }] })
+    const unknown = enabledLifecycle(unknownRuntime)
+    expect((await unknown.acquire()).status).toEqual({
+      state: "unavailable",
+      reason: "configuration_unverified",
+    })
+    expect(unknownRuntime.state.close).toBe(1)
+    await unknown.release()
+  })
+
+  test("rechecks registrations before admitting later work", async () => {
+    const runtime = fakeRuntime()
+    const lifecycle = enabledLifecycle(runtime)
+    const relay = await lifecycle.acquire()
+    expect(relay.status.state).toBe("active")
+
+    runtime.state.registrations = [{ kind: "tool_execution_intercept" }]
+    let executed = false
+    const exit = await Effect.runPromiseExit(
+      relay.observeRun(
+        { runtime: "v2" },
+        Effect.sync(() => (executed = true)),
+      ),
+    )
+
+    expect(executed).toBe(false)
+    expect(Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined).toMatchObject({
+      code: "OPENCODE_NEMO_RELAY_EXECUTION_MIDDLEWARE_UNSUPPORTED",
+    })
+    expect(relay.status).toEqual({
+      state: "unavailable",
+      reason: "unsupported_middleware",
+      unsupportedRegistrations: ["tool_execution_intercept"],
+    })
+    expect(lifecycle.health()).toMatchObject({
+      blocking: true,
+      status: { state: "unavailable", reason: "unsupported_middleware" },
+    })
+    await lifecycle.release()
+
+    const uninspectableRuntime = fakeRuntime()
+    const uninspectable = enabledLifecycle(uninspectableRuntime)
+    const uninspectableRelay = await uninspectable.acquire()
+    uninspectableRuntime.state.registrationInspectionFails = true
+    const uninspectableExit = await Effect.runPromiseExit(uninspectableRelay.observeRun({ runtime: "v2" }, Effect.void))
+    expect(Exit.isFailure(uninspectableExit) ? Cause.squash(uninspectableExit.cause) : undefined).toMatchObject({
+      code: "OPENCODE_NEMO_RELAY_CONFIGURATION_UNVERIFIED",
+    })
+    expect(uninspectable.health()).toMatchObject({
+      blocking: true,
+      status: { state: "unavailable", reason: "configuration_unverified" },
+    })
+    await uninspectable.release()
   })
 
   test("summarizes empty, configured, and degraded activation reports without exposing paths", async () => {
@@ -1614,8 +1776,12 @@ describe("NeMo Relay process lifecycle", () => {
     await lifecycle.release()
   })
 
-  test("throwing activation getters fail closed without escaping into the host", async () => {
-    for (const runtime of [fakeRuntime({ isActiveThrows: true }), fakeRuntime({ reportThrows: true })]) {
+  test("invalid activation state or report fails closed without escaping into the host", async () => {
+    for (const runtime of [
+      fakeRuntime({ isActiveThrows: true }),
+      fakeRuntime({ reportThrows: true }),
+      fakeRuntime({ report: {} }),
+    ]) {
       const lifecycle = enabledLifecycle(runtime)
       expect((await lifecycle.acquire()).status).toEqual({ state: "unavailable", reason: "invalid_activation" })
       expect(runtime.state.close).toBe(1)
