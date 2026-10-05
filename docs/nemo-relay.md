@@ -3,11 +3,11 @@
 Status: experimental fork work. This is not yet an OpenCode or NeMo Relay
 compatibility promise.
 
-This branch supports the currently released `opencode` CLI/server and its
-standalone Bun artifacts. Preview `packages/cli`/`lildax`, Electron desktop,
-and channel-specific Nix, Docker, npm postinstall, shell-installer, AUR, and
-Homebrew work are preserved in separate follow-up branches. Those surfaces are
-not part of this branch's support claim.
+The common branch supports the currently released `opencode` CLI/server and
+its standalone Bun artifacts. This follow-up adds preview
+`packages/cli`/`lildax` support. Electron desktop and channel-specific Nix,
+Docker, npm postinstall, shell-installer, AUR, and Homebrew work remain separate
+and are not part of this branch's support claim.
 
 The integration is a first-party, in-process observation adapter. It emits two
 parallel, privacy-bounded contracts through Relay at OpenCode-owned execution
@@ -78,6 +78,15 @@ Apache-2.0 license. Channel-specific installation and license propagation are
 owned by the distribution follow-up branch. A custom runtime specifier can be
 used to qualify a separately built macOS x64 addon, but it is not a claimed
 release target.
+
+### Preview CLI support
+
+This branch extends the same process-global Relay adapter into the preview
+`packages/cli` binary, currently named `lildax`. It adds bounded Relay health
+reporting, embeds one target-native addon in each supported standalone preview
+artifact, and gives preview serve and daemon/service shutdown paths one owner
+for admission close, drain, flush, and runtime close. It does not change the
+telemetry schema or expand Relay plugin reachability.
 
 ## Activation and health
 
@@ -583,9 +592,13 @@ Run tests from their package directories, never from the repository root.
 (cd packages/llm && bun typecheck)
 (cd packages/core && bun typecheck)
 (cd packages/opencode && bun typecheck)
+(cd packages/cli && bun typecheck)
 
-# The current-host standalone build runs its packaged Relay activation gate.
+# Both current-host standalone builds run their packaged Relay activation gate.
 (cd packages/opencode && bun run script/build.ts --single)
+(cd packages/cli && bun run script/build.ts --single)
+
+(cd packages/cli && bun test test/services/daemon-deadline.test.ts --timeout 30000)
 ```
 
 The focused suite covers disabled parity, invalid configuration, supported and
@@ -695,12 +708,13 @@ and concurrent sessions before treating a packaged target as fully qualified.
 ### Latest local qualification evidence
 
 On 2026-09-29, macOS arm64 with Bun 1.3.14, Relay 0.9.3, and Phoenix
-20.16.0 passed the following checks for the current CLI/server branch:
+20.16.0 passed the following checks for the current and preview CLI branches:
 
-- standalone `opencode` activated after the installed source addon directory
-  was made unavailable, proving that the executable is self-contained;
-- the final current-CLI platform package carried byte-identical MIT and
-  Apache-2.0 notices;
+- standalone `opencode` and preview `lildax` activated after the installed
+  source addon directory was made unavailable, proving that both executables
+  are self-contained;
+- the final current and preview platform packages carried byte-identical MIT
+  and Apache-2.0 notices;
 - all 12 standalone OpenCode targets cross-built from the pinned metapackage;
 - adversarial ambient runtime-module, plugin-TOML, pure-mode, Relay logging, and
   OTLP variables did not influence the standalone build probe;
