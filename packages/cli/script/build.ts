@@ -1,10 +1,14 @@
 #!/usr/bin/env bun
 
 import { $ } from "bun"
-import { rm } from "fs/promises"
+import { mkdtemp, rm } from "fs/promises"
+import { createRequire } from "module"
+import { tmpdir } from "os"
 import path from "path"
+import { fileURLToPath } from "url"
 import { Script } from "@opencode-ai/script"
 import { createSolidTransformPlugin } from "@opentui/solid/bun-plugin"
+import corePkg from "../../core/package.json"
 import pkg from "../package.json"
 import { modelsData } from "./generate"
 
@@ -20,12 +24,100 @@ const skipInstall = process.argv.includes("--skip-install")
 const sourcemapsFlag = process.argv.includes("--sourcemaps")
 const plugin = createSolidTransformPlugin()
 
-const allTargets: {
+type BuildTarget = {
   os: string
   arch: "arm64" | "x64"
   abi?: "musl"
   avx2?: false
-}[] = [
+}
+
+const relayModule = (target: BuildTarget) => {
+  if (target.os === "darwin") return target.arch === "arm64" ? "nemo-relay-node-darwin-arm64" : undefined
+  if (target.os === "linux") return `nemo-relay-node-linux-${target.arch}-${target.abi === "musl" ? "musl" : "gnu"}`
+  if (target.os === "win32") return `nemo-relay-node-win32-${target.arch}-msvc`
+  return undefined
+}
+
+const relayShimPath = path.resolve(dir, "lildax-nemo-relay-runtime.gen.ts")
+const relayAddonPath = path.resolve(dir, "lildax-nemo-relay.node")
+const relayPackageRequire = createRequire(
+  createRequire(path.resolve(dir, "../core/package.json")).resolve("nemo-relay-node"),
+)
+
+const relaySource = (target: BuildTarget) => {
+  const module = relayModule(target)
+  if (!module) return undefined
+  try {
+    return fileURLToPath(import.meta.resolve(module))
+  } catch {
+    return relayPackageRequire.resolve(module)
+  }
+}
+
+const relayFiles = async (target: BuildTarget) => {
+  const source = relaySource(target)
+  if (!source) return {}
+  return {
+    [relayShimPath]: [
+      `import addonPath from ${JSON.stringify("./lildax-nemo-relay.node")} with { type: "file" }`,
+      `const relay = require(addonPath)`,
+      `export default relay`,
+    ].join("\n"),
+    [relayAddonPath]: await Bun.file(source).arrayBuffer(),
+  }
+}
+
+const probeRelayRuntime = async (binaryPath: string, supported: boolean) => {
+  const home = await mkdtemp(path.join(tmpdir(), "lildax-relay-build-"))
+  try {
+    const env = { ...process.env }
+    for (const key of Object.keys(env)) {
+      if (
+        key === "OPENCODE_PURE" ||
+        key.startsWith("OPENCODE_NEMO_RELAY") ||
+        key.startsWith("NEMO_RELAY_") ||
+        key.startsWith("OTEL_")
+      )
+        delete env[key]
+    }
+    const child = Bun.spawn([path.resolve(binaryPath), "debug", "nemo-relay"], {
+      env: {
+        ...env,
+        HOME: home,
+        USERPROFILE: home,
+        XDG_CONFIG_HOME: home,
+        APPDATA: home,
+        LOCALAPPDATA: home,
+        OPENCODE_NEMO_RELAY: "1",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ])
+    if (code !== 0) throw new Error(`debug nemo-relay exited ${code}: ${stderr.trim()}`)
+    const marker = '{\n  "service":'
+    const start = stdout.lastIndexOf(marker)
+    if (start < 0) throw new Error(`debug nemo-relay did not return status JSON: ${stdout.trim()} ${stderr.trim()}`)
+    const status = JSON.parse(stdout.slice(start)) as {
+      readonly service?: { readonly state?: string; readonly reason?: string }
+      readonly process?: { readonly phase?: string }
+    }
+    if (supported) {
+      if (status.service?.state !== "active" || status.process?.phase !== "active")
+        throw new Error(`embedded Relay runtime did not activate: ${stdout.trim()}`)
+    } else if (status.service?.state !== "unavailable" || status.service.reason !== "unsupported_platform") {
+      throw new Error(`unsupported Relay target was not reported explicitly: ${stdout.trim()}`)
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+}
+
+const allTargets: BuildTarget[] = [
   { os: "linux", arch: "arm64" },
   { os: "linux", arch: "x64" },
   { os: "linux", arch: "x64", avx2: false },
@@ -48,7 +140,17 @@ const targets = singleFlag
     })
   : allTargets
 
-if (!skipInstall) await $`bun install --os="*" --cpu="*" @opentui/core@${pkg.dependencies["@opentui/core"]}`
+const relayVersion = corePkg.dependencies["nemo-relay-node"]
+const relayNativeModules = [
+  ...new Set(allTargets.map(relayModule).filter((item): item is string => item !== undefined)),
+]
+
+if (!skipInstall) {
+  await $`bun install --os="*" --cpu="*" @opentui/core@${pkg.dependencies["@opentui/core"]}`
+  // Cross-builds need every native package available to the build script. The
+  // compiler embeds only the one selected by relayModule for each artifact.
+  await $`bun install --os="*" --cpu="*" --no-save nemo-relay-node@${relayVersion} ${relayNativeModules.map((module) => `${module}@${relayVersion}`)}`
+}
 
 for (const item of targets) {
   const target = [
@@ -81,11 +183,13 @@ for (const item of targets) {
       execArgv: [`--user-agent=${binary}/${Script.version}`, "--use-system-ca", "--"],
       windows: {},
     },
+    files: await relayFiles(item),
     define: {
       OPENCODE_VERSION: `'${Script.version}'`,
       OPENCODE_CLI_NAME: `'${binary}'`,
       OPENCODE_MODELS_DEV: modelsData,
       OPENCODE_CHANNEL: `'${Script.channel}'`,
+      OPENCODE_NEMO_RELAY_BUNDLED_MODULE: relayModule(item) ? JSON.stringify(relayShimPath) : "undefined",
       OPENCODE_LIBC: item.os === "linux" ? `'${item.abi ?? "glibc"}'` : "undefined",
       // FFF_LIBC selects the fff native lib variant: "musl" or "gnu".
       FFF_LIBC: item.os === "linux" ? `'${item.abi ?? "gnu"}'` : "undefined",
@@ -98,13 +202,28 @@ for (const item of targets) {
     process.exit(1)
   }
 
+  const relayNativeSource = relaySource(item)
+  await Bun.write(`./dist/${name}/bin/LICENSE`, Bun.file(path.resolve(dir, "../../LICENSE")))
+  if (relayNativeSource)
+    await Bun.write(
+      `./dist/${name}/bin/LICENSE.nemo-relay`,
+      Bun.file(path.join(path.dirname(relayNativeSource), "LICENSE")),
+    )
+
+  if (item.os === process.platform && item.arch === process.arch && !item.abi) {
+    const binaryPath = `./dist/${name}/bin/${binary}${item.os === "win32" ? ".exe" : ""}`
+    console.log(`Running packaged Relay activation test: ${binaryPath} debug nemo-relay`)
+    await probeRelayRuntime(binaryPath, relayModule(item) !== undefined)
+    console.log("Packaged Relay activation test passed")
+  }
+
   await Bun.write(
     `./dist/${name}/package.json`,
     JSON.stringify(
       {
         name: `@opencode-ai/${name}`,
         version: Script.version,
-        license: "MIT",
+        license: relayNativeSource ? "MIT AND Apache-2.0" : "MIT",
         repository: { type: "git", url: "git+https://github.com/anomalyco/opencode.git" },
         os: [item.os],
         cpu: [item.arch],
